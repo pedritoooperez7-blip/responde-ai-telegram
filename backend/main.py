@@ -90,12 +90,8 @@ async def ocr(file: UploadFile = File(...)):
 @app.post("/ocr-base64-simple")
 async def ocr_base64_simple(request: Request):
     try:
-        import json
-
         raw_body = await request.body()
-        payload = json.loads(raw_body.decode("utf-8"))
-
-        image_data = payload.get("image", "")
+        image_data = raw_body.decode("utf-8").strip()
 
         if "," in image_data:
             image_data = image_data.split(",", 1)[1]
