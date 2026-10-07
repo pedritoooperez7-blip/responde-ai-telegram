@@ -218,6 +218,12 @@ class TelegramAuthRequest(BaseModel):
     user_id: Optional[str] = None
 
 
+class GenerateReplyRequest(BaseModel):
+    user_id: str
+    mode: str = "coquetear"
+    text: str = ""
+
+
 @app.get("/")
 def root():
     return {"service": "LiggaCuba OCR API", "status": "ok"}
@@ -371,6 +377,36 @@ async def admin_users(request: Request):
     return {"users": [dict(item) for item in items]}
 
 
+def build_reply_for_mode(mode: str, text: str) -> str:
+    normalized = (text or "").replace("\s+", " ").strip()
+    lower = normalized.lower()
+
+    templates = {
+        "gracioso": "Responde con un toque ligero y divertido, sin perder naturalidad.",
+        "coquetear": "Usa un tono cálido y atractivo, pero sin presionar ni forzar.",
+        "provocativo": "Da un tono más directo e intenso, pero con control y clase.",
+        "enamorar": "Haz una respuesta elegante, cercana y romántica, con buena energía y respeto.",
+    }
+
+    if not normalized:
+        return "No pude detectar texto suficiente para generar una respuesta útil. Intenta otra captura."
+
+    base = templates.get(mode, templates["coquetear"])
+    if "hola" in lower or "hey" in lower:
+        return f"{base} Además, puedes empezar con un saludo amable y seguir la conversación sin hacerla forzada."
+    if "porque" in lower or "por qué" in lower:
+        return f"{base} Responde con claridad, evita entrar en defensiva y deja la conversación con una línea amable y directa."
+    return f"{base} Mantén la respuesta breve, auténtica y con buena energía."
+
+
+@app.post("/api/generate-reply")
+async def generate_reply(payload: GenerateReplyRequest):
+    if not payload.text:
+        return {"success": True, "reply": "No pude detectar texto suficiente para generar una respuesta útil."}
+    reply = build_reply_for_mode(payload.mode, payload.text)
+    return {"success": True, "reply": reply}
+
+
 def preprocess_image(raw: bytes) -> Image.Image:
     image = Image.open(io.BytesIO(raw))
     image.load()
@@ -439,3 +475,4 @@ async def ocr_base64_simple(request: Request):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"No se pudo procesar la imagen: {exc}")
+
