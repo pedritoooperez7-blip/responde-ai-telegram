@@ -3,71 +3,114 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <meta name="theme-color" content="#111827">
-  <title>Responde AI</title>
+  <meta name="theme-color" content="#09111b">
+  <title>LiggaCuba</title>
   <link rel="stylesheet" href="style.css">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 </head>
 <body>
   <main class="app">
-    <div class="brand">RESPONDE AI</div>
+    <div class="brand">LIGGACUBA</div>
 
     <section id="welcomeScreen" class="screen">
-      <h1>Tu asistente de respuestas</h1>
-      <p id="welcome">
-        Analiza una conversación y encuentra una respuesta adecuada.
-      </p>
+      <h1 id="welcomeTitle">Tu asistente para responder mejor</h1>
+      <p id="welcome">Analiza una conversación, extrae el texto y responde con estilo.</p>
       <button id="startButton" type="button">Comenzar</button>
       <div id="status" class="status" aria-live="polite"></div>
     </section>
 
     <section id="analyzeScreen" class="screen hidden">
-      <button id="backButton" class="secondary-button" type="button">Volver</button>
-      <h2>Analiza una conversación</h2>
-      <p class="screen-text">
-        Selecciona una captura de pantalla de la conversación.
-      </p>
+      <div class="top-actions">
+        <button id="backButton" class="secondary-button" type="button">Volver</button>
+        <button id="openSettingsButton" class="secondary-button" type="button">Configuración</button>
+      </div>
+
+      <h2 id="chatTitle">Chat</h2>
+      <p id="chatSubtitle" class="screen-text">Selecciona una captura de pantalla para analizar.</p>
+      <div id="limitStatus" class="status" aria-live="polite"></div>
 
       <label class="upload-box" for="imageInput">
         <span class="upload-icon">＋</span>
-        <strong>Seleccionar captura</strong>
-        <span>JPG, PNG o WEBP</span>
+        <strong id="imageLabel">Seleccionar captura</strong>
+        <span id="imageHint">JPG, PNG o WEBP</span>
       </label>
       <input id="imageInput" type="file" accept="image/*">
 
       <div id="previewContainer" class="preview-container hidden">
-        <img id="previewImage" alt="Vista previa de la captura seleccionada">
+        <img id="previewImage" alt="Vista previa de la captura">
         <button id="removeImageButton" class="secondary-button" type="button">Cambiar captura</button>
       </div>
 
       <div id="modeSection" class="hidden">
-        <h3>¿Qué tipo de respuesta buscas?</h3>
+        <h3 id="modeLabel">¿Qué tipo de respuesta buscas?</h3>
         <div class="mode-grid">
           <button class="mode-button" data-mode="natural" type="button">Natural</button>
           <button class="mode-button" data-mode="casual" type="button">Casual</button>
           <button class="mode-button" data-mode="segura" type="button">Segura</button>
           <button class="mode-button" data-mode="curiosa" type="button">Con curiosidad</button>
+          <button class="mode-button" data-mode="gracioso" type="button">Gracioso</button>
+          <button class="mode-button" data-mode="coquetear" type="button">Coquetear</button>
+          <button class="mode-button" data-mode="enamorar" type="button">Enamorar</button>
+          <button class="mode-button" data-mode="provocativo" type="button">Provocativo</button>
         </div>
         <button id="analyzeButton" class="primary-button" type="button" disabled>
           Analizar conversación
         </button>
         <div id="analysisStatus" class="status" aria-live="polite"></div>
       </div>
+
+      <div class="inline-actions">
+        <button id="storyButton" class="secondary-button" type="button">Estado / Story</button>
+        <button id="openPremiumButton" class="secondary-button" type="button">Premium</button>
+      </div>
+    </section>
+
+    <section id="storyScreen" class="screen hidden">
+      <div class="top-actions">
+        <button id="backButtonStory" class="secondary-button" type="button">Volver</button>
+        <button id="openSettingsButtonStory" class="secondary-button" type="button">Configuración</button>
+      </div>
+
+      <h2 id="storyTitle">Estado / Story</h2>
+      <p id="storySubtitle" class="screen-text">Sube una captura de la historia a responder.</p>
+      <div id="storyLimitStatus" class="status" aria-live="polite"></div>
+
+      <label class="upload-box" for="storyImageInput">
+        <span class="upload-icon">＋</span>
+        <strong>Seleccionar captura</strong>
+        <span>JPG, PNG o WEBP</span>
+      </label>
+      <input id="storyImageInput" type="file" accept="image/*">
+
+      <div id="storyPreviewContainer" class="preview-container hidden">
+        <img id="storyPreviewImage" alt="Vista previa de la historia">
+        <button id="storyRemoveImageButton" class="secondary-button" type="button">Cambiar captura</button>
+      </div>
+
+      <div id="storyModeSection" class="hidden">
+        <h3>Modo de respuesta</h3>
+        <div class="mode-grid">
+          <button class="story-mode-button" data-mode="natural" type="button">Natural</button>
+          <button class="story-mode-button" data-mode="casual" type="button">Casual</button>
+          <button class="story-mode-button" data-mode="gracioso" type="button">Gracioso</button>
+          <button class="story-mode-button" data-mode="coquetear" type="button">Coquetear</button>
+          <button class="story-mode-button" data-mode="enamorar" type="button">Enamorar</button>
+          <button class="story-mode-button" data-mode="provocativo" type="button">Provocativo</button>
+        </div>
+        <button id="storyAnalyzeButton" class="primary-button" type="button" disabled>Analizar conversación</button>
+        <div id="storyAnalysisStatus" class="status" aria-live="polite"></div>
+      </div>
     </section>
 
     <section id="resultScreen" class="screen hidden">
       <button id="resultBackButton" class="secondary-button" type="button">Volver</button>
-      <h2>Resultado</h2>
-      <p id="resultIntro" class="screen-text">
-        Texto detectado de la captura:
-      </p>
+      <h2 id="resultTitle">Resultado</h2>
 
       <div class="result-box">
         <p id="ocrText"></p>
       </div>
 
-      <p class="screen-text">Respuesta de demostración basada en el modo seleccionado:</p>
+      <p id="resultIntro" class="screen-text">Respuesta sugerida por LiggaCuba:</p>
       <div class="result-box">
         <p id="resultText"></p>
       </div>
@@ -75,8 +118,49 @@
       <button id="copyButton" class="primary-button" type="button">Copiar respuesta</button>
       <div id="copyStatus" class="status" aria-live="polite"></div>
     </section>
+
+    <section id="premiumScreen" class="screen hidden">
+      <button id="backButtonPremium" class="secondary-button" type="button">Volver</button>
+      <h2 id="premiumTitle">Premium</h2>
+
+      <div class="premium-box">
+        <p>✓ Usos ilimitados</p>
+        <p>✓ Modos premium</p>
+        <p>✓ Máxima velocidad y calidad</p>
+      </div>
+
+      <div class="premium-plan">
+        <p id="premiumPlan1">Plan semanal: 2500 CUP</p>
+        <p id="premiumPlan2">Plan anual: 15500 CUP</p>
+      </div>
+
+      <button id="premiumButton" class="primary-button" type="button">Obtener Premium</button>
+    </section>
+
+    <section id="settingsScreen" class="screen hidden">
+      <div class="top-actions">
+        <button id="backButtonSettings" class="secondary-button" type="button">Volver</button>
+      </div>
+      <h2 id="settingsTitle">Configuración</h2>
+
+      <div class="settings-card">
+        <label id="settingsLanguage" for="languageToggle">Idioma</label>
+        <select id="languageToggle">
+          <option value="es">Español</option>
+          <option value="en">English</option>
+        </select>
+      </div>
+
+      <div class="settings-card">
+        <p id="settingsContact">Contáctanos</p>
+      </div>
+
+      <div class="settings-card">
+        <p id="settingsOpinion">Tu opinión</p>
+      </div>
+    </section>
   </main>
 
-  <script src="app.js?v=20261007"></script>
+  <script src="app.js?v=20261007-2"></script>
 </body>
 </html>
