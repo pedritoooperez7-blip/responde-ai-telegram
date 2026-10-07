@@ -201,6 +201,8 @@ button {
 .result-box p {
   margin: 0;
   line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 380px) {

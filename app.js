@@ -13,34 +13,33 @@ const welcome = document.getElementById("welcome");
 const startButton = document.getElementById("startButton");
 const status = document.getElementById("status");
 const backButton = document.getElementById("backButton");
-
 const imageInput = document.getElementById("imageInput");
 const previewContainer = document.getElementById("previewContainer");
 const previewImage = document.getElementById("previewImage");
 const removeImageButton = document.getElementById("removeImageButton");
-
 const modeSection = document.getElementById("modeSection");
 const modeButtons = document.querySelectorAll(".mode-button");
 const analyzeButton = document.getElementById("analyzeButton");
 const analysisStatus = document.getElementById("analysisStatus");
 
 const resultBackButton = document.getElementById("resultBackButton");
+const ocrText = document.getElementById("ocrText");
 const resultText = document.getElementById("resultText");
 const copyButton = document.getElementById("copyButton");
 const copyStatus = document.getElementById("copyStatus");
 
 let selectedImage = null;
 let selectedMode = null;
+let ocrWorker = null;
 
 const demoResponses = {
   natural: "Puedes responder de forma natural y tranquila, manteniendo la conversación sin forzarla.",
-  casual: "Jajaja, sí, puede ser 😄 ¿Qué tal si seguimos hablando y vemos qué sale?",
-  segura: "Claro. Me parece bien, dime qué tienes pensado y lo hablamos.",
-  curiosa: "Eso suena interesante. Ahora me dejaste con curiosidad, ¿qué quieres decir?"
+  casual: "Puedes mantener un tono relajado y cercano para que la conversación siga fluyendo.",
+  segura: "Una respuesta clara y tranquila puede mantener la conversación sin complicarla.",
+  curiosa: "Puedes dejar una pequeña pregunta abierta para mostrar interés y seguir la conversación."
 };
 
 const user = tg?.initDataUnsafe?.user;
-
 if (user) {
   const name = user.first_name || "usuario";
   welcome.textContent = `Hola, ${name}. Responde AI está listo para comenzar.`;
@@ -62,6 +61,7 @@ function resetAnalysis() {
   previewContainer.classList.add("hidden");
   modeSection.classList.add("hidden");
   analyzeButton.disabled = true;
+  analyzeButton.textContent = "Analizar conversación";
   analysisStatus.textContent = "";
   modeButtons.forEach((button) => button.classList.remove("selected"));
 }
@@ -80,9 +80,7 @@ backButton.addEventListener("click", () => {
 imageInput.addEventListener("change", () => {
   const file = imageInput.files?.[0];
 
-  if (!file) {
-    return;
-  }
+  if (!file) return;
 
   if (!file.type.startsWith("image/")) {
     analysisStatus.textContent = "Selecciona una imagen válida.";
@@ -93,7 +91,6 @@ imageInput.addEventListener("change", () => {
   selectedImage = file;
 
   const reader = new FileReader();
-
   reader.onload = () => {
     previewImage.src = reader.result;
     previewContainer.classList.remove("hidden");
@@ -111,7 +108,6 @@ removeImageButton.addEventListener("click", () => {
 modeButtons.forEach((button) => {
   button.addEventListener("click", () => {
     selectedMode = button.dataset.mode;
-
     modeButtons.forEach((item) => item.classList.remove("selected"));
     button.classList.add("selected");
 
@@ -120,19 +116,40 @@ modeButtons.forEach((button) => {
   });
 });
 
-analyzeButton.addEventListener("click", () => {
-  if (!selectedImage || !selectedMode) {
-    return;
+async function runOCR(image) {
+  if (!window.Tesseract) {
+    throw new Error("OCR no disponible");
   }
 
-  analysisStatus.textContent = "Analizando captura...";
+  if (!ocrWorker) {
+    analysisStatus.textContent = "Preparando OCR…";
+    ocrWorker = await Tesseract.createWorker("spa+eng");
+  }
 
-  // V0.2: demostración local. El OCR y la IA real se conectarán en el backend.
-  window.setTimeout(() => {
+  const result = await ocrWorker.recognize(image);
+  return result.data.text.trim();
+}
+
+analyzeButton.addEventListener("click", async () => {
+  if (!selectedImage || !selectedMode) return;
+
+  analyzeButton.disabled = true;
+  analyzeButton.textContent = "Analizando…";
+  analysisStatus.textContent = "Extrayendo texto de la captura…";
+
+  try {
+    const text = await runOCR(selectedImage);
+
+    ocrText.textContent = text || "No se pudo detectar texto en la captura.";
     resultText.textContent = demoResponses[selectedMode];
     copyStatus.textContent = "";
     showScreen(resultScreen);
-  }, 700);
+  } catch (error) {
+    console.error(error);
+    analysisStatus.textContent = "No se pudo completar el OCR. Intenta con una captura más nítida.";
+    analyzeButton.disabled = false;
+    analyzeButton.textContent = "Analizar conversación";
+  }
 });
 
 resultBackButton.addEventListener("click", () => {

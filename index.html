@@ -7,6 +7,7 @@
   <title>Responde AI</title>
   <link rel="stylesheet" href="style.css">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 </head>
 <body>
   <main class="app">
@@ -23,7 +24,6 @@
 
     <section id="analyzeScreen" class="screen hidden">
       <button id="backButton" class="secondary-button" type="button">Volver</button>
-
       <h2>Analiza una conversación</h2>
       <p class="screen-text">
         Selecciona una captura de pantalla de la conversación.
@@ -43,30 +43,31 @@
 
       <div id="modeSection" class="hidden">
         <h3>¿Qué tipo de respuesta buscas?</h3>
-
         <div class="mode-grid">
           <button class="mode-button" data-mode="natural" type="button">Natural</button>
           <button class="mode-button" data-mode="casual" type="button">Casual</button>
           <button class="mode-button" data-mode="segura" type="button">Segura</button>
           <button class="mode-button" data-mode="curiosa" type="button">Con curiosidad</button>
         </div>
-
         <button id="analyzeButton" class="primary-button" type="button" disabled>
           Analizar conversación
         </button>
-
         <div id="analysisStatus" class="status" aria-live="polite"></div>
       </div>
     </section>
 
     <section id="resultScreen" class="screen hidden">
       <button id="resultBackButton" class="secondary-button" type="button">Volver</button>
-
       <h2>Resultado</h2>
       <p id="resultIntro" class="screen-text">
-        Esta es una respuesta de demostración basada en el modo seleccionado.
+        Texto detectado de la captura:
       </p>
 
+      <div class="result-box">
+        <p id="ocrText"></p>
+      </div>
+
+      <p class="screen-text">Respuesta de demostración basada en el modo seleccionado:</p>
       <div class="result-box">
         <p id="resultText"></p>
       </div>
