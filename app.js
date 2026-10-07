@@ -118,6 +118,78 @@ modeButtons.forEach((button) => {
 
 const OCR_API_URL = "https://responde-ai-telegram-production.up.railway.app/ocr";
 
+
+async function prepareImageForOCR(file) {
+  return await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      const img = new Image();
+
+      img.onload = () => {
+        const maxSize = 1280;
+
+        let width = img.naturalWidth;
+        let height = img.naturalHeight;
+
+        if (width > maxSize || height > maxSize) {
+          const scale = Math.min(
+            maxSize / width,
+            maxSize / height
+          );
+
+          width = Math.round(width * scale);
+          height = Math.round(height * scale);
+        }
+
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+
+        const ctx = canvas.getContext("2d");
+
+        if (!ctx) {
+          reject(new Error("No se pudo preparar la imagen."));
+          return;
+        }
+
+        ctx.drawImage(img, 0, 0, width, height);
+
+        canvas.toBlob(
+          (blob) => {
+            if (!blob) {
+              reject(new Error("No se pudo comprimir la imagen."));
+              return;
+            }
+
+            resolve(
+              new File(
+                [blob],
+                "captura-ocr.jpg",
+                { type: "image/jpeg" }
+              )
+            );
+          },
+          "image/jpeg",
+          0.70
+        );
+      };
+
+      img.onerror = () => {
+        reject(new Error("No se pudo cargar la captura."));
+      };
+
+      img.src = reader.result;
+    };
+
+    reader.onerror = () => {
+      reject(new Error("No se pudo leer la captura."));
+    };
+
+    reader.readAsDataURL(file);
+  });
+}
+
 async function runOCR(image) {
   analysisStatus.textContent = "Preparando captura…";
 
@@ -139,6 +211,15 @@ async function runOCR(image) {
 
     analysisStatus.textContent = "Conectado. Preparando imagen…";
 
+    const preparedImage = await prepareImageForOCR(image);
+
+    console.log(
+      "OCR imagen preparada:",
+      preparedImage.size,
+      "bytes",
+      preparedImage.type
+    );
+
     const base64 = await new Promise((resolve, reject) => {
       const reader = new FileReader();
 
@@ -152,10 +233,10 @@ async function runOCR(image) {
       };
 
       reader.onerror = () => {
-        reject(new Error("No se pudo leer la captura."));
+        reject(new Error("No se pudo leer la imagen preparada."));
       };
 
-      reader.readAsDataURL(image);
+      reader.readAsDataURL(preparedImage);
     });
 
     analysisStatus.textContent = "Enviando captura al OCR…";
