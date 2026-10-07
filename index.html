@@ -71,12 +71,28 @@
         <div class="usage-row">
           <div class="usage-pill">
             <span class="usage-icon"><i class="fas fa-clock"></i></span>
-            <span>1 análisis restantes hoy</span>
+            <span id="usageText">1 análisis restantes hoy</span>
           </div>
-          <button class="update-link" type="button">Actualizar</button>
+          <button class="update-link" type="button" id="refreshUsage">Actualizar</button>
         </div>
 
-        <button class="primary-action" type="button">Analizar con Liggo</button>
+        <button id="analyzeButton" class="primary-action" type="button">Analizar con Liggo</button>
+        <div id="statusMessage" class="status-message" aria-live="polite"></div>
+
+        <section id="resultPanel" class="result-panel hidden">
+          <div class="result-block">
+            <h3>Texto detectado</h3>
+            <p id="ocrOutput">-</p>
+          </div>
+
+          <div class="result-block">
+            <h3>Respuesta sugerida</h3>
+            <p id="replyOutput">-</p>
+          </div>
+
+          <button id="copyResponse" class="copy-button" type="button">Copiar respuesta</button>
+          <div id="copyStatus" class="copy-status" aria-live="polite"></div>
+        </section>
 
         <div class="bottom-tabs" aria-label="Navegación inferior">
           <button class="tab-home active" type="button"><i class="fas fa-heart"></i>Home</button>
