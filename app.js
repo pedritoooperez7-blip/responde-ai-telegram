@@ -119,13 +119,16 @@ modeButtons.forEach((button) => {
 const OCR_API_URL = "https://responde-ai-telegram-production.up.railway.app/ocr";
 
 async function runOCR(image) {
-  analysisStatus.textContent = "Probando conexión con el backend…";
+  analysisStatus.textContent = "Preparando captura…";
 
   try {
-    const testResponse = await fetch("https://responde-ai-telegram-production.up.railway.app/", {
-      method: "GET",
-      cache: "no-store"
-    });
+    const testResponse = await fetch(
+      "https://responde-ai-telegram-production.up.railway.app/",
+      {
+        method: "GET",
+        cache: "no-store"
+      }
+    );
 
     if (!testResponse.ok) {
       throw new Error("GET backend HTTP " + testResponse.status);
@@ -133,48 +136,68 @@ async function runOCR(image) {
 
     const testData = await testResponse.json();
     console.log("BACKEND GET OK:", testData);
-    analysisStatus.textContent = "Backend conectado. Enviando captura…";
+
+    analysisStatus.textContent = "Conectado. Preparando imagen…";
+
+    const base64 = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+
+      reader.onload = () => {
+        if (typeof reader.result !== "string") {
+          reject(new Error("No se pudo convertir la imagen."));
+          return;
+        }
+
+        resolve(reader.result);
+      };
+
+      reader.onerror = () => {
+        reject(new Error("No se pudo leer la captura."));
+      };
+
+      reader.readAsDataURL(image);
+    });
+
+    analysisStatus.textContent = "Enviando captura al OCR…";
+
+    const response = await fetch(
+      "https://responde-ai-telegram-production.up.railway.app/ocr-base64",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json"
+        },
+        body: JSON.stringify({
+          image: base64
+        })
+      }
+    );
+
+    let data;
+
+    try {
+      data = await response.json();
+    } catch (error) {
+      throw new Error("El backend devolvió una respuesta no válida.");
+    }
+
+    if (!response.ok || !data.success) {
+      throw new Error(
+        data?.detail || `Error HTTP ${response.status}`
+      );
+    }
+
+    return (data.text || "").trim();
+
   } catch (error) {
-    console.error("BACKEND GET ERROR:", error);
-    throw new Error("GET backend: " + (error.message || String(error)));
+    console.error("ERROR OCR REAL:", error);
+
+    analysisStatus.textContent =
+      "ERROR OCR: " + (error.message || String(error));
+
+    throw error;
   }
-
-  return await new Promise((resolve, reject) => {
-    const formData = new FormData();
-    formData.append("file", image, image.name || "captura.jpg");
-
-    const xhr = new XMLHttpRequest();
-
-    xhr.open("POST", OCR_API_URL, true);
-    xhr.responseType = "json";
-    xhr.timeout = 60000;
-
-    xhr.onload = () => {
-      if (xhr.status < 200 || xhr.status >= 300) {
-        reject(new Error(`Error HTTP ${xhr.status}`));
-        return;
-      }
-
-      const data = xhr.response;
-
-      if (!data || !data.success) {
-        reject(new Error(data?.detail || "El backend no pudo procesar la imagen."));
-        return;
-      }
-
-      resolve((data.text || "").trim());
-    };
-
-    xhr.onerror = () => {
-      reject(new Error("XHR: Load failed"));
-    };
-
-    xhr.ontimeout = () => {
-      reject(new Error("XHR: tiempo de espera agotado"));
-    };
-
-    xhr.send(formData);
-  });
 }
 
 analyzeButton.addEventListener("click", async () => {
