@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#efeff5" />
     <title>LiggaCuba</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
     <link rel="stylesheet" href="style.css" />
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
   </head>
@@ -32,7 +33,9 @@
       <main class="app-body">
         <section class="panel upload-panel">
           <div class="section-head">
-            <span class="panel-icon violet">💬</span>
+            <span class="panel-icon violet">
+              <i class="fas fa-comments"></i>
+            </span>
             <h2>Imagen de la conversación</h2>
           </div>
           <p class="helper">Sube una captura de tu chat</p>
@@ -40,7 +43,7 @@
           <label class="upload-zone" for="chatImageInput">
             <input id="chatImageInput" type="file" accept="image/*" hidden />
             <div class="upload-inner">
-              <span class="plus">＋</span>
+              <span class="plus">+</span>
               <span class="upload-text">Agregar</span>
             </div>
           </label>
@@ -48,36 +51,46 @@
 
         <section class="panel mode-panel">
           <div class="section-head">
-            <span class="panel-icon purple">😊</span>
+            <span class="panel-icon purple">
+              <i class="fas fa-smile"></i>
+            </span>
             <h2>Modo de respuesta</h2>
           </div>
           <p class="helper">Elige el estilo de tu respuesta</p>
 
           <div class="mode-grid" aria-label="Modos de respuesta">
             <button class="mode-card" type="button" data-mode="gracioso">
-              <span class="emoji">😎</span>
+              <span class="icon-wrapper">
+                <i class="fas fa-face-grin-stars"></i>
+              </span>
               <span class="mode-label">Gracioso</span>
             </button>
 
             <button class="mode-card selected" type="button" data-mode="coquetear">
-              <span class="emoji">😊</span>
+              <span class="icon-wrapper">
+                <i class="fas fa-face-smirk"></i>
+              </span>
               <span class="mode-label">Coquetear</span>
             </button>
 
             <button class="mode-card" type="button" data-mode="provocativo">
-              <span class="emoji">🔥</span>
+              <span class="icon-wrapper">
+                <i class="fas fa-fire"></i>
+              </span>
               <span class="mode-label">Provocativo</span>
             </button>
 
             <button class="mode-card" type="button" data-mode="enamorar">
-              <span class="emoji">😍</span>
+              <span class="icon-wrapper">
+                <i class="fas fa-face-heart-eyes"></i>
+              </span>
               <span class="mode-label">Enamorar</span>
             </button>
           </div>
 
           <button class="special-option" type="button">
             <span class="option-emoji">
-              <span class="mini-avatar">🧑‍🚀</span>
+              <i class="fas fa-shield"></i>
             </span>
             <span>Salvar Situación</span>
           </button>
@@ -85,7 +98,9 @@
 
         <div class="usage-row">
           <div class="usage-pill">
-            <span class="usage-icon">◔</span>
+            <span class="usage-icon">
+              <i class="fas fa-clock"></i>
+            </span>
             <span>1 análisis restantes hoy</span>
           </div>
           <button class="update-link" type="button">Actualizar</button>
@@ -94,8 +109,13 @@
         <button class="primary-action" type="button">Analizar con Liggo</button>
 
         <div class="bottom-tabs" aria-label="Navegación inferior">
-          <button class="tab-home active" type="button">Home</button>
-          <button class="tab-profile" type="button" aria-label="Perfil">👤</button>
+          <button class="tab-home active" type="button">
+            <i class="fas fa-heart"></i>
+            Home
+          </button>
+          <button class="tab-profile" type="button" aria-label="Perfil">
+            <i class="fas fa-user"></i>
+          </button>
         </div>
       </main>
     </div>

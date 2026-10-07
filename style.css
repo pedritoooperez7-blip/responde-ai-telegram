@@ -40,6 +40,7 @@ body {
 
 button {
   font: inherit;
+  outline: none;
 }
 
 .phone-shell {
@@ -212,12 +213,12 @@ button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: 38px;
+  height: 38px;
   border-radius: 50%;
   background: linear-gradient(135deg, #6163ff, #4c5ae8);
   color: #fff;
-  font-size: 0.9rem;
+  font-size: 1.1rem;
   box-shadow: 0 6px 12px rgba(81,75,210,0.18);
 }
 
@@ -268,6 +269,7 @@ button {
   font-weight: 700;
   margin-top: 2px;
   letter-spacing: -0.04em;
+  color: #3f3f46;
 }
 
 .mode-grid {
@@ -282,13 +284,13 @@ button {
   border: 2px solid rgba(122, 108, 176, 0.26);
   background: rgba(255,255,255,0.45);
   border-radius: 18px;
-  min-height: 120px;
+  min-height: 130px;
   padding: 18px 16px;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: 12px;
   font-size: 1rem;
   font-weight: 800;
   color: #1c1d20;
@@ -315,12 +317,19 @@ button {
 }
 
 .mode-card:nth-child(4) {
-  background: rgba(255,255,255,0.5);
+  background: rgba(255,230,200,0.48);
 }
 
-.emoji {
-  font-size: 2.2rem;
-  line-height: 1;
+.icon-wrapper {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.6);
+  color: #3f3f46;
+  font-size: 1.8rem;
 }
 
 .mode-label {
@@ -346,22 +355,24 @@ button {
   letter-spacing: -0.03em;
   cursor: pointer;
   box-shadow: inset 0 0 0 1px rgba(62, 103, 163, 0.12);
+  transition: 0.2s ease;
+}
+
+.special-option:hover {
+  background: rgba(180, 215, 255, 0.85);
 }
 
 .option-emoji {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 25px;
-  height: 25px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
-  background: rgba(255,255,255,0.45);
+  background: rgba(255,255,255,0.6);
+  color: #3f67d9;
+  font-size: 0.9rem;
   box-shadow: 0 0 0 1px rgba(71,96,150,0.08);
-}
-
-.mini-avatar {
-  font-size: 1.05rem;
-  transform: translateY(1px);
 }
 
 .usage-row {
@@ -386,12 +397,12 @@ button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
+  width: 28px;
+  height: 28px;
   border-radius: 50%;
   background: rgba(109,102,255,0.14);
   color: var(--purple);
-  font-size: 0.8rem;
+  font-size: 0.85rem;
 }
 
 .update-link {
@@ -403,6 +414,11 @@ button {
   font-weight: 800;
   cursor: pointer;
   padding: 0;
+  transition: 0.2s ease;
+}
+
+.update-link:hover {
+  opacity: 0.7;
 }
 
 .primary-action {
@@ -417,6 +433,12 @@ button {
   letter-spacing: -0.03em;
   box-shadow: 0 12px 20px rgba(72, 72, 196, 0.22);
   cursor: pointer;
+  transition: 0.2s ease;
+}
+
+.primary-action:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 16px 28px rgba(72, 72, 196, 0.28);
 }
 
 .bottom-tabs {
@@ -433,9 +455,14 @@ button {
   border: 0;
   border-radius: 999px;
   height: 64px;
-  font-size: 1.2rem;
+  font-size: 1.1rem;
   font-weight: 800;
   cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: 0.2s ease;
 }
 
 .tab-home {
@@ -449,9 +476,21 @@ button {
   color: #1f2937;
 }
 
+.tab-home.active {
+  background: linear-gradient(135deg, #4d4ae6, #4a57dc);
+  color: white;
+}
+
 .tab-profile {
   background: #eceaf1;
   color: #1f2937;
+  font-size: 1.3rem;
+}
+
+.tab-profile.active {
+  background: linear-gradient(135deg, #9d7ff5, #8b5cf6);
+  color: white;
+  box-shadow: 0 12px 20px rgba(139, 92, 246, 0.18);
 }
 
 @media (max-width: 420px) {
@@ -466,5 +505,9 @@ button {
 
   .upload-text {
     font-size: 1.7rem;
+  }
+
+  .section-head h2 {
+    font-size: 0.95rem;
   }
 }
