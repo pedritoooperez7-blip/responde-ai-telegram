@@ -157,8 +157,8 @@ analyzeButton.addEventListener("click", async () => {
     copyStatus.textContent = "";
     showScreen(resultScreen);
   } catch (error) {
-    console.error(error);
-    analysisStatus.textContent = "No se pudo completar el OCR. Intenta con una captura más nítida.";
+    console.error("ERROR OCR REAL:", error);
+    analysisStatus.textContent = "ERROR OCR: " + (error.message || String(error));
     analyzeButton.disabled = false;
     analyzeButton.textContent = "Analizar conversación";
   }
