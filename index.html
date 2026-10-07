@@ -3,31 +3,28 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <meta name="theme-color" content="#111827">
-  <title>Responde AI</title>
+  <meta name="theme-color" content="#09111b">
+  <title>LiggaCuba</title>
   <link rel="stylesheet" href="style.css">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 </head>
 <body>
   <main class="app">
-    <div class="brand">RESPONDE AI</div>
+    <div class="brand">LIGGACUBA</div>
 
     <section id="welcomeScreen" class="screen">
-      <h1>Tu asistente de respuestas</h1>
-      <p id="welcome">
-        Analiza una conversación y encuentra una respuesta adecuada.
-      </p>
+      <h1>Tu asistente para responder mejor</h1>
+      <p id="welcome">Analiza una conversación, extrae el texto y responde con estilo.</p>
       <button id="startButton" type="button">Comenzar</button>
       <div id="status" class="status" aria-live="polite"></div>
     </section>
 
     <section id="analyzeScreen" class="screen hidden">
       <button id="backButton" class="secondary-button" type="button">Volver</button>
-      <h2>Analiza una conversación</h2>
-      <p class="screen-text">
-        Selecciona una captura de pantalla de la conversación.
-      </p>
+      <h2>Chat</h2>
+      <p class="screen-text">Selecciona una captura de pantalla para analizar.</p>
+
+      <div id="limitStatus" class="status" aria-live="polite"></div>
 
       <label class="upload-box" for="imageInput">
         <span class="upload-icon">＋</span>
@@ -37,7 +34,7 @@
       <input id="imageInput" type="file" accept="image/*">
 
       <div id="previewContainer" class="preview-container hidden">
-        <img id="previewImage" alt="Vista previa de la captura seleccionada">
+        <img id="previewImage" alt="Vista previa de la captura">
         <button id="removeImageButton" class="secondary-button" type="button">Cambiar captura</button>
       </div>
 
@@ -48,32 +45,53 @@
           <button class="mode-button" data-mode="casual" type="button">Casual</button>
           <button class="mode-button" data-mode="segura" type="button">Segura</button>
           <button class="mode-button" data-mode="curiosa" type="button">Con curiosidad</button>
+          <button class="mode-button" data-mode="gracioso" type="button">Gracioso</button>
+          <button class="mode-button" data-mode="coquetear" type="button">Coquetear</button>
+          <button class="mode-button" data-mode="enamorar" type="button">Enamorar</button>
+          <button class="mode-button" data-mode="provocativo" type="button">Provocativo</button>
         </div>
         <button id="analyzeButton" class="primary-button" type="button" disabled>
           Analizar conversación
         </button>
         <div id="analysisStatus" class="status" aria-live="polite"></div>
       </div>
+
+      <button id="openPremiumButton" class="secondary-button premium-link" type="button">Premium</button>
     </section>
 
     <section id="resultScreen" class="screen hidden">
       <button id="resultBackButton" class="secondary-button" type="button">Volver</button>
       <h2>Resultado</h2>
-      <p id="resultIntro" class="screen-text">
-        Texto detectado de la captura:
-      </p>
 
       <div class="result-box">
         <p id="ocrText"></p>
       </div>
 
-      <p class="screen-text">Respuesta de demostración basada en el modo seleccionado:</p>
+      <p class="screen-text">Respuesta sugerida por LiggaCuba:</p>
       <div class="result-box">
         <p id="resultText"></p>
       </div>
 
       <button id="copyButton" class="primary-button" type="button">Copiar respuesta</button>
       <div id="copyStatus" class="status" aria-live="polite"></div>
+    </section>
+
+    <section id="premiumScreen" class="screen hidden">
+      <button id="backButtonPremium" class="secondary-button" type="button">Volver</button>
+      <h2>Premium</h2>
+
+      <div class="premium-box">
+        <p>✓ Usos ilimitados</p>
+        <p>✓ Modos premium</p>
+        <p>✓ Máxima velocidad y calidad</p>
+      </div>
+
+      <div class="premium-plan">
+        <p>Plan semanal: 2500 CUP</p>
+        <p>Plan anual: 15500 CUP</p>
+      </div>
+
+      <button id="premiumButton" class="primary-button" type="button">Obtener Premium</button>
     </section>
   </main>
 
