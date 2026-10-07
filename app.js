@@ -1,34 +1,263 @@
-const API_BASE='https://responde-ai-telegram-production.up.railway.app';
-const tg=window.Telegram?.WebApp;
-const state={module:'chat',file:null,mode:'coquetear',userId:String(tg?.initDataUnsafe?.user?.id||'guest-user'),premium:false,remaining:0,language:localStorage.getItem('liggacuba_lang')||'es',cropSource:null,plan:'weekly'};
-const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
-const modes={chat:[['gracioso','fa-face-grin-stars',false],['coquetear','fa-face-smile-wink',false],['provocativo','fa-bolt',true],['enamorar','fa-heart',false]],story:[['gracioso','fa-face-grin-stars',false],['coquetear','fa-face-smile-wink',false],['provocativo','fa-bolt',true],['enamorar','fa-heart',true]]};
-const i18n={es:{loading:'Cargando...',chat_image:'Imagen de la conversación',chat_help:'Sube una captura de tu chat',story_image:'Captura del estado',story_help:'Sube una captura del estado para responder',add:'Agregar',replace:'Reemplazar',delete:'Eliminar',mode:'Modo de respuesta',mode_help:'Elige el estilo de tu respuesta',refresh:'Actualizar',analyze:'Analizar con LiggaCuba',back:'Atrás'},en:{loading:'Loading...',chat_image:'Conversation screenshot',chat_help:'Upload a screenshot of your chat',story_image:'Story screenshot',story_help:'Upload a screenshot of the story to reply to',add:'Add',replace:'Replace',delete:'Delete',mode:'Response mode',mode_help:'Pick the vibe of your reply',refresh:'Refresh',analyze:'Analyze with LiggaCuba',back:'Back'}};
-function toast(msg){const el=$('#toast');el.textContent=msg;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2400)}
-function applyLanguage(){document.documentElement.lang=state.language;$$('[data-i18n]').forEach(e=>{const k=e.dataset.i18n;e.textContent=i18n[state.language][k]||e.textContent});$('#languageValue').textContent=state.language==='es'?'Español':'English'}
-function setModule(mod){state.module=mod;$$('.segment').forEach(b=>b.classList.toggle('active',b.dataset.module===mod));$('#chatScreen').classList.toggle('hidden',mod!=='chat');$('#storyScreen').classList.toggle('hidden',mod!=='story');$('#screenTitle').textContent=mod==='chat'?'Chat':'Estado Story';renderModes();}
-function renderModes(){const box=state.module==='chat'?$('#chatModes'):$('#storyModes');box.innerHTML='';modes[state.module].forEach(([key,icon,locked])=>{const b=document.createElement('button');b.className='mode-card'+(key===state.mode?' selected':'')+(locked?' locked':'');b.dataset.mode=key;b.innerHTML=`<span class="mode-icon"><i class="fa-solid ${icon}"></i></span><strong>${key[0].toUpperCase()+key.slice(1)}</strong>${locked?'<span class="lock"><i class="fa-solid fa-lock"></i></span>':''}`;b.onclick=()=>{if(locked&&!state.premium){showPremium();return}state.mode=key;renderModes()};box.appendChild(b)});}
-function usageText(){return state.premium?'Premium activo · sin límite':`${Math.max(0,state.remaining)} análisis restantes hoy`}
-function updateUsage(){['#usageText','#storyUsageText'].forEach(s=>$(s).textContent=usageText())}
-async function auth(){try{const r=await fetch(`${API_BASE}/api/auth/telegram`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData:tg?.initData||'',user_id:state.userId})});if(r.ok){const d=await r.json();state.userId=String(d.user_id||state.userId);state.premium=!!d.premium;state.remaining=Number(d.remaining||0);updateUsage();return}}catch(e){}await refreshUsage()}
-async function refreshUsage(){try{const r=await fetch(`${API_BASE}/api/usage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId})});if(!r.ok)throw 0;const d=await r.json();state.premium=!!d.premium;state.remaining=Number(d.remaining||0);updateUsage()}catch(e){toast('No se pudo actualizar el límite')}}
-function openFile(input){const f=input.files?.[0];if(!f)return;if(!f.type.startsWith('image/')){toast('Selecciona una imagen válida');input.value='';return}if(f.size>12*1024*1024){toast('La imagen supera el límite de 12 MB');input.value='';return}openCropper(f)}
-let cropImg=$('#cropImage');let cropSource=null;
-function openCropper(file){cropSource=file;const url=URL.createObjectURL(file);cropImg.onload=()=>{$('#cropModal').classList.remove('hidden');};cropImg.src=url}
-function closeCrop(){if(cropImg.src)URL.revokeObjectURL(cropImg.src);cropImg.src='';cropSource=null;$('#cropModal').classList.add('hidden')}
-async function useCrop(){if(!cropSource)return;try{const blob=await cropImageToBlob(cropSource);state.file=new File([blob],`liggacuba-${Date.now()}.jpg`,{type:'image/jpeg'});setPreview(state.file);closeCrop();toast('Imagen recortada y lista')}catch(e){toast('No se pudo recortar la imagen')}}
-function cropImageToBlob(file){return new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>{const w=img.naturalWidth,h=img.naturalHeight;const side=Math.min(w,h);const sx=(w-side)/2,sy=(h-side)/2;const max=1400,scale=Math.min(1,max/side);const c=document.createElement('canvas');c.width=Math.round(side*scale);c.height=Math.round(side*scale);c.getContext('2d').drawImage(img,sx,sy,side,side,0,0,c.width,c.height);c.toBlob(b=>b?resolve(b):reject(new Error('blob')), 'image/jpeg',.9);};img.onerror=reject;img.src=URL.createObjectURL(file)})}
-function setPreview(file){const url=URL.createObjectURL(file);if(state.module==='chat'){$('#emptyUpload').classList.add('hidden');$('#imagePreview').classList.remove('hidden');$('#previewImg').src=url}else{$('#storyEmpty').classList.add('hidden');$('#storyPreview').classList.remove('hidden');$('#storyPreviewImg').src=url}}
-function clearImage(){state.file=null;if(state.module==='chat'){$('#emptyUpload').classList.remove('hidden');$('#imagePreview').classList.add('hidden');$('#imageInput').value=''}else{$('#storyEmpty').classList.remove('hidden');$('#storyPreview').classList.add('hidden');$('#storyInput').value=''}}
-function fileBase64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=rej;r.readAsDataURL(file)})}
-async function runOCR(file){const b64=await fileBase64(file);const r=await fetch(`${API_BASE}/ocr-base64-simple`,{method:'POST',headers:{'Content-Type':'text/plain'},body:b64});const d=await r.json();if(!r.ok||!d.success)throw new Error(d.detail||'Error del OCR');return String(d.text||'').trim()}
-async function consume(){const r=await fetch(`${API_BASE}/api/analyze`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId,mode:state.mode,module:state.module})});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||'No se pudo validar el límite');state.premium=!!d.premium;state.remaining=Number(d.remaining||0);updateUsage();return d}
-async function generate(text){const r=await fetch(`${API_BASE}/api/generate-reply`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId,mode:state.mode,text,module:state.module})});const d=await r.json();if(!r.ok)throw new Error(d.detail||'No se pudo generar la respuesta');return d.reply}
-async function analyze(){if(!state.file){toast('Agrega una imagen primero');return}const btn=state.module==='chat'?$('#analyzeButton'):$('#storyAnalyze');btn.disabled=true;btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> Analizando...';try{await consume();toast('Procesando OCR...');const text=await runOCR(state.file);toast('Generando respuesta...');const reply=await generate(text);$('#ocrOutput').textContent=text||'No se detectó texto.';$('#replyOutput').textContent=reply||'No se generó una respuesta.';$('#resultModal').classList.remove('hidden')}catch(e){toast(e.message)}finally{btn.disabled=false;btn.innerHTML='<i class="fa-solid fa-wand-magic-sparkles"></i> '+(i18n[state.language].analyze)}}
-function showPremium(){$('#premiumScreen').classList.remove('hidden');$('#chatScreen').classList.add('hidden');$('#storyScreen').classList.add('hidden');$('.bottom-nav').classList.add('hidden')}
-function hidePremium(){$('#premiumScreen').classList.add('hidden');$('.bottom-nav').classList.remove('hidden');setModule(state.module)}
-async function createPayment(){const r=await fetch(`${API_BASE}/api/payments/pending`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId,plan:state.plan,language:state.language})});const d=await r.json();if(!r.ok)throw new Error(d.detail||'No se pudo crear la operación');$('#paymentStatus').textContent=`Operación pendiente: ${d.operation_id}. Completa el pago según las instrucciones del backend.`}
-function profile(){['#chatScreen','#storyScreen','#settingsScreen','#premiumScreen'].forEach(s=>$(s).classList.add('hidden'));$('#profileScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden');$$('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.nav==='profile'))}
-function home(){['#profileScreen','#settingsScreen','#premiumScreen'].forEach(s=>$(s).classList.add('hidden'));$('.bottom-nav').classList.remove('hidden');$$('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.nav==='home'));setModule(state.module)}
-$('#imageInput').onchange=()=>openFile($('#imageInput'));$('#storyInput').onchange=()=>openFile($('#storyInput'));$('#uploadCard').onclick=e=>{if(!e.target.closest('button'))$('#imageInput').click()};$('#storyAdd').onclick=()=>$('#storyInput').click();$('#replaceImage').onclick=()=>$('#imageInput').click();$('#storyReplace').onclick=()=>$('#storyInput').click();$('#deleteImage').onclick=clearImage;$('#storyDelete').onclick=clearImage;$('#cropCancel').onclick=closeCrop;$('#cropClose').onclick=closeCrop;$('#cropUse').onclick=useCrop;$('#analyzeButton').onclick=analyze;$('#storyAnalyze').onclick=analyze;$('#refreshUsage').onclick=refreshUsage;$('#storyRefreshUsage').onclick=refreshUsage;$('#profileTop').onclick=profile;$('#settingsButton').onclick=()=>{profile();$('#profileScreen').classList.add('hidden');$('#settingsScreen').classList.remove('hidden')};$('#backFromSettings').onclick=profile;$('#premiumButton').onclick=showPremium;$('#backFromPremium').onclick=hidePremium;$('#startPayment').onclick=async()=>{try{await createPayment()}catch(e){$('#paymentStatus').textContent=e.message}};$('#resultClose').onclick=()=>$('#resultModal').classList.add('hidden');$('#anotherAnalysis').onclick=()=>{$('#resultModal').classList.add('hidden');clearImage()};$('#copyResponse').onclick=async()=>{try{await navigator.clipboard.writeText($('#replyOutput').textContent);$('#copyStatus').textContent='Respuesta copiada.'}catch(e){$('#copyStatus').textContent='No se pudo copiar.'}};$$('.segment').forEach(b=>b.onclick=()=>setModule(b.dataset.module));$$('.nav-item').forEach(b=>b.onclick=()=>b.dataset.nav==='profile'?profile():home());$$('.plan').forEach(b=>b.onclick=()=>{$$('.plan').forEach(x=>x.classList.remove('selected'));b.classList.add('selected');state.plan=b.dataset.plan});$('#languageButton').onclick=()=>{state.language=state.language==='es'?'en':'es';localStorage.setItem('liggacuba_lang',state.language);applyLanguage()};$('#contactButton').onclick=()=>toast('Configura aquí el contacto oficial de LiggaCuba');$('#feedbackButton').onclick=()=>toast('Configura aquí el grupo oficial de feedback');
-if(tg){tg.ready();tg.expand();}applyLanguage();renderModes();setTimeout(()=>{$('#splash').classList.add('hidden');$('#app').classList.remove('hidden');},700);auth();
+const API_BASE = 'https://responde-ai-telegram-production.up.railway.app';
+
+const state = {
+  selectedFile: null,
+  selectedMode: 'coquetear',
+  userId: 'guest-user',
+  usage: null,
+};
+
+const modeButtons = document.querySelectorAll('.mode-card');
+const segments = document.querySelectorAll('.segment');
+const tabs = document.querySelectorAll('.tab-home, .tab-profile');
+const uploadInput = document.querySelector('#chatImageInput');
+const uploadZone = document.querySelector('.upload-zone');
+const analyzeButton = document.getElementById('analyzeButton');
+const statusMessage = document.getElementById('statusMessage');
+const usageText = document.getElementById('usageText');
+const refreshUsage = document.getElementById('refreshUsage');
+const resultPanel = document.getElementById('resultPanel');
+const ocrOutput = document.getElementById('ocrOutput');
+const replyOutput = document.getElementById('replyOutput');
+const copyResponseButton = document.getElementById('copyResponse');
+const copyStatus = document.getElementById('copyStatus');
+const uploadText = document.querySelector('.upload-text');
+
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) {
+  state.userId = String(tg.initDataUnsafe.user.id || 'guest-user');
+}
+
+function setStatus(message, type = '') {
+  statusMessage.textContent = message || '';
+  statusMessage.className = 'status-message';
+  if (type) statusMessage.classList.add(type);
+}
+
+function updateUsageUI(data) {
+  const remaining = Number(data?.remaining ?? 0);
+  if (data?.premium) {
+    usageText.textContent = 'Premium activo · sin límite';
+    return;
+  }
+  usageText.textContent = `${Math.max(remaining, 0)} análisis restantes hoy`;
+}
+
+async function fetchUsage() {
+  try {
+    const response = await fetch(`${API_BASE}/api/usage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: state.userId }),
+    });
+
+    if (!response.ok) return;
+    const data = await response.json();
+    state.usage = data;
+    updateUsageUI(data);
+  } catch (error) {
+    console.warn('No se pudo cargar el uso:', error);
+  }
+}
+
+async function consumeAnalysis() {
+  const response = await fetch(`${API_BASE}/api/analyze`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: state.userId }),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.detail || 'No se pudo validar el límite de uso.');
+  }
+
+  return response.json();
+}
+
+function buildLocalReply(mode, text) {
+  const normalized = (text || '').replace(/\s+/g, ' ').trim();
+  const lower = normalized.toLowerCase();
+
+  const modes = {
+    gracioso: 'Responde con un toque ligero y divertido, sin perder naturalidad.',
+    coquetear: 'Usa un tono cálido y atractivo, pero sin presionar ni forzar.',
+    provocativo: 'Da un tono más directo e intenso, pero con control y clase.',
+    enamorar: 'Haz una respuesta elegante, cercana y romántica, con buena energía y respeto.',
+  };
+
+  if (!normalized) {
+    return 'No pude detectar texto suficiente para generar una respuesta útil. Intenta otra captura.';
+  }
+
+  const base = modes[mode] || modes.coquetear;
+  if (lower.includes('hola') || lower.includes('hey')) {
+    return `${base} Además, puedes empezar con un saludo amable y seguir la conversación sin hacerla forzada.`;
+  }
+  if (lower.includes('porque') || lower.includes('por qué')) {
+    return `${base} Responde con claridad, evita entrar en defensiva y deja la conversación con una línea amable y directa.`;
+  }
+
+  return `${base} Mantén la respuesta breve, auténtica y con buena energía.`;
+}
+
+async function callGenerateReply(text, mode) {
+  try {
+    const response = await fetch(`${API_BASE}/api/generate-reply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: state.userId, mode, text }),
+    });
+
+    if (!response.ok) {
+      return buildLocalReply(mode, text);
+    }
+
+    const data = await response.json();
+    return data.reply || buildLocalReply(mode, text);
+  } catch (error) {
+    return buildLocalReply(mode, text);
+  }
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') {
+        reject(new Error('No se pudo convertir la imagen.'));
+        return;
+      }
+      resolve(reader.result);
+    };
+    reader.onerror = () => reject(new Error('No se pudo leer la imagen.'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function runOCR(file) {
+  const base64 = await fileToBase64(file);
+  const response = await fetch(`${API_BASE}/ocr-base64-simple`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: base64,
+  });
+
+  let data;
+  try {
+    data = await response.json();
+  } catch (error) {
+    throw new Error('La respuesta del OCR no es válida.');
+  }
+
+  if (!response.ok || !data.success) {
+    throw new Error(data?.detail || `Error del OCR (${response.status}).`);
+  }
+
+  return (data.text || '').trim();
+}
+
+async function handleAnalyze() {
+  if (!state.selectedFile) {
+    setStatus('Selecciona una imagen antes de analizar.', 'error');
+    return;
+  }
+
+  if (!state.selectedMode) {
+    setStatus('Elige un estilo de respuesta.', 'error');
+    return;
+  }
+
+  analyzeButton.disabled = true;
+  analyzeButton.textContent = 'Analizando...';
+  setStatus('Procesando imagen...');
+
+  try {
+    const usageResult = await consumeAnalysis();
+    if (!usageResult.allowed) {
+      setStatus('Has alcanzado tus 3 análisis gratuitos de hoy. Obtén Premium.', 'error');
+      analyzeButton.disabled = false;
+      analyzeButton.textContent = 'Analizar con Liggo';
+      return;
+    }
+
+    const text = await runOCR(state.selectedFile);
+    const reply = await callGenerateReply(text, state.selectedMode);
+
+    ocrOutput.textContent = text || 'No se detectó texto en la imagen.';
+    replyOutput.textContent = reply;
+    resultPanel.classList.remove('hidden');
+    setStatus('Listo. Tu respuesta está preparada.', 'success');
+
+    if (usageResult.remaining !== undefined) {
+      updateUsageUI({ remaining: usageResult.remaining, premium: usageResult.premium });
+    }
+  } catch (error) {
+    console.error(error);
+    setStatus(error.message || 'No se pudo completar el análisis.', 'error');
+  } finally {
+    analyzeButton.disabled = false;
+    analyzeButton.textContent = 'Analizar con Liggo';
+  }
+}
+
+async function handleRefreshUsage() {
+  setStatus('Actualizando cuota...');
+  await fetchUsage();
+  setStatus('');
+}
+
+modeButtons.forEach((button) => {
+  button.addEventListener('click', () => {
+    modeButtons.forEach((card) => card.classList.remove('selected'));
+    button.classList.add('selected');
+    state.selectedMode = button.dataset.mode || 'coquetear';
+    setStatus('Modo listo. Puedes analizar la imagen.', 'success');
+  });
+});
+
+segments.forEach((button) => {
+  button.addEventListener('click', () => {
+    segments.forEach((item) => item.classList.remove('active'));
+    button.classList.add('active');
+  });
+});
+
+tabs.forEach((button) => {
+  button.addEventListener('click', () => {
+    tabs.forEach((item) => item.classList.remove('active'));
+    button.classList.add('active');
+  });
+});
+
+if (uploadInput && uploadZone) {
+  uploadZone.addEventListener('click', () => uploadInput.click());
+  uploadInput.addEventListener('change', () => {
+    const file = uploadInput.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setStatus('Selecciona un archivo de imagen válido.', 'error');
+      return;
+    }
+    state.selectedFile = file;
+    if (uploadText) {
+      uploadText.textContent = file.name.length > 16 ? `${file.name.slice(0, 16)}...` : file.name;
+    }
+    setStatus('Imagen cargada. Elige un estilo y analiza.', 'success');
+  });
+}
+
+analyzeButton.addEventListener('click', handleAnalyze);
+refreshUsage.addEventListener('click', handleRefreshUsage);
+
+copyResponseButton.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(replyOutput.textContent);
+    copyStatus.textContent = 'Respuesta copiada.';
+  } catch (error) {
+    copyStatus.textContent = 'No se pudo copiar automáticamente.';
+  }
+});
+
+fetchUsage();
+setStatus('');
