@@ -4,12 +4,13 @@ from pydantic import BaseModel
 from PIL import Image
 import base64
 import io
-import pytesseract
 import os
+import sqlite3
+import pytesseract
 from datetime import datetime, timedelta
 from typing import Dict, Any
 
-app = FastAPI(title="LiggaCuba API", version="1.1.0")
+app = FastAPI(title="LiggaCuba API", version="1.2.0")
 
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
@@ -21,44 +22,107 @@ app.add_middleware(
 )
 
 FREE_DAILY_LIMIT = 3
-USAGE_DB: Dict[str, Dict[str, Any]] = {}
+DB_PATH = os.getenv("DATABASE_PATH", "/tmp/liggacuba.db")
+
+
+def db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    conn = db_connect()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            date TEXT NOT NULL,
+            used_today INTEGER NOT NULL DEFAULT 0,
+            premium INTEGER NOT NULL DEFAULT 0,
+            premium_until TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+def utc_now() -> datetime:
+    return datetime.utcnow()
 
 
 def get_or_create_user(user_id: str) -> Dict[str, Any]:
-    if user_id not in USAGE_DB:
-        USAGE_DB[user_id] = {
-            "user_id": user_id,
-            "date": datetime.utcnow().date().isoformat(),
-            "used_today": 0,
-            "premium": False,
-            "premium_until": None,
-        }
-    return USAGE_DB[user_id]
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id requerido")
+
+    conn = db_connect()
+    row = conn.execute(
+        "SELECT user_id, date, used_today, premium, premium_until FROM users WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+
+    if row is None:
+        now_iso = utc_now().isoformat()
+        conn.execute(
+            """
+            INSERT INTO users (user_id, date, used_today, premium, premium_until, created_at, updated_at)
+            VALUES (?, ?, 0, 0, NULL, ?, ?)
+            """,
+            (user_id, utc_now().date().isoformat(), now_iso, now_iso),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT user_id, date, used_today, premium, premium_until FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+    conn.close()
+    if row is None:
+        raise HTTPException(status_code=500, detail="No se pudo crear el usuario")
+
+    return {
+        "user_id": row["user_id"],
+        "date": row["date"],
+        "used_today": int(row["used_today"]),
+        "premium": bool(row["premium"]),
+        "premium_until": row["premium_until"],
+    }
 
 
 def reset_if_needed(user_id: str):
     user = get_or_create_user(user_id)
-    today = datetime.utcnow().date().isoformat()
+    today = utc_now().date().isoformat()
     if user["date"] != today:
-        user["date"] = today
-        user["used_today"] = 0
+        conn = db_connect()
+        conn.execute(
+            "UPDATE users SET date = ?, used_today = 0, updated_at = ? WHERE user_id = ?",
+            (today, utc_now().isoformat(), user_id),
+        )
+        conn.commit()
+        conn.close()
 
 
 def is_premium_active(user_id: str) -> bool:
     user = get_or_create_user(user_id)
     if not user.get("premium"):
         return False
-    if user.get("premium_until") is None:
+    premium_until = user.get("premium_until")
+    if not premium_until:
         return False
-    return datetime.utcnow() < datetime.fromisoformat(user["premium_until"])
+    return utc_now() < datetime.fromisoformat(premium_until)
 
 
 def can_use_analysis(user_id: str) -> Dict[str, Any]:
     reset_if_needed(user_id)
     user = get_or_create_user(user_id)
-    premium = is_premium_active(user_id)
-
-    if premium:
+    if is_premium_active(user_id):
         return {
             "allowed": True,
             "remaining": 999,
@@ -67,11 +131,11 @@ def can_use_analysis(user_id: str) -> Dict[str, Any]:
             "message": "Premium activo",
         }
 
-    remaining = max(0, FREE_DAILY_LIMIT - user["used_today"])
+    remaining = max(0, FREE_DAILY_LIMIT - int(user["used_today"]))
     return {
-        "allowed": user["used_today"] < FREE_DAILY_LIMIT,
+        "allowed": int(user["used_today"]) < FREE_DAILY_LIMIT,
         "remaining": remaining,
-        "used_today": user["used_today"],
+        "used_today": int(user["used_today"]),
         "premium": False,
         "message": "Límite gratuito alcanzado" if remaining == 0 else "Disponible",
     }
@@ -84,11 +148,19 @@ def consume_analysis(user_id: str) -> Dict[str, Any]:
     if is_premium_active(user_id):
         return {"allowed": True, "remaining": 999, "premium": True}
 
-    if user["used_today"] >= FREE_DAILY_LIMIT:
+    if int(user["used_today"]) >= FREE_DAILY_LIMIT:
         return {"allowed": False, "remaining": 0, "premium": False}
 
-    user["used_today"] += 1
-    remaining = max(0, FREE_DAILY_LIMIT - user["used_today"])
+    new_used = int(user["used_today"]) + 1
+    conn = db_connect()
+    conn.execute(
+        "UPDATE users SET used_today = ?, updated_at = ? WHERE user_id = ?",
+        (new_used, utc_now().isoformat(), user_id),
+    )
+    conn.commit()
+    conn.close()
+
+    remaining = max(0, FREE_DAILY_LIMIT - new_used)
     return {"allowed": True, "remaining": remaining, "premium": False}
 
 
@@ -119,7 +191,6 @@ def generate_reply(mode: str, text: str) -> str:
     }
 
     style = mode_map.get(mode, mode_map["natural"])
-    preview = normalized[:220]
     return f"{opener}responde de forma {style} Mantén la respuesta breve, cercana y natural. Puedes decir: ‘Vi lo que escribiste y me gustó cómo lo planteas, me gustaría seguir esta conversación contigo.’"
 
 
@@ -235,7 +306,10 @@ class GenerateReplyRequest(BaseModel):
 
 @app.post("/api/generate-reply")
 async def generate_reply_endpoint(payload: GenerateReplyRequest):
-    user = get_or_create_user(payload.user_id)
+    if not payload.user_id:
+        raise HTTPException(status_code=400, detail="user_id requerido")
+
+    get_or_create_user(payload.user_id)
     if not is_premium_active(payload.user_id):
         status = can_use_analysis(payload.user_id)
         if not status["allowed"]:
@@ -255,8 +329,17 @@ async def activate_premium(payload: PremiumActivate):
     user = get_or_create_user(payload.user_id)
     user["premium"] = True
     user["premium_until"] = (
-        datetime.utcnow() + timedelta(days=7 if payload.plan == "weekly" else 365)
-    ).isoformat()
+        (utc_now() + timedelta(days=7 if payload.plan == "weekly" else 365)).isoformat()
+    )
+
+    conn = db_connect()
+    conn.execute(
+        "UPDATE users SET premium = 1, premium_until = ?, updated_at = ? WHERE user_id = ?",
+        (user["premium_until"], utc_now().isoformat(), payload.user_id),
+    )
+    conn.commit()
+    conn.close()
+
     return {
         "success": True,
         "premium": True,
@@ -281,7 +364,11 @@ async def premium_status(payload: UsageQuery):
 
 @app.post("/api/reset")
 async def reset_usage(payload: UsageQuery):
-    user = get_or_create_user(payload.user_id)
-    user["date"] = datetime.utcnow().date().isoformat()
-    user["used_today"] = 0
+    conn = db_connect()
+    conn.execute(
+        "UPDATE users SET date = ?, used_today = 0, updated_at = ? WHERE user_id = ?",
+        (utc_now().date().isoformat(), utc_now().isoformat(), payload.user_id),
+    )
+    conn.commit()
+    conn.close()
     return {"success": True, "remaining": FREE_DAILY_LIMIT}
