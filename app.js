@@ -13,8 +13,8 @@ const translations = {
     start: "Comenzar",
     chatTitle: "Chat",
     chatSubtitle: "Selecciona una captura de pantalla para analizar.",
-    heroSelect: "Seleccionar captura",
-    fileHint: "JPG, PNG o WEBP",
+    chooseCapture: "Seleccionar captura",
+    chooseCaptureHint: "JPG, PNG o WEBP",
     changeImage: "Cambiar captura",
     chooseMode: "¿Qué tipo de respuesta buscas?",
     analyze: "Analizar conversación",
@@ -31,11 +31,10 @@ const translations = {
     settingsLanguage: "Idioma",
     settingsContact: "Contáctanos",
     settingsOpinion: "Tu opinión",
-    settingsBack: "Volver",
     back: "Volver",
     premiumLink: "Premium",
     settingsLink: "Configuración",
-    statusNo: "Selecciona una imagen válida.",
+    statusInvalid: "Selecciona una imagen válida.",
     statusReady: "Captura seleccionada. Ahora elige un modo.",
     statusMode: "Modo seleccionado. Ya puedes analizar.",
     copying: "Respuesta copiada.",
@@ -59,6 +58,9 @@ const translations = {
     preparing: "Preparando captura…",
     connected: "Conectado. Preparando imagen…",
     sending: "Enviando captura al OCR…",
+    resultFallback: "No se pudo detectar texto en la captura.",
+    responseFallback: "Puedes responder con naturalidad.",
+    storyButton: "Estado / Story",
   },
   en: {
     brand: "LIGGACUBA",
@@ -67,9 +69,9 @@ const translations = {
     start: "Start",
     chatTitle: "Chat",
     chatSubtitle: "Select a screenshot to analyze.",
-    heroSelect: "Choose capture",
-    fileHint: "JPG, PNG or WEBP",
-    changeImage: "Change image",
+    chooseCapture: "Choose capture",
+    chooseCaptureHint: "JPG, PNG or WEBP",
+    changeImage: "Change capture",
     chooseMode: "What type of response do you want?",
     analyze: "Analyze conversation",
     resultTitle: "Result",
@@ -85,11 +87,10 @@ const translations = {
     settingsLanguage: "Language",
     settingsContact: "Contact us",
     settingsOpinion: "Your opinion",
-    settingsBack: "Back",
     back: "Back",
     premiumLink: "Premium",
     settingsLink: "Settings",
-    statusNo: "Select a valid image.",
+    statusInvalid: "Select a valid image.",
     statusReady: "Capture selected. Now choose a mode.",
     statusMode: "Mode selected. You can analyze now.",
     copying: "Response copied.",
@@ -113,7 +114,10 @@ const translations = {
     preparing: "Preparing capture…",
     connected: "Connected. Preparing image…",
     sending: "Sending capture to OCR…",
-  }
+    resultFallback: "Could not detect text in the image.",
+    responseFallback: "You can answer naturally.",
+    storyButton: "Status / Story",
+  },
 };
 
 const appState = {
@@ -121,16 +125,17 @@ const appState = {
   selectedMode: null,
   userId: "guest-user",
   language: "es",
-  activeScreen: "welcome",
   activeModule: "chat",
 };
 
-const welcomeScreen = document.getElementById("welcomeScreen");
-const analyzeScreen = document.getElementById("analyzeScreen");
-const resultScreen = document.getElementById("resultScreen");
-const premiumScreen = document.getElementById("premiumScreen");
-const storyScreen = document.getElementById("storyScreen");
-const settingsScreen = document.getElementById("settingsScreen");
+const screens = {
+  welcome: document.getElementById("welcomeScreen"),
+  chat: document.getElementById("analyzeScreen"),
+  result: document.getElementById("resultScreen"),
+  premium: document.getElementById("premiumScreen"),
+  story: document.getElementById("storyScreen"),
+  settings: document.getElementById("settingsScreen"),
+};
 
 const welcome = document.getElementById("welcome");
 const startButton = document.getElementById("startButton");
@@ -153,8 +158,10 @@ const copyButton = document.getElementById("copyButton");
 const copyStatus = document.getElementById("copyStatus");
 const openPremiumButton = document.getElementById("openPremiumButton");
 const openSettingsButton = document.getElementById("openSettingsButton");
+const openSettingsButtonStory = document.getElementById("openSettingsButtonStory");
 const premiumButton = document.getElementById("premiumButton");
 const backButtonPremium = document.getElementById("backButtonPremium");
+const backButtonSettings = document.getElementById("backButtonSettings");
 const storyButton = document.getElementById("storyButton");
 const backButtonStory = document.getElementById("backButtonStory");
 const storyImageInput = document.getElementById("storyImageInput");
@@ -167,17 +174,6 @@ const storyAnalyzeButton = document.getElementById("storyAnalyzeButton");
 const storyAnalysisStatus = document.getElementById("storyAnalysisStatus");
 const storyLimitStatus = document.getElementById("storyLimitStatus");
 const languageToggle = document.getElementById("languageToggle");
-
-const demoResponses = {
-  natural: "Puedes responder de forma natural y tranquila, manteniendo la conversación sin forzarla.",
-  casual: "Puedes mantener un tono relajado y cercano para que la conversación siga fluyendo.",
-  segura: "Una respuesta clara y tranquila puede mantener la conversación sin complicarla.",
-  curiosa: "Puedes dejar una pequeña pregunta abierta para mostrar interés y seguir la conversación.",
-  gracioso: "Puedes responder con un toque ligero y divertido, sin perder naturalidad.",
-  coquetear: "Puedes responder con un tono cálido y atractivo, sin presionar ni forzar.",
-  enamorar: "Haz una respuesta amable, cercana y elegante, con intención clara pero respetuosa.",
-  provocativo: "Haz una respuesta más intensa, directa y seductora, pero siempre controlada.",
-};
 
 const user = tg?.initDataUnsafe?.user;
 if (user) {
@@ -193,32 +189,34 @@ function t(key) {
 
 function updateLanguageUI() {
   document.querySelector(".brand").textContent = t("brand");
-  document.querySelector("#welcomeTitle").textContent = t("welcomeTitle");
+  document.getElementById("welcomeTitle").textContent = t("welcomeTitle");
   welcome.textContent = t("welcomeText");
   startButton.textContent = t("start");
-  document.querySelector("#chatTitle").textContent = t("chatTitle");
-  document.querySelector("#chatSubtitle").textContent = t("chatSubtitle");
-  document.querySelector("#storyTitle").textContent = t("storyTitle");
-  document.querySelector("#storySubtitle").textContent = t("storySubtitle");
-  document.querySelector("#settingsTitle").textContent = t("settingsTitle");
-  document.querySelector("#resultTitle").textContent = t("resultTitle");
-  document.querySelector("#resultIntro").textContent = t("resultIntro");
-  document.querySelector("#copyButton").textContent = t("copy");
-  document.querySelector("#premiumTitle").textContent = t("premiumTitle");
-  document.querySelector("#premiumPlan1").textContent = t("premiumPlan1");
-  document.querySelector("#premiumPlan2").textContent = t("premiumPlan2");
-  document.querySelector("#premiumButton").textContent = t("premiumButton");
-  document.querySelector("#settingsLanguage").textContent = t("settingsLanguage");
-  document.querySelector("#settingsContact").textContent = t("settingsContact");
-  document.querySelector("#settingsOpinion").textContent = t("settingsOpinion");
-  document.querySelector("#openPremiumButton").textContent = t("premiumLink");
-  document.querySelector("#openSettingsButton").textContent = t("settingsLink");
-  document.querySelector("#storyButton").textContent = t("storyTitle");
-  document.querySelector("#imageLabel").textContent = t("heroSelect");
-  document.querySelector("#imageHint").textContent = t("fileHint");
-  document.querySelector("#removeImageButton").textContent = t("changeImage");
-  document.querySelector("#modeLabel").textContent = t("chooseMode");
+  document.getElementById("chatTitle").textContent = t("chatTitle");
+  document.getElementById("chatSubtitle").textContent = t("chatSubtitle");
+  document.getElementById("storyTitle").textContent = t("storyTitle");
+  document.getElementById("storySubtitle").textContent = t("storySubtitle");
+  document.getElementById("settingsTitle").textContent = t("settingsTitle");
+  document.getElementById("resultTitle").textContent = t("resultTitle");
+  document.getElementById("resultIntro").textContent = t("resultIntro");
+  document.getElementById("copyButton").textContent = t("copy");
+  document.getElementById("premiumTitle").textContent = t("premiumTitle");
+  document.getElementById("premiumPlan1").textContent = t("premiumPlan1");
+  document.getElementById("premiumPlan2").textContent = t("premiumPlan2");
+  document.getElementById("premiumButton").textContent = t("premiumButton");
+  document.getElementById("settingsLanguage").textContent = t("settingsLanguage");
+  document.getElementById("settingsContact").textContent = t("settingsContact");
+  document.getElementById("settingsOpinion").textContent = t("settingsOpinion");
+  openPremiumButton.textContent = t("premiumLink");
+  openSettingsButton.textContent = t("settingsLink");
+  openSettingsButtonStory.textContent = t("settingsLink");
+  storyButton.textContent = t("storyButton");
+  document.getElementById("imageLabel").textContent = t("chooseCapture");
+  document.getElementById("imageHint").textContent = t("chooseCaptureHint");
+  removeImageButton.textContent = t("changeImage");
+  document.getElementById("modeLabel").textContent = t("chooseMode");
   analyzeButton.textContent = t("analyze");
+
   const modeLabels = {
     natural: t("modeNatural"),
     casual: t("modeCasual"),
@@ -229,33 +227,27 @@ function updateLanguageUI() {
     enamorar: t("modeLove"),
     provocativo: t("modeProvocative"),
   };
+
   modeButtons.forEach((btn) => {
     const key = btn.dataset.mode;
     if (modeLabels[key]) btn.textContent = modeLabels[key];
   });
+
   storyModeButtons.forEach((btn) => {
     const key = btn.dataset.mode;
     if (modeLabels[key]) btn.textContent = modeLabels[key];
   });
-  if (languageToggle) {
-    languageToggle.value = appState.language;
-  }
+
+  if (languageToggle) languageToggle.value = appState.language;
 }
 
 function showScreen(screenName) {
-  appState.activeScreen = screenName;
-  [welcomeScreen, analyzeScreen, resultScreen, premiumScreen, storyScreen, settingsScreen].forEach((item) => {
-    if (item) item.classList.add("hidden");
+  Object.entries(screens).forEach(([key, el]) => {
+    if (el) el.classList.add("hidden");
   });
-  const target = {
-    welcome: welcomeScreen,
-    chat: analyzeScreen,
-    result: resultScreen,
-    premium: premiumScreen,
-    story: storyScreen,
-    settings: settingsScreen,
-  }[screenName];
+  const target = screens[screenName];
   if (target) target.classList.remove("hidden");
+  appState.activeModule = screenName === "story" ? "story" : "chat";
   window.scrollTo({ top: 0, behavior: "instant" });
 }
 
@@ -319,6 +311,53 @@ async function fetchUsageStatus() {
   }
 }
 
+function generateLocalResponse(mode, text) {
+  const normalized = (text || "").replace(/\s+/g, " ").trim();
+  const lower = normalized.toLowerCase();
+  const replyMap = {
+    natural: "Puedes responder de forma natural, cercana y sin forzar la conversación.",
+    casual: "Mantén un tono relajado y amistoso para que la charla siga fluyendo sin tensión.",
+    segura: "Haz una respuesta clara y segura, con respeto y sin dramatizar la situación.",
+    curiosa: "Deja una pequeña pregunta abierta para mostrar interés y mantener el flujo.",
+    gracioso: "Responde con un toque ligero y divertido, sin perder naturalidad.",
+    coquetear: "Usa un tono cálido y atractivo, pero sin presionar ni forzar.",
+    enamorar: "Haz una respuesta elegante, cercana y romántica, con buena energía y respeto.",
+    provocativo: "Da un tono más directo y intenso, pero siempre con control y clase.",
+  };
+
+  if (!normalized) {
+    return "No pude detectar texto suficiente para generar una respuesta útil. Intenta otra captura.";
+  }
+
+  const base = replyMap[mode] || replyMap.natural;
+  if (lower.includes("hola") || lower.includes("hey")) {
+    return `${base} Además, puedes empezar con un saludo amable y seguir la conversación sin hacerla forzada.`;
+  }
+  if (lower.includes("porque") || lower.includes("por qué")) {
+    return `${base} Responde con claridad, sin entrar en defensiva, y deja la conversación con una línea amable y directa.`;
+  }
+  return `${base} Mantén la respuesta breve, auténtica y con buena energía.`;
+}
+
+async function callGenerateReply(messageText, mode) {
+  try {
+    const res = await fetch("https://responde-ai-telegram-production.up.railway.app/api/generate-reply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: appState.userId, mode, text: messageText }),
+    });
+
+    if (!res.ok) {
+      return generateLocalResponse(mode, messageText);
+    }
+
+    const data = await res.json();
+    return data.reply || generateLocalResponse(mode, messageText);
+  } catch (error) {
+    return generateLocalResponse(mode, messageText);
+  }
+}
+
 startButton.addEventListener("click", async () => {
   status.textContent = "";
   resetAnalysis();
@@ -331,9 +370,8 @@ backButton.addEventListener("click", () => {
   showScreen("welcome");
 });
 
-backButtonPremium.addEventListener("click", () => {
-  showScreen("chat");
-});
+backButtonPremium.addEventListener("click", () => showScreen("chat"));
+backButtonSettings.addEventListener("click", () => showScreen("chat"));
 
 storyButton.addEventListener("click", () => {
   resetStoryAnalysis();
@@ -345,11 +383,10 @@ backButtonStory.addEventListener("click", () => {
   showScreen("chat");
 });
 
-openSettingsButton.addEventListener("click", () => {
-  showScreen("settings");
-});
+openSettingsButton.addEventListener("click", () => showScreen("settings"));
+openSettingsButtonStory.addEventListener("click", () => showScreen("settings"));
 
-languageToggle.addEventListener("change", (event) => {
+document.getElementById("languageToggle").addEventListener("change", (event) => {
   appState.language = event.target.value;
   updateLanguageUI();
 });
@@ -359,7 +396,7 @@ imageInput.addEventListener("change", () => {
   if (!file) return;
 
   if (!file.type.startsWith("image/")) {
-    analysisStatus.textContent = t("statusNo");
+    analysisStatus.textContent = t("statusInvalid");
     imageInput.value = "";
     return;
   }
@@ -373,7 +410,6 @@ imageInput.addEventListener("change", () => {
     modeSection.classList.remove("hidden");
     analysisStatus.textContent = t("statusReady");
   };
-
   reader.readAsDataURL(file);
 });
 
@@ -382,7 +418,7 @@ storyImageInput.addEventListener("change", () => {
   if (!file) return;
 
   if (!file.type.startsWith("image/")) {
-    storyAnalysisStatus.textContent = t("statusNo");
+    storyAnalysisStatus.textContent = t("statusInvalid");
     storyImageInput.value = "";
     return;
   }
@@ -398,13 +434,8 @@ storyImageInput.addEventListener("change", () => {
   reader.readAsDataURL(file);
 });
 
-removeImageButton.addEventListener("click", () => {
-  imageInput.click();
-});
-
-storyRemoveImageButton.addEventListener("click", () => {
-  storyImageInput.click();
-});
+removeImageButton.addEventListener("click", () => imageInput.click());
+storyRemoveImageButton.addEventListener("click", () => storyImageInput.click());
 
 modeButtons.forEach((button) => {
   button.addEventListener("click", () => {
@@ -431,10 +462,8 @@ const OCR_API_URL = "https://responde-ai-telegram-production.up.railway.app/ocr-
 async function prepareImageForOCR(file) {
   return await new Promise((resolve, reject) => {
     const reader = new FileReader();
-
     reader.onload = () => {
       const img = new Image();
-
       img.onload = () => {
         const maxSize = 1280;
         let width = img.naturalWidth;
@@ -477,7 +506,7 @@ async function prepareImageForOCR(file) {
 }
 
 async function runOCR(image) {
-  const activeStatus = analysisStatus || storyAnalysisStatus;
+  const activeStatus = document.activeElement && document.activeElement.id === "storyAnalyzeButton" ? storyAnalysisStatus : analysisStatus;
   if (activeStatus) activeStatus.textContent = t("preparing");
 
   try {
@@ -551,11 +580,11 @@ async function consumeAnalysis() {
   }
 }
 
-async function analyzeCurrentImage() {
+async function handleAnalysisAction() {
   if (!appState.selectedImage || !appState.selectedMode) return;
 
-  const currentAnalyzeButton = appState.activeScreen === "story" ? storyAnalyzeButton : analyzeButton;
-  const currentStatusEl = appState.activeScreen === "story" ? storyAnalysisStatus : analysisStatus;
+  const currentAnalyzeButton = appState.activeModule === "story" ? storyAnalyzeButton : analyzeButton;
+  const currentStatusEl = appState.activeModule === "story" ? storyAnalysisStatus : analysisStatus;
 
   currentAnalyzeButton.disabled = true;
   currentAnalyzeButton.textContent = t("analyzing");
@@ -571,27 +600,24 @@ async function analyzeCurrentImage() {
     }
 
     const text = await runOCR(appState.selectedImage);
-    ocrText.textContent = text || "No se pudo detectar texto en la captura.";
-    resultText.textContent = demoResponses[appState.selectedMode] || "Puedes responder con naturalidad.";
+    const reply = await callGenerateReply(text || "", appState.selectedMode);
+
+    ocrText.textContent = text || t("resultFallback");
+    resultText.textContent = reply || t("responseFallback");
     copyStatus.textContent = "";
     showScreen("result");
   } catch (error) {
-    console.error("ERROR OCR REAL:", error);
     currentStatusEl.textContent = "ERROR OCR: " + (error.message || String(error));
     currentAnalyzeButton.disabled = false;
     currentAnalyzeButton.textContent = t("analyze");
   }
 }
 
-analyzeButton.addEventListener("click", analyzeCurrentImage);
-storyAnalyzeButton.addEventListener("click", analyzeCurrentImage);
+analyzeButton.addEventListener("click", handleAnalysisAction);
+storyAnalyzeButton.addEventListener("click", handleAnalysisAction);
 
 resultBackButton.addEventListener("click", () => {
-  if (appState.activeModule === "story") {
-    showScreen("story");
-  } else {
-    showScreen("chat");
-  }
+  showScreen(appState.activeModule === "story" ? "story" : "chat");
 });
 
 copyButton.addEventListener("click", async () => {
@@ -603,9 +629,7 @@ copyButton.addEventListener("click", async () => {
   }
 });
 
-openPremiumButton.addEventListener("click", () => {
-  showScreen("premium");
-});
+openPremiumButton.addEventListener("click", () => showScreen("premium"));
 
 premiumButton.addEventListener("click", async () => {
   try {

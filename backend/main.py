@@ -5,14 +5,16 @@ from PIL import Image
 import base64
 import io
 import pytesseract
+import os
 from datetime import datetime, timedelta
 from typing import Dict, Any
 
-app = FastAPI(title="LiggaCuba OCR API")
+app = FastAPI(title="LiggaCuba API", version="1.1.0")
 
+allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -90,14 +92,45 @@ def consume_analysis(user_id: str) -> Dict[str, Any]:
     return {"allowed": True, "remaining": remaining, "premium": False}
 
 
+def normalize_text(text: str) -> str:
+    return " ".join((text or "").replace("\n", " ").split())
+
+
+def generate_reply(mode: str, text: str) -> str:
+    normalized = normalize_text(text)
+    if not normalized:
+        return "No pude detectar texto suficiente en la captura. Inténtalo con otra imagen."
+
+    lower = normalized.lower()
+    if "hola" in lower or "hey" in lower:
+        opener = "Hola, "
+    else:
+        opener = "Podrías responder con un tono "
+
+    mode_map = {
+        "natural": "natural y tranquilo, manteniendo la conversación sin forzarla.",
+        "casual": "relajado y cercano para que la charla fluya sin presión.",
+        "segura": "claro y seguro, sin entrar en drama ni hacerla incómoda.",
+        "curiosa": "curioso y natural, dejando una pequeña pregunta para seguir la conversación.",
+        "gracioso": "ligero y divertido, sin perder naturalidad ni exagerar.",
+        "coquetear": "cálido y atractivo, con confianza y sin presionar demasiado.",
+        "enamorar": "cercano, elegante y romántico, con buen tono y respeto.",
+        "provocativo": "más directo y intenso, con mucha presencia y un toque sensual controlado.",
+    }
+
+    style = mode_map.get(mode, mode_map["natural"])
+    preview = normalized[:220]
+    return f"{opener}responde de forma {style} Mantén la respuesta breve, cercana y natural. Puedes decir: ‘Vi lo que escribiste y me gustó cómo lo planteas, me gustaría seguir esta conversación contigo.’"
+
+
 @app.get("/")
 def root():
-    return {"service": "LiggaCuba OCR API", "status": "ok"}
+    return {"service": "LiggaCuba API", "status": "ok"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "LiggaCuba OCR API"}
+    return {"status": "ok", "service": "LiggaCuba API"}
 
 
 class OCRBase64Request(BaseModel):
@@ -194,6 +227,24 @@ async def analyze(payload: UsageQuery):
     return {"allowed": True, "remaining": status["remaining"], "premium": status["premium"]}
 
 
+class GenerateReplyRequest(BaseModel):
+    user_id: str
+    mode: str
+    text: str
+
+
+@app.post("/api/generate-reply")
+async def generate_reply_endpoint(payload: GenerateReplyRequest):
+    user = get_or_create_user(payload.user_id)
+    if not is_premium_active(payload.user_id):
+        status = can_use_analysis(payload.user_id)
+        if not status["allowed"]:
+            raise HTTPException(status_code=403, detail="Límite alcanzado. Compra Premium.")
+
+    reply = generate_reply(payload.mode, payload.text)
+    return {"success": True, "reply": reply}
+
+
 class PremiumActivate(BaseModel):
     user_id: str
     plan: str = "weekly"
@@ -216,3 +267,21 @@ async def activate_premium(payload: PremiumActivate):
 @app.post("/api/premium/check")
 async def check_premium(payload: UsageQuery):
     return {"premium": is_premium_active(payload.user_id), "user_id": payload.user_id}
+
+
+@app.post("/api/premium/status")
+async def premium_status(payload: UsageQuery):
+    user = get_or_create_user(payload.user_id)
+    return {
+        "premium": is_premium_active(payload.user_id),
+        "premium_until": user.get("premium_until"),
+        "user_id": payload.user_id,
+    }
+
+
+@app.post("/api/reset")
+async def reset_usage(payload: UsageQuery):
+    user = get_or_create_user(payload.user_id)
+    user["date"] = datetime.utcnow().date().isoformat()
+    user["used_today"] = 0
+    return {"success": True, "remaining": FREE_DAILY_LIMIT}
