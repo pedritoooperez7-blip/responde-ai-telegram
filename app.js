@@ -242,16 +242,13 @@ async function runOCR(image) {
     analysisStatus.textContent = "Enviando captura al OCR…";
 
     const response = await fetch(
-      "https://responde-ai-telegram-production.up.railway.app/ocr-base64",
+      "https://responde-ai-telegram-production.up.railway.app/ocr-base64-simple",
       {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/json"
+          "Content-Type": "text/plain"
         },
-        body: JSON.stringify({
-          image: base64
-        })
+        body: base64
       }
     );
 
