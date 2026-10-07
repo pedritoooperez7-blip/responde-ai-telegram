@@ -1,314 +1,34 @@
-const tg = window.Telegram && window.Telegram.WebApp;
-
-if (tg) {
-  tg.ready();
-  tg.expand();
-}
-
-const welcomeScreen = document.getElementById("welcomeScreen");
-const analyzeScreen = document.getElementById("analyzeScreen");
-const resultScreen = document.getElementById("resultScreen");
-
-const welcome = document.getElementById("welcome");
-const startButton = document.getElementById("startButton");
-const status = document.getElementById("status");
-const backButton = document.getElementById("backButton");
-const imageInput = document.getElementById("imageInput");
-const previewContainer = document.getElementById("previewContainer");
-const previewImage = document.getElementById("previewImage");
-const removeImageButton = document.getElementById("removeImageButton");
-const modeSection = document.getElementById("modeSection");
-const modeButtons = document.querySelectorAll(".mode-button");
-const analyzeButton = document.getElementById("analyzeButton");
-const analysisStatus = document.getElementById("analysisStatus");
-
-const resultBackButton = document.getElementById("resultBackButton");
-const ocrText = document.getElementById("ocrText");
-const resultText = document.getElementById("resultText");
-const copyButton = document.getElementById("copyButton");
-const copyStatus = document.getElementById("copyStatus");
-
-let selectedImage = null;
-let selectedMode = null;
-let ocrWorker = null;
-
-const demoResponses = {
-  natural: "Puedes responder de forma natural y tranquila, manteniendo la conversación sin forzarla.",
-  casual: "Puedes mantener un tono relajado y cercano para que la conversación siga fluyendo.",
-  segura: "Una respuesta clara y tranquila puede mantener la conversación sin complicarla.",
-  curiosa: "Puedes dejar una pequeña pregunta abierta para mostrar interés y seguir la conversación."
-};
-
-const user = tg?.initDataUnsafe?.user;
-if (user) {
-  const name = user.first_name || "usuario";
-  welcome.textContent = `Hola, ${name}. Responde AI está listo para comenzar.`;
-}
-
-function showScreen(screen) {
-  [welcomeScreen, analyzeScreen, resultScreen].forEach((item) => {
-    item.classList.add("hidden");
-  });
-  screen.classList.remove("hidden");
-  window.scrollTo({ top: 0, behavior: "instant" });
-}
-
-function resetAnalysis() {
-  selectedImage = null;
-  selectedMode = null;
-  imageInput.value = "";
-  previewImage.removeAttribute("src");
-  previewContainer.classList.add("hidden");
-  modeSection.classList.add("hidden");
-  analyzeButton.disabled = true;
-  analyzeButton.textContent = "Analizar conversación";
-  analysisStatus.textContent = "";
-  modeButtons.forEach((button) => button.classList.remove("selected"));
-}
-
-startButton.addEventListener("click", () => {
-  status.textContent = "";
-  resetAnalysis();
-  showScreen(analyzeScreen);
-});
-
-backButton.addEventListener("click", () => {
-  resetAnalysis();
-  showScreen(welcomeScreen);
-});
-
-imageInput.addEventListener("change", () => {
-  const file = imageInput.files?.[0];
-
-  if (!file) return;
-
-  if (!file.type.startsWith("image/")) {
-    analysisStatus.textContent = "Selecciona una imagen válida.";
-    imageInput.value = "";
-    return;
-  }
-
-  selectedImage = file;
-
-  const reader = new FileReader();
-  reader.onload = () => {
-    previewImage.src = reader.result;
-    previewContainer.classList.remove("hidden");
-    modeSection.classList.remove("hidden");
-    analysisStatus.textContent = "Captura seleccionada. Ahora elige un modo.";
-  };
-
-  reader.readAsDataURL(file);
-});
-
-removeImageButton.addEventListener("click", () => {
-  imageInput.click();
-});
-
-modeButtons.forEach((button) => {
-  button.addEventListener("click", () => {
-    selectedMode = button.dataset.mode;
-    modeButtons.forEach((item) => item.classList.remove("selected"));
-    button.classList.add("selected");
-
-    analyzeButton.disabled = !selectedImage || !selectedMode;
-    analysisStatus.textContent = "Modo seleccionado. Ya puedes analizar.";
-  });
-});
-
-const OCR_API_URL = "https://responde-ai-telegram-production.up.railway.app/ocr";
-
-
-async function prepareImageForOCR(file) {
-  return await new Promise((resolve, reject) => {
-    const reader = new FileReader();
-
-    reader.onload = () => {
-      const img = new Image();
-
-      img.onload = () => {
-        const maxSize = 1280;
-
-        let width = img.naturalWidth;
-        let height = img.naturalHeight;
-
-        if (width > maxSize || height > maxSize) {
-          const scale = Math.min(
-            maxSize / width,
-            maxSize / height
-          );
-
-          width = Math.round(width * scale);
-          height = Math.round(height * scale);
-        }
-
-        const canvas = document.createElement("canvas");
-        canvas.width = width;
-        canvas.height = height;
-
-        const ctx = canvas.getContext("2d");
-
-        if (!ctx) {
-          reject(new Error("No se pudo preparar la imagen."));
-          return;
-        }
-
-        ctx.drawImage(img, 0, 0, width, height);
-
-        canvas.toBlob(
-          (blob) => {
-            if (!blob) {
-              reject(new Error("No se pudo comprimir la imagen."));
-              return;
-            }
-
-            resolve(
-              new File(
-                [blob],
-                "captura-ocr.jpg",
-                { type: "image/jpeg" }
-              )
-            );
-          },
-          "image/jpeg",
-          0.70
-        );
-      };
-
-      img.onerror = () => {
-        reject(new Error("No se pudo cargar la captura."));
-      };
-
-      img.src = reader.result;
-    };
-
-    reader.onerror = () => {
-      reject(new Error("No se pudo leer la captura."));
-    };
-
-    reader.readAsDataURL(file);
-  });
-}
-
-async function runOCR(image) {
-  analysisStatus.textContent = "Preparando captura…";
-
-  try {
-    const testResponse = await fetch(
-      "https://responde-ai-telegram-production.up.railway.app/",
-      {
-        method: "GET",
-        cache: "no-store"
-      }
-    );
-
-    if (!testResponse.ok) {
-      throw new Error("GET backend HTTP " + testResponse.status);
-    }
-
-    const testData = await testResponse.json();
-    console.log("BACKEND GET OK:", testData);
-
-    analysisStatus.textContent = "Conectado. Preparando imagen…";
-
-    const preparedImage = await prepareImageForOCR(image);
-
-    console.log(
-      "OCR imagen preparada:",
-      preparedImage.size,
-      "bytes",
-      preparedImage.type
-    );
-
-    const base64 = await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-
-      reader.onload = () => {
-        if (typeof reader.result !== "string") {
-          reject(new Error("No se pudo convertir la imagen."));
-          return;
-        }
-
-        resolve(reader.result);
-      };
-
-      reader.onerror = () => {
-        reject(new Error("No se pudo leer la imagen preparada."));
-      };
-
-      reader.readAsDataURL(preparedImage);
-    });
-
-    analysisStatus.textContent = "Enviando captura al OCR…";
-
-    const response = await fetch(
-      "https://responde-ai-telegram-production.up.railway.app/ocr-base64-simple",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "text/plain"
-        },
-        body: base64
-      }
-    );
-
-    let data;
-
-    try {
-      data = await response.json();
-    } catch (error) {
-      throw new Error("El backend devolvió una respuesta no válida.");
-    }
-
-    if (!response.ok || !data.success) {
-      throw new Error(
-        data?.detail || `Error HTTP ${response.status}`
-      );
-    }
-
-    return (data.text || "").trim();
-
-  } catch (error) {
-    console.error("ERROR OCR REAL:", error);
-
-    analysisStatus.textContent =
-      "ERROR OCR: " + (error.message || String(error));
-
-    throw error;
-  }
-}
-
-analyzeButton.addEventListener("click", async () => {
-  if (!selectedImage || !selectedMode) return;
-
-  analyzeButton.disabled = true;
-  analyzeButton.textContent = "Analizando…";
-  analysisStatus.textContent = "Extrayendo texto de la captura…";
-
-  try {
-    const text = await runOCR(selectedImage);
-
-    ocrText.textContent = text || "No se pudo detectar texto en la captura.";
-    resultText.textContent = demoResponses[selectedMode];
-    copyStatus.textContent = "";
-    showScreen(resultScreen);
-  } catch (error) {
-    console.error("ERROR OCR REAL:", error);
-    analysisStatus.textContent = "ERROR OCR: " + (error.message || String(error));
-    analyzeButton.disabled = false;
-    analyzeButton.textContent = "Analizar conversación";
-  }
-});
-
-resultBackButton.addEventListener("click", () => {
-  showScreen(analyzeScreen);
-});
-
-copyButton.addEventListener("click", async () => {
-  try {
-    await navigator.clipboard.writeText(resultText.textContent);
-    copyStatus.textContent = "Respuesta copiada.";
-  } catch (error) {
-    copyStatus.textContent = "No se pudo copiar automáticamente.";
-  }
-});
+const API_BASE='https://responde-ai-telegram-production.up.railway.app';
+const tg=window.Telegram?.WebApp;
+const state={module:'chat',file:null,mode:'coquetear',userId:String(tg?.initDataUnsafe?.user?.id||'guest-user'),premium:false,remaining:0,language:localStorage.getItem('liggacuba_lang')||'es',cropSource:null,plan:'weekly'};
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const modes={chat:[['gracioso','fa-face-grin-stars',false],['coquetear','fa-face-smile-wink',false],['provocativo','fa-bolt',true],['enamorar','fa-heart',false]],story:[['gracioso','fa-face-grin-stars',false],['coquetear','fa-face-smile-wink',false],['provocativo','fa-bolt',true],['enamorar','fa-heart',true]]};
+const i18n={es:{loading:'Cargando...',chat_image:'Imagen de la conversación',chat_help:'Sube una captura de tu chat',story_image:'Captura del estado',story_help:'Sube una captura del estado para responder',add:'Agregar',replace:'Reemplazar',delete:'Eliminar',mode:'Modo de respuesta',mode_help:'Elige el estilo de tu respuesta',refresh:'Actualizar',analyze:'Analizar con LiggaCuba',back:'Atrás'},en:{loading:'Loading...',chat_image:'Conversation screenshot',chat_help:'Upload a screenshot of your chat',story_image:'Story screenshot',story_help:'Upload a screenshot of the story to reply to',add:'Add',replace:'Replace',delete:'Delete',mode:'Response mode',mode_help:'Pick the vibe of your reply',refresh:'Refresh',analyze:'Analyze with LiggaCuba',back:'Back'}};
+function toast(msg){const el=$('#toast');el.textContent=msg;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2400)}
+function applyLanguage(){document.documentElement.lang=state.language;$$('[data-i18n]').forEach(e=>{const k=e.dataset.i18n;e.textContent=i18n[state.language][k]||e.textContent});$('#languageValue').textContent=state.language==='es'?'Español':'English'}
+function setModule(mod){state.module=mod;$$('.segment').forEach(b=>b.classList.toggle('active',b.dataset.module===mod));$('#chatScreen').classList.toggle('hidden',mod!=='chat');$('#storyScreen').classList.toggle('hidden',mod!=='story');$('#screenTitle').textContent=mod==='chat'?'Chat':'Estado Story';renderModes();}
+function renderModes(){const box=state.module==='chat'?$('#chatModes'):$('#storyModes');box.innerHTML='';modes[state.module].forEach(([key,icon,locked])=>{const b=document.createElement('button');b.className='mode-card'+(key===state.mode?' selected':'')+(locked?' locked':'');b.dataset.mode=key;b.innerHTML=`<span class="mode-icon"><i class="fa-solid ${icon}"></i></span><strong>${key[0].toUpperCase()+key.slice(1)}</strong>${locked?'<span class="lock"><i class="fa-solid fa-lock"></i></span>':''}`;b.onclick=()=>{if(locked&&!state.premium){showPremium();return}state.mode=key;renderModes()};box.appendChild(b)});}
+function usageText(){return state.premium?'Premium activo · sin límite':`${Math.max(0,state.remaining)} análisis restantes hoy`}
+function updateUsage(){['#usageText','#storyUsageText'].forEach(s=>$(s).textContent=usageText())}
+async function auth(){try{const r=await fetch(`${API_BASE}/api/auth/telegram`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData:tg?.initData||'',user_id:state.userId})});if(r.ok){const d=await r.json();state.userId=String(d.user_id||state.userId);state.premium=!!d.premium;state.remaining=Number(d.remaining||0);updateUsage();return}}catch(e){}await refreshUsage()}
+async function refreshUsage(){try{const r=await fetch(`${API_BASE}/api/usage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId})});if(!r.ok)throw 0;const d=await r.json();state.premium=!!d.premium;state.remaining=Number(d.remaining||0);updateUsage()}catch(e){toast('No se pudo actualizar el límite')}}
+function openFile(input){const f=input.files?.[0];if(!f)return;if(!f.type.startsWith('image/')){toast('Selecciona una imagen válida');input.value='';return}if(f.size>12*1024*1024){toast('La imagen supera el límite de 12 MB');input.value='';return}openCropper(f)}
+let cropImg=$('#cropImage');let cropSource=null;
+function openCropper(file){cropSource=file;const url=URL.createObjectURL(file);cropImg.onload=()=>{$('#cropModal').classList.remove('hidden');};cropImg.src=url}
+function closeCrop(){if(cropImg.src)URL.revokeObjectURL(cropImg.src);cropImg.src='';cropSource=null;$('#cropModal').classList.add('hidden')}
+async function useCrop(){if(!cropSource)return;try{const blob=await cropImageToBlob(cropSource);state.file=new File([blob],`liggacuba-${Date.now()}.jpg`,{type:'image/jpeg'});setPreview(state.file);closeCrop();toast('Imagen recortada y lista')}catch(e){toast('No se pudo recortar la imagen')}}
+function cropImageToBlob(file){return new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>{const w=img.naturalWidth,h=img.naturalHeight;const side=Math.min(w,h);const sx=(w-side)/2,sy=(h-side)/2;const max=1400,scale=Math.min(1,max/side);const c=document.createElement('canvas');c.width=Math.round(side*scale);c.height=Math.round(side*scale);c.getContext('2d').drawImage(img,sx,sy,side,side,0,0,c.width,c.height);c.toBlob(b=>b?resolve(b):reject(new Error('blob')), 'image/jpeg',.9);};img.onerror=reject;img.src=URL.createObjectURL(file)})}
+function setPreview(file){const url=URL.createObjectURL(file);if(state.module==='chat'){$('#emptyUpload').classList.add('hidden');$('#imagePreview').classList.remove('hidden');$('#previewImg').src=url}else{$('#storyEmpty').classList.add('hidden');$('#storyPreview').classList.remove('hidden');$('#storyPreviewImg').src=url}}
+function clearImage(){state.file=null;if(state.module==='chat'){$('#emptyUpload').classList.remove('hidden');$('#imagePreview').classList.add('hidden');$('#imageInput').value=''}else{$('#storyEmpty').classList.remove('hidden');$('#storyPreview').classList.add('hidden');$('#storyInput').value=''}}
+function fileBase64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=rej;r.readAsDataURL(file)})}
+async function runOCR(file){const b64=await fileBase64(file);const r=await fetch(`${API_BASE}/ocr-base64-simple`,{method:'POST',headers:{'Content-Type':'text/plain'},body:b64});const d=await r.json();if(!r.ok||!d.success)throw new Error(d.detail||'Error del OCR');return String(d.text||'').trim()}
+async function consume(){const r=await fetch(`${API_BASE}/api/analyze`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId,mode:state.mode,module:state.module})});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||'No se pudo validar el límite');state.premium=!!d.premium;state.remaining=Number(d.remaining||0);updateUsage();return d}
+async function generate(text){const r=await fetch(`${API_BASE}/api/generate-reply`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId,mode:state.mode,text,module:state.module})});const d=await r.json();if(!r.ok)throw new Error(d.detail||'No se pudo generar la respuesta');return d.reply}
+async function analyze(){if(!state.file){toast('Agrega una imagen primero');return}const btn=state.module==='chat'?$('#analyzeButton'):$('#storyAnalyze');btn.disabled=true;btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> Analizando...';try{await consume();toast('Procesando OCR...');const text=await runOCR(state.file);toast('Generando respuesta...');const reply=await generate(text);$('#ocrOutput').textContent=text||'No se detectó texto.';$('#replyOutput').textContent=reply||'No se generó una respuesta.';$('#resultModal').classList.remove('hidden')}catch(e){toast(e.message)}finally{btn.disabled=false;btn.innerHTML='<i class="fa-solid fa-wand-magic-sparkles"></i> '+(i18n[state.language].analyze)}}
+function showPremium(){$('#premiumScreen').classList.remove('hidden');$('#chatScreen').classList.add('hidden');$('#storyScreen').classList.add('hidden');$('.bottom-nav').classList.add('hidden')}
+function hidePremium(){$('#premiumScreen').classList.add('hidden');$('.bottom-nav').classList.remove('hidden');setModule(state.module)}
+async function createPayment(){const r=await fetch(`${API_BASE}/api/payments/pending`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId,plan:state.plan,language:state.language})});const d=await r.json();if(!r.ok)throw new Error(d.detail||'No se pudo crear la operación');$('#paymentStatus').textContent=`Operación pendiente: ${d.operation_id}. Completa el pago según las instrucciones del backend.`}
+function profile(){['#chatScreen','#storyScreen','#settingsScreen','#premiumScreen'].forEach(s=>$(s).classList.add('hidden'));$('#profileScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden');$$('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.nav==='profile'))}
+function home(){['#profileScreen','#settingsScreen','#premiumScreen'].forEach(s=>$(s).classList.add('hidden'));$('.bottom-nav').classList.remove('hidden');$$('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.nav==='home'));setModule(state.module)}
+$('#imageInput').onchange=()=>openFile($('#imageInput'));$('#storyInput').onchange=()=>openFile($('#storyInput'));$('#uploadCard').onclick=e=>{if(!e.target.closest('button'))$('#imageInput').click()};$('#storyAdd').onclick=()=>$('#storyInput').click();$('#replaceImage').onclick=()=>$('#imageInput').click();$('#storyReplace').onclick=()=>$('#storyInput').click();$('#deleteImage').onclick=clearImage;$('#storyDelete').onclick=clearImage;$('#cropCancel').onclick=closeCrop;$('#cropClose').onclick=closeCrop;$('#cropUse').onclick=useCrop;$('#analyzeButton').onclick=analyze;$('#storyAnalyze').onclick=analyze;$('#refreshUsage').onclick=refreshUsage;$('#storyRefreshUsage').onclick=refreshUsage;$('#profileTop').onclick=profile;$('#settingsButton').onclick=()=>{profile();$('#profileScreen').classList.add('hidden');$('#settingsScreen').classList.remove('hidden')};$('#backFromSettings').onclick=profile;$('#premiumButton').onclick=showPremium;$('#backFromPremium').onclick=hidePremium;$('#startPayment').onclick=async()=>{try{await createPayment()}catch(e){$('#paymentStatus').textContent=e.message}};$('#resultClose').onclick=()=>$('#resultModal').classList.add('hidden');$('#anotherAnalysis').onclick=()=>{$('#resultModal').classList.add('hidden');clearImage()};$('#copyResponse').onclick=async()=>{try{await navigator.clipboard.writeText($('#replyOutput').textContent);$('#copyStatus').textContent='Respuesta copiada.'}catch(e){$('#copyStatus').textContent='No se pudo copiar.'}};$$('.segment').forEach(b=>b.onclick=()=>setModule(b.dataset.module));$$('.nav-item').forEach(b=>b.onclick=()=>b.dataset.nav==='profile'?profile():home());$$('.plan').forEach(b=>b.onclick=()=>{$$('.plan').forEach(x=>x.classList.remove('selected'));b.classList.add('selected');state.plan=b.dataset.plan});$('#languageButton').onclick=()=>{state.language=state.language==='es'?'en':'es';localStorage.setItem('liggacuba_lang',state.language);applyLanguage()};$('#contactButton').onclick=()=>toast('Configura aquí el contacto oficial de LiggaCuba');$('#feedbackButton').onclick=()=>toast('Configura aquí el grupo oficial de feedback');
+if(tg){tg.ready();tg.expand();}applyLanguage();renderModes();setTimeout(()=>{$('#splash').classList.add('hidden');$('#app').classList.remove('hidden');},700);auth();
