@@ -116,18 +116,30 @@ modeButtons.forEach((button) => {
   });
 });
 
+const OCR_API_URL = "https://responde-ai-telegram-production.up.railway.app/ocr";
+
 async function runOCR(image) {
-  if (!window.Tesseract) {
-    throw new Error("OCR no disponible");
+  const formData = new FormData();
+  formData.append("file", image, image.name || "captura.jpg");
+
+  const response = await fetch(OCR_API_URL, {
+    method: "POST",
+    body: formData
+  });
+
+  let data;
+
+  try {
+    data = await response.json();
+  } catch (error) {
+    throw new Error("El backend devolvió una respuesta no válida.");
   }
 
-  if (!ocrWorker) {
-    analysisStatus.textContent = "Preparando OCR…";
-    ocrWorker = await Tesseract.createWorker("spa+eng");
+  if (!response.ok || !data.success) {
+    throw new Error(data.detail || `Error HTTP ${response.status}`);
   }
 
-  const result = await ocrWorker.recognize(image);
-  return result.data.text.trim();
+  return (data.text || "").trim();
 }
 
 analyzeButton.addEventListener("click", async () => {
