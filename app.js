@@ -32,7 +32,7 @@ if (uploadInput && uploadZone) {
     if (!file) return;
     const label = uploadZone.querySelector('.upload-text');
     if (label) {
-      label.textContent = file.name.length > 18 ? `${file.name.slice(0, 18)}...` : file.name;
+      label.textContent = file.name.length > 16 ? `${file.name.slice(0, 16)}...` : file.name;
     }
   });
 }
