@@ -139,27 +139,42 @@ async function runOCR(image) {
     throw new Error("GET backend: " + (error.message || String(error)));
   }
 
-  const formData = new FormData();
-  formData.append("file", image, image.name || "captura.jpg");
+  return await new Promise((resolve, reject) => {
+    const formData = new FormData();
+    formData.append("file", image, image.name || "captura.jpg");
 
-  const response = await fetch(OCR_API_URL, {
-    method: "POST",
-    body: formData
+    const xhr = new XMLHttpRequest();
+
+    xhr.open("POST", OCR_API_URL, true);
+    xhr.responseType = "json";
+    xhr.timeout = 60000;
+
+    xhr.onload = () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject(new Error(`Error HTTP ${xhr.status}`));
+        return;
+      }
+
+      const data = xhr.response;
+
+      if (!data || !data.success) {
+        reject(new Error(data?.detail || "El backend no pudo procesar la imagen."));
+        return;
+      }
+
+      resolve((data.text || "").trim());
+    };
+
+    xhr.onerror = () => {
+      reject(new Error("XHR: Load failed"));
+    };
+
+    xhr.ontimeout = () => {
+      reject(new Error("XHR: tiempo de espera agotado"));
+    };
+
+    xhr.send(formData);
   });
-
-  let data;
-
-  try {
-    data = await response.json();
-  } catch (error) {
-    throw new Error("El backend devolvió una respuesta no válida.");
-  }
-
-  if (!response.ok || !data.success) {
-    throw new Error(data.detail || `Error HTTP ${response.status}`);
-  }
-
-  return (data.text || "").trim();
 }
 
 analyzeButton.addEventListener("click", async () => {
