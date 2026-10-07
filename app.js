@@ -119,6 +119,26 @@ modeButtons.forEach((button) => {
 const OCR_API_URL = "https://responde-ai-telegram-production.up.railway.app/ocr";
 
 async function runOCR(image) {
+  analysisStatus.textContent = "Probando conexión con el backend…";
+
+  try {
+    const testResponse = await fetch("https://responde-ai-telegram-production.up.railway.app/", {
+      method: "GET",
+      cache: "no-store"
+    });
+
+    if (!testResponse.ok) {
+      throw new Error("GET backend HTTP " + testResponse.status);
+    }
+
+    const testData = await testResponse.json();
+    console.log("BACKEND GET OK:", testData);
+    analysisStatus.textContent = "Backend conectado. Enviando captura…";
+  } catch (error) {
+    console.error("BACKEND GET ERROR:", error);
+    throw new Error("GET backend: " + (error.message || String(error)));
+  }
+
   const formData = new FormData();
   formData.append("file", image, image.name || "captura.jpg");
 
