@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from pydantic import BaseModel
 import base64
 from fastapi.middleware.cors import CORSMiddleware
@@ -86,3 +86,40 @@ async def ocr(file: UploadFile = File(...)):
             status_code=500,
             detail=f"No se pudo procesar la imagen: {exc}"
         )
+
+@app.post("/ocr-base64-simple")
+async def ocr_base64_simple(request: Request):
+    try:
+        import json
+
+        raw_body = await request.body()
+        payload = json.loads(raw_body.decode("utf-8"))
+
+        image_data = payload.get("image", "")
+
+        if "," in image_data:
+            image_data = image_data.split(",", 1)[1]
+
+        raw = base64.b64decode(image_data)
+
+        if not raw:
+            raise HTTPException(status_code=400, detail="La imagen está vacía.")
+
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+
+        text = pytesseract.image_to_string(image, lang="spa+eng")
+
+        return {
+            "success": True,
+            "text": text.strip()
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"No se pudo procesar la imagen: {exc}"
+        )
+
