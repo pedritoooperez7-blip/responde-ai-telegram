@@ -8,8 +8,10 @@ import hmac
 import io
 import json
 import os
+import re
 import sqlite3
 import time
+import uuid
 import pytesseract
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
@@ -26,6 +28,11 @@ app.add_middleware(
 )
 
 FREE_DAILY_LIMIT = 3
+
+FREE_CHAT_MODES = {"gracioso", "coquetear", "enamorar"}
+PREMIUM_CHAT_MODES = {"provocativo"}
+FREE_STORY_MODES = {"gracioso", "coquetear"}
+PREMIUM_STORY_MODES = {"provocativo", "enamorar"}
 DB_PATH = os.getenv("DB_PATH", "liggacuba.db")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
@@ -39,6 +46,7 @@ def get_db_connection() -> sqlite3.Connection:
 
 def init_db() -> None:
     conn = get_db_connection()
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -54,6 +62,7 @@ def init_db() -> None:
         )
         """
     )
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS usage_logs (
@@ -65,6 +74,44 @@ def init_db() -> None:
         )
         """
     )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS payment_operations (
+            operation_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            plan TEXT NOT NULL,
+            language TEXT NOT NULL,
+            method TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            amount TEXT NOT NULL,
+            payment_code TEXT,
+            transaction_id TEXT,
+            proof_note TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            verified_at TEXT,
+            cancelled_at TEXT
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_transaction
+        ON payment_operations(transaction_id)
+        WHERE transaction_id IS NOT NULL
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_code
+        ON payment_operations(payment_code)
+        WHERE payment_code IS NOT NULL
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -208,6 +255,12 @@ class UsageQuery(BaseModel):
     user_id: str
 
 
+class AnalyzeRequest(BaseModel):
+    user_id: str
+    mode: str = "coquetear"
+    module: str = "chat"
+
+
 class PremiumActivate(BaseModel):
     user_id: str
     plan: str = "weekly"
@@ -221,7 +274,41 @@ class TelegramAuthRequest(BaseModel):
 class GenerateReplyRequest(BaseModel):
     user_id: str
     mode: str = "coquetear"
+    module: str = "chat"
     text: str = ""
+
+
+class PendingPaymentRequest(BaseModel):
+    user_id: str
+    plan: str = "weekly"
+    language: str = "es"
+    method: Optional[str] = None
+
+
+class PaymentSubmitRequest(BaseModel):
+    operation_id: str
+    user_id: str
+    method: str
+    payment_code: Optional[str] = None
+    transaction_id: Optional[str] = None
+    proof_note: Optional[str] = None
+
+
+class PaymentStatusRequest(BaseModel):
+    operation_id: str
+    user_id: Optional[str] = None
+
+
+class PaymentCancelRequest(BaseModel):
+    operation_id: str
+    user_id: str
+
+
+class PaymentVerifyRequest(BaseModel):
+    operation_id: str
+    transaction_id: str
+    payment_code: Optional[str] = None
+    amount: Optional[str] = None
 
 
 @app.get("/")
@@ -278,10 +365,18 @@ def verify_telegram_init_data(init_data: str, bot_token: str) -> Dict[str, Any]:
 
 def require_admin(request: Request) -> None:
     if not ADMIN_KEY:
-        return
-    provided = request.headers.get("x-admin-key")
-    if provided != ADMIN_KEY:
-        raise HTTPException(status_code=401, detail="No autorizado")
+        raise HTTPException(
+            status_code=503,
+            detail="ADMIN_KEY no está configurada en el servidor."
+        )
+
+    provided = request.headers.get("x-admin-key", "")
+
+    if not provided or not hmac.compare_digest(provided, ADMIN_KEY):
+        raise HTTPException(
+            status_code=401,
+            detail="No autorizado"
+        )
 
 
 @app.post("/api/auth/telegram")
@@ -320,33 +415,534 @@ async def usage(payload: UsageQuery):
 
 
 @app.post("/api/analyze")
-async def analyze(payload: UsageQuery):
-    status = consume_analysis(payload.user_id, mode="chat")
+async def analyze(payload: AnalyzeRequest):
+    module = payload.module if payload.module in {"chat", "story"} else "chat"
+    mode = payload.mode.lower().strip()
+    allowed_free = FREE_CHAT_MODES if module == "chat" else FREE_STORY_MODES
+    allowed_premium = PREMIUM_CHAT_MODES if module == "chat" else PREMIUM_STORY_MODES
+    if mode not in allowed_free | allowed_premium:
+        raise HTTPException(status_code=400, detail="Modo de respuesta no válido.")
+    premium = is_premium_active(payload.user_id)
+    if mode in allowed_premium and not premium:
+        raise HTTPException(status_code=402, detail="Este modo requiere Premium.")
+    status = consume_analysis(payload.user_id, mode=f"{module}:{mode}")
     if not status["allowed"]:
-        raise HTTPException(
-            status_code=403,
-            detail="Has alcanzado tus 3 análisis gratuitos de hoy. Obtén Premium para continuar.",
-        )
+        raise HTTPException(status_code=403, detail="Has alcanzado tus 3 análisis gratuitos de hoy. Obtén Premium para continuar.")
     return {"allowed": True, "remaining": status["remaining"], "premium": status["premium"]}
+
+
+def get_premium_price(plan: str, language: str) -> str:
+    if plan not in {"weekly", "annual"}:
+        raise HTTPException(status_code=400, detail="Plan inválido.")
+
+    language = (language or "es").lower().strip()
+
+    if language == "en":
+        return "8.99 USD" if plan == "weekly" else "29.99 USD"
+
+    return "2500 CUP" if plan == "weekly" else "15500 CUP"
+
+
+def get_plan_days(plan: str) -> int:
+    if plan == "weekly":
+        return 7
+
+    if plan == "annual":
+        return 365
+
+    raise HTTPException(status_code=400, detail="Plan inválido.")
+
+
+def activate_verified_premium(user_id: str, plan: str) -> Dict[str, Any]:
+    user = get_or_create_user(user_id)
+
+    now = datetime.utcnow()
+    current_until = None
+
+    if user.get("premium_until"):
+        try:
+            current_until = datetime.fromisoformat(user["premium_until"])
+        except (ValueError, TypeError):
+            current_until = None
+
+    days = get_plan_days(plan)
+
+    if current_until and current_until > now:
+        base_date = current_until
+    else:
+        base_date = now
+
+    premium_until = base_date + timedelta(days=days)
+
+    get_or_create_user(
+        user_id,
+        {"premium_until": premium_until.isoformat()},
+    )
+
+    return {
+        "premium": True,
+        "premium_until": premium_until.isoformat(),
+    }
 
 
 @app.post("/api/premium/activate")
 async def activate_premium(payload: PremiumActivate):
-    user = get_or_create_user(payload.user_id)
-    plan_days = 7 if payload.plan == "weekly" else 365
-    premium_until = (datetime.utcnow() + timedelta(days=plan_days)).isoformat()
-    get_or_create_user(payload.user_id, {"premium_until": premium_until})
-    return {
-        "success": True,
-        "premium": True,
-        "premium_until": premium_until,
-    }
+    raise HTTPException(
+        status_code=403,
+        detail="La activación directa de Premium no está permitida. Debes completar y verificar un pago."
+    )
 
 
 @app.post("/api/premium/check")
 async def check_premium(payload: UsageQuery):
-    return {"premium": is_premium_active(payload.user_id), "user_id": payload.user_id}
+    user = get_or_create_user(payload.user_id)
+    premium = is_premium_active(payload.user_id)
 
+    return {
+        "premium": premium,
+        "user_id": payload.user_id,
+        "premium_until": user.get("premium_until") if premium else None,
+    }
+
+
+@app.post("/api/payments/pending")
+async def create_pending_payment(payload: PendingPaymentRequest):
+    plan = (payload.plan or "").lower().strip()
+    language = (payload.language or "es").lower().strip()
+
+    if plan not in {"weekly", "annual"}:
+        raise HTTPException(status_code=400, detail="Plan inválido.")
+
+    if language not in {"es", "en"}:
+        language = "es"
+
+    method = payload.method
+
+    if language == "en":
+        method = None
+    elif method is not None:
+        method = method.lower().strip()
+
+        allowed_methods = {
+            "bandec",
+            "bpa",
+            "saldo_movil",
+            "mobile_balance",
+            "iphone",
+        }
+
+        if method not in allowed_methods:
+            raise HTTPException(
+                status_code=400,
+                detail="Método de pago no válido.",
+            )
+
+    amount = get_premium_price(plan, language)
+
+    operation_id = uuid.uuid4().hex[:12].upper()
+    now = utcnow_iso()
+
+    conn = get_db_connection()
+
+    conn.execute(
+        """
+        INSERT INTO payment_operations (
+            operation_id,
+            user_id,
+            plan,
+            language,
+            method,
+            status,
+            amount,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+        """,
+        (
+            operation_id,
+            str(payload.user_id),
+            plan,
+            language,
+            method,
+            amount,
+            now,
+            now,
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "operation_id": operation_id,
+        "status": "pending",
+        "plan": plan,
+        "language": language,
+        "amount": amount,
+        "method": method,
+    }
+
+
+@app.post("/api/payments/submit")
+async def submit_payment(payload: PaymentSubmitRequest):
+    operation_id = (payload.operation_id or "").strip()
+    user_id = (payload.operation_id or "").strip()
+
+    user_id = str(payload.user_id or "").strip()
+
+    if not operation_id or not user_id:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="Operación y usuario son obligatorios.",
+
+        )
+
+    conn = get_db_connection()
+
+    row = conn.execute(
+
+        """
+
+        SELECT *
+
+        FROM payment_operations
+
+        WHERE operation_id = ?
+
+        """,
+
+        (operation_id,),
+
+    ).fetchone()
+
+    if not row:
+
+        conn.close()
+
+        raise HTTPException(
+
+            status_code=404,
+
+            detail="Operación no encontrada.",
+
+        )
+
+    payment = dict(row)
+
+    if str(payment["user_id"]) != user_id:
+
+        conn.close()
+
+        raise HTTPException(
+
+            status_code=403,
+
+            detail="La operación no pertenece a este usuario.",
+
+        )
+
+    if payment["status"] != "pending":
+
+        conn.close()
+
+        raise HTTPException(
+
+            status_code=409,
+
+            detail="Solo se pueden cancelar operaciones pendientes.",
+
+        )
+
+    now = utcnow_iso()
+
+    conn.execute(
+
+        """
+
+        UPDATE payment_operations
+
+        SET
+
+            status = 'cancelled',
+
+            cancelled_at = ?,
+
+            updated_at = ?
+
+        WHERE operation_id = ?
+
+        """,
+
+        (
+
+            now,
+
+            now,
+
+            operation_id,
+
+        ),
+
+    )
+
+    conn.commit()
+
+    conn.close()
+
+    return {
+
+        "success": True,
+
+        "operation_id": operation_id,
+
+        "status": "cancelled",
+
+    }
+
+@app.post("/api/payments/verify")
+
+async def verify_payment(
+
+    payload: PaymentVerifyRequest,
+
+    request: Request,
+
+):
+
+    require_admin(request)
+
+    operation_id = (payload.operation_id or "").strip()
+
+    transaction_id = (payload.transaction_id or "").strip()
+
+    if not operation_id:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="operation_id es obligatorio.",
+
+        )
+
+    if not transaction_id:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="transaction_id es obligatorio.",
+
+        )
+
+    conn = get_db_connection()
+
+    row = conn.execute(
+
+        """
+
+        SELECT *
+
+        FROM payment_operations
+
+        WHERE operation_id = ?
+
+        """,
+
+        (operation_id,),
+
+    ).fetchone()
+
+    if not row:
+
+        conn.close()
+
+        raise HTTPException(
+
+            status_code=404,
+
+            detail="Operación no encontrada.",
+
+        )
+
+    payment = dict(row)
+
+    if payment["status"] not in {"pending", "submitted"}:
+
+        conn.close()
+
+        raise HTTPException(
+
+            status_code=409,
+
+            detail=f"La operación no puede verificarse porque está en estado '{payment['status']}'.",
+
+        )
+
+    if payload.amount is not None:
+
+        if str(payload.amount).strip() != str(payment["amount"]).strip():
+
+            conn.close()
+
+            raise HTTPException(
+
+                status_code=400,
+
+                detail="El importe no coincide con el precio de la operación.",
+
+            )
+
+    duplicate_transaction = conn.execute(
+
+        """
+
+        SELECT operation_id
+
+        FROM payment_operations
+
+        WHERE transaction_id = ?
+
+          AND operation_id != ?
+
+        """,
+
+        (
+
+            transaction_id,
+
+            operation_id,
+
+        ),
+
+    ).fetchone()
+
+    if duplicate_transaction:
+
+        conn.close()
+
+        raise HTTPException(
+
+            status_code=409,
+
+            detail="La transacción ya está asociada a otra operación.",
+
+        )
+
+    if payload.payment_code:
+
+        duplicate_code = conn.execute(
+
+            """
+
+            SELECT operation_id
+
+            FROM payment_operations
+
+            WHERE payment_code = ?
+
+              AND operation_id != ?
+
+            """,
+
+            (
+
+                payload.payment_code.strip(),
+
+                operation_id,
+
+            ),
+
+        ).fetchone()
+
+        if duplicate_code:
+
+            conn.close()
+
+            raise HTTPException(
+
+                status_code=409,
+
+                detail="El código de pago ya fue utilizado.",
+
+            )
+
+    now = utcnow_iso()
+
+    conn.execute(
+
+        """
+
+        UPDATE payment_operations
+
+        SET
+
+            status = 'paid',
+
+            transaction_id = ?,
+
+            payment_code = COALESCE(?, payment_code),
+
+            verified_at = ?,
+
+            updated_at = ?
+
+        WHERE operation_id = ?
+
+        """,
+
+        (
+
+            transaction_id,
+
+            payload.payment_code.strip()
+
+            if payload.payment_code
+
+            else None,
+
+            now,
+
+            now,
+
+            operation_id,
+
+        ),
+
+    )
+
+    conn.commit()
+
+    conn.close()
+
+    premium_result = activate_verified_premium(
+
+        payment["user_id"],
+
+        payment["plan"],
+
+    )
+
+    return {
+
+        "success": True,
+
+        "operation_id": operation_id,
+
+        "status": "paid",
+
+        "premium": True,
+
+        "premium_until": premium_result["premium_until"],
+
+        "message": "Pago verificado y Premium activado correctamente.",
+
+    }
 
 @app.get("/api/admin/stats")
 async def admin_stats(request: Request):
@@ -378,7 +974,7 @@ async def admin_users(request: Request):
 
 
 def build_reply_for_mode(mode: str, text: str) -> str:
-    normalized = (text or "").replace("\s+", " ").strip()
+    normalized = re.sub(r"\s+", " ", text or "").strip()
     lower = normalized.lower()
 
     templates = {
@@ -401,9 +997,17 @@ def build_reply_for_mode(mode: str, text: str) -> str:
 
 @app.post("/api/generate-reply")
 async def generate_reply(payload: GenerateReplyRequest):
+    module = payload.module if payload.module in {"chat", "story"} else "chat"
+    mode = payload.mode.lower().strip()
+    allowed_free = FREE_CHAT_MODES if module == "chat" else FREE_STORY_MODES
+    allowed_premium = PREMIUM_CHAT_MODES if module == "chat" else PREMIUM_STORY_MODES
+    if mode not in allowed_free | allowed_premium:
+        raise HTTPException(status_code=400, detail="Modo de respuesta no válido.")
+    if mode in allowed_premium and not is_premium_active(payload.user_id):
+        raise HTTPException(status_code=402, detail="Este modo requiere Premium.")
     if not payload.text:
         return {"success": True, "reply": "No pude detectar texto suficiente para generar una respuesta útil."}
-    reply = build_reply_for_mode(payload.mode, payload.text)
+    reply = build_reply_for_mode(mode, payload.text)
     return {"success": True, "reply": reply}
 
 
