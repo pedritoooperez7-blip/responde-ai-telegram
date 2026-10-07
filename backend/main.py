@@ -3,47 +3,65 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image
 import base64
+import hashlib
+import hmac
 import io
+import json
 import os
 import sqlite3
+import time
 import pytesseract
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from typing import Any, Dict, Optional
+from urllib.parse import parse_qs
 
-app = FastAPI(title="LiggaCuba API", version="1.2.0")
+app = FastAPI(title="LiggaCuba OCR API")
 
-allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
 FREE_DAILY_LIMIT = 3
-DB_PATH = os.getenv("DATABASE_PATH", "/tmp/liggacuba.db")
+DB_PATH = os.getenv("DB_PATH", "liggacuba.db")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 
 
-def db_connect() -> sqlite3.Connection:
+def get_db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db() -> None:
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    conn = db_connect()
+    conn = get_db_connection()
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY,
-            date TEXT NOT NULL,
-            used_today INTEGER NOT NULL DEFAULT 0,
-            premium INTEGER NOT NULL DEFAULT 0,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
             premium_until TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            created_at TEXT,
+            updated_at TEXT,
+            usage_today INTEGER DEFAULT 0,
+            last_reset_date TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS usage_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            used_at TEXT,
+            mode TEXT,
+            premium_used INTEGER DEFAULT 0
         )
         """
     )
@@ -54,56 +72,62 @@ def init_db() -> None:
 init_db()
 
 
-def utc_now() -> datetime:
-    return datetime.utcnow()
+def utcnow_iso() -> str:
+    return datetime.utcnow().isoformat()
 
 
-def get_or_create_user(user_id: str) -> Dict[str, Any]:
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id requerido")
+def today_iso() -> str:
+    return datetime.utcnow().date().isoformat()
 
-    conn = db_connect()
-    row = conn.execute(
-        "SELECT user_id, date, used_today, premium, premium_until FROM users WHERE user_id = ?",
-        (user_id,),
-    ).fetchone()
+
+def get_or_create_user(user_id: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    user_id = str(user_id or "guest-user")
+    now = utcnow_iso()
+    conn = get_db_connection()
+    row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
 
     if row is None:
-        now_iso = utc_now().isoformat()
         conn.execute(
             """
-            INSERT INTO users (user_id, date, used_today, premium, premium_until, created_at, updated_at)
-            VALUES (?, ?, 0, 0, NULL, ?, ?)
+            INSERT INTO users (
+                user_id, username, first_name, last_name, premium_until,
+                created_at, updated_at, usage_today, last_reset_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
             """,
-            (user_id, utc_now().date().isoformat(), now_iso, now_iso),
+            (user_id, None, None, None, None, now, now, today_iso()),
         )
         conn.commit()
-        row = conn.execute(
-            "SELECT user_id, date, used_today, premium, premium_until FROM users WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
+        row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+
+    if extra:
+        update_fields = []
+        update_values = []
+        for key, value in extra.items():
+            if value is not None:
+                update_fields.append(f"{key} = ?")
+                update_values.append(value)
+        if update_fields:
+            update_fields.append("updated_at = ?")
+            update_values.extend([now, user_id])
+            conn.execute(
+                f"UPDATE users SET {', '.join(update_fields)} WHERE user_id = ?",
+                tuple(update_values),
+            )
+            conn.commit()
+        row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
 
     conn.close()
-    if row is None:
-        raise HTTPException(status_code=500, detail="No se pudo crear el usuario")
-
-    return {
-        "user_id": row["user_id"],
-        "date": row["date"],
-        "used_today": int(row["used_today"]),
-        "premium": bool(row["premium"]),
-        "premium_until": row["premium_until"],
-    }
+    return dict(row) if row else {"user_id": user_id}
 
 
-def reset_if_needed(user_id: str):
+def reset_if_needed(user_id: str) -> None:
     user = get_or_create_user(user_id)
-    today = utc_now().date().isoformat()
-    if user["date"] != today:
-        conn = db_connect()
+    today = today_iso()
+    if user.get("last_reset_date") != today:
+        conn = get_db_connection()
         conn.execute(
-            "UPDATE users SET date = ?, used_today = 0, updated_at = ? WHERE user_id = ?",
-            (today, utc_now().isoformat(), user_id),
+            "UPDATE users SET usage_today = 0, last_reset_date = ?, updated_at = ? WHERE user_id = ?",
+            (today, utcnow_iso(), user_id),
         )
         conn.commit()
         conn.close()
@@ -111,101 +135,240 @@ def reset_if_needed(user_id: str):
 
 def is_premium_active(user_id: str) -> bool:
     user = get_or_create_user(user_id)
-    if not user.get("premium"):
+    if not user.get("premium_until"):
         return False
-    premium_until = user.get("premium_until")
-    if not premium_until:
+    try:
+        return datetime.utcnow() < datetime.fromisoformat(user["premium_until"])
+    except ValueError:
         return False
-    return utc_now() < datetime.fromisoformat(premium_until)
 
 
 def can_use_analysis(user_id: str) -> Dict[str, Any]:
     reset_if_needed(user_id)
     user = get_or_create_user(user_id)
+
     if is_premium_active(user_id):
         return {
             "allowed": True,
             "remaining": 999,
-            "used_today": user["used_today"],
+            "used_today": int(user.get("usage_today") or 0),
             "premium": True,
             "message": "Premium activo",
         }
 
-    remaining = max(0, FREE_DAILY_LIMIT - int(user["used_today"]))
+    remaining = max(0, FREE_DAILY_LIMIT - int(user.get("usage_today") or 0))
     return {
-        "allowed": int(user["used_today"]) < FREE_DAILY_LIMIT,
+        "allowed": int(user.get("usage_today") or 0) < FREE_DAILY_LIMIT,
         "remaining": remaining,
-        "used_today": int(user["used_today"]),
+        "used_today": int(user.get("usage_today") or 0),
         "premium": False,
         "message": "Límite gratuito alcanzado" if remaining == 0 else "Disponible",
     }
 
 
-def consume_analysis(user_id: str) -> Dict[str, Any]:
+def consume_analysis(user_id: str, mode: str = "chat") -> Dict[str, Any]:
     reset_if_needed(user_id)
     user = get_or_create_user(user_id)
 
     if is_premium_active(user_id):
+        conn = get_db_connection()
+        conn.execute(
+            "INSERT INTO usage_logs (user_id, used_at, mode, premium_used) VALUES (?, ?, ?, 1)",
+            (user_id, utcnow_iso(), mode),
+        )
+        conn.commit()
+        conn.close()
         return {"allowed": True, "remaining": 999, "premium": True}
 
-    if int(user["used_today"]) >= FREE_DAILY_LIMIT:
+    used_today = int(user.get("usage_today") or 0)
+    if used_today >= FREE_DAILY_LIMIT:
         return {"allowed": False, "remaining": 0, "premium": False}
 
-    new_used = int(user["used_today"]) + 1
-    conn = db_connect()
+    conn = get_db_connection()
     conn.execute(
-        "UPDATE users SET used_today = ?, updated_at = ? WHERE user_id = ?",
-        (new_used, utc_now().isoformat(), user_id),
+        "UPDATE users SET usage_today = usage_today + 1, updated_at = ? WHERE user_id = ?",
+        (utcnow_iso(), user_id),
+    )
+    conn.execute(
+        "INSERT INTO usage_logs (user_id, used_at, mode, premium_used) VALUES (?, ?, ?, 0)",
+        (user_id, utcnow_iso(), mode),
     )
     conn.commit()
     conn.close()
 
-    remaining = max(0, FREE_DAILY_LIMIT - new_used)
+    remaining = max(0, FREE_DAILY_LIMIT - (used_today + 1))
     return {"allowed": True, "remaining": remaining, "premium": False}
-
-
-def normalize_text(text: str) -> str:
-    return " ".join((text or "").replace("\n", " ").split())
-
-
-def generate_reply(mode: str, text: str) -> str:
-    normalized = normalize_text(text)
-    if not normalized:
-        return "No pude detectar texto suficiente en la captura. Inténtalo con otra imagen."
-
-    lower = normalized.lower()
-    if "hola" in lower or "hey" in lower:
-        opener = "Hola, "
-    else:
-        opener = "Podrías responder con un tono "
-
-    mode_map = {
-        "natural": "natural y tranquilo, manteniendo la conversación sin forzarla.",
-        "casual": "relajado y cercano para que la charla fluya sin presión.",
-        "segura": "claro y seguro, sin entrar en drama ni hacerla incómoda.",
-        "curiosa": "curioso y natural, dejando una pequeña pregunta para seguir la conversación.",
-        "gracioso": "ligero y divertido, sin perder naturalidad ni exagerar.",
-        "coquetear": "cálido y atractivo, con confianza y sin presionar demasiado.",
-        "enamorar": "cercano, elegante y romántico, con buen tono y respeto.",
-        "provocativo": "más directo y intenso, con mucha presencia y un toque sensual controlado.",
-    }
-
-    style = mode_map.get(mode, mode_map["natural"])
-    return f"{opener}responde de forma {style} Mantén la respuesta breve, cercana y natural. Puedes decir: ‘Vi lo que escribiste y me gustó cómo lo planteas, me gustaría seguir esta conversación contigo.’"
-
-
-@app.get("/")
-def root():
-    return {"service": "LiggaCuba API", "status": "ok"}
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "service": "LiggaCuba API"}
 
 
 class OCRBase64Request(BaseModel):
     image: str
+
+
+class UsageQuery(BaseModel):
+    user_id: str
+
+
+class PremiumActivate(BaseModel):
+    user_id: str
+    plan: str = "weekly"
+
+
+class TelegramAuthRequest(BaseModel):
+    initData: str = ""
+    user_id: Optional[str] = None
+
+
+@app.get("/")
+def root():
+    return {"service": "LiggaCuba OCR API", "status": "ok"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "LiggaCuba OCR API"}
+
+
+def parse_telegram_init_data(init_data: str) -> Dict[str, str]:
+    parsed = parse_qs(init_data, keep_blank_values=True)
+    return {key: value[0] for key, value in parsed.items() if value}
+
+
+def verify_telegram_init_data(init_data: str, bot_token: str) -> Dict[str, Any]:
+    if not init_data:
+        raise ValueError("initData vacío")
+
+    if not bot_token:
+        try:
+            params = parse_telegram_init_data(init_data)
+            user = json.loads(params.get("user", "{}"))
+            if user:
+                return user
+        except Exception:
+            pass
+        raise ValueError("No hay TELEGRAM_BOT_TOKEN configurado")
+
+    params = parse_telegram_init_data(init_data)
+    received_hash = params.pop("hash", "")
+    if not received_hash:
+        raise ValueError("Falta hash de Telegram")
+
+    auth_date = int(params.get("auth_date", "0"))
+    if abs(time.time() - auth_date) > 86400:
+        raise ValueError("La sesión de Telegram ha expirado")
+
+    data_check_string = "\n".join(f"{key}={params[key]}" for key in sorted(params))
+    secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+    calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(calculated_hash, received_hash):
+        raise ValueError("Hash de Telegram inválido")
+
+    user_payload = params.get("user", "{}")
+    user = json.loads(user_payload)
+    if not user:
+        raise ValueError("No se pudo leer el usuario de Telegram")
+    return user
+
+
+def require_admin(request: Request) -> None:
+    if not ADMIN_KEY:
+        return
+    provided = request.headers.get("x-admin-key")
+    if provided != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="No autorizado")
+
+
+@app.post("/api/auth/telegram")
+async def auth_telegram(payload: TelegramAuthRequest):
+    try:
+        user_payload = verify_telegram_init_data(payload.initData, BOT_TOKEN) if payload.initData else {}
+    except ValueError:
+        if payload.user_id:
+            user_payload = {"id": int(payload.user_id), "username": None, "first_name": None, "last_name": None}
+        else:
+            raise HTTPException(status_code=400, detail="initData inválido o no disponible")
+
+    user_id = str(user_payload.get("id") or payload.user_id or "guest-user")
+    extra = {
+        "username": user_payload.get("username"),
+        "first_name": user_payload.get("first_name"),
+        "last_name": user_payload.get("last_name"),
+    }
+    user = get_or_create_user(user_id, extra)
+    usage = can_use_analysis(user_id)
+
+    return {
+        "success": True,
+        "user_id": user_id,
+        "username": user.get("username"),
+        "first_name": user.get("first_name"),
+        "last_name": user.get("last_name"),
+        "premium": usage["premium"],
+        "remaining": usage["remaining"],
+    }
+
+
+@app.post("/api/usage")
+async def usage(payload: UsageQuery):
+    return can_use_analysis(payload.user_id)
+
+
+@app.post("/api/analyze")
+async def analyze(payload: UsageQuery):
+    status = consume_analysis(payload.user_id, mode="chat")
+    if not status["allowed"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Has alcanzado tus 3 análisis gratuitos de hoy. Obtén Premium para continuar.",
+        )
+    return {"allowed": True, "remaining": status["remaining"], "premium": status["premium"]}
+
+
+@app.post("/api/premium/activate")
+async def activate_premium(payload: PremiumActivate):
+    user = get_or_create_user(payload.user_id)
+    plan_days = 7 if payload.plan == "weekly" else 365
+    premium_until = (datetime.utcnow() + timedelta(days=plan_days)).isoformat()
+    get_or_create_user(payload.user_id, {"premium_until": premium_until})
+    return {
+        "success": True,
+        "premium": True,
+        "premium_until": premium_until,
+    }
+
+
+@app.post("/api/premium/check")
+async def check_premium(payload: UsageQuery):
+    return {"premium": is_premium_active(payload.user_id), "user_id": payload.user_id}
+
+
+@app.get("/api/admin/stats")
+async def admin_stats(request: Request):
+    require_admin(request)
+    conn = get_db_connection()
+    total_users = conn.execute("SELECT COUNT(*) AS total FROM users").fetchone()["total"]
+    premium_users = conn.execute(
+        "SELECT COUNT(*) AS total FROM users WHERE premium_until IS NOT NULL AND premium_until > ?",
+        (utcnow_iso(),),
+    ).fetchone()["total"]
+    today = today_iso()
+    today_usage = conn.execute(
+        "SELECT COUNT(*) AS total FROM usage_logs WHERE used_at >= ?",
+        (f"{today}T00:00:00",),
+    ).fetchone()["total"]
+    conn.close()
+    return {"total_users": total_users, "premium_users": premium_users, "today_usage": today_usage}
+
+
+@app.get("/api/admin/users")
+async def admin_users(request: Request):
+    require_admin(request)
+    conn = get_db_connection()
+    items = conn.execute(
+        "SELECT user_id, username, first_name, last_name, premium_until, usage_today, last_reset_date FROM users ORDER BY updated_at DESC LIMIT 50"
+    ).fetchall()
+    conn.close()
+    return {"users": [dict(item) for item in items]}
 
 
 def preprocess_image(raw: bytes) -> Image.Image:
@@ -276,99 +439,3 @@ async def ocr_base64_simple(request: Request):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"No se pudo procesar la imagen: {exc}")
-
-
-class UsageQuery(BaseModel):
-    user_id: str
-
-
-@app.post("/api/usage")
-async def usage(payload: UsageQuery):
-    return can_use_analysis(payload.user_id)
-
-
-@app.post("/api/analyze")
-async def analyze(payload: UsageQuery):
-    status = consume_analysis(payload.user_id)
-    if not status["allowed"]:
-        raise HTTPException(
-            status_code=403,
-            detail="Has alcanzado tus 3 análisis gratuitos de hoy. Obtén Premium para continuar.",
-        )
-    return {"allowed": True, "remaining": status["remaining"], "premium": status["premium"]}
-
-
-class GenerateReplyRequest(BaseModel):
-    user_id: str
-    mode: str
-    text: str
-
-
-@app.post("/api/generate-reply")
-async def generate_reply_endpoint(payload: GenerateReplyRequest):
-    if not payload.user_id:
-        raise HTTPException(status_code=400, detail="user_id requerido")
-
-    get_or_create_user(payload.user_id)
-    if not is_premium_active(payload.user_id):
-        status = can_use_analysis(payload.user_id)
-        if not status["allowed"]:
-            raise HTTPException(status_code=403, detail="Límite alcanzado. Compra Premium.")
-
-    reply = generate_reply(payload.mode, payload.text)
-    return {"success": True, "reply": reply}
-
-
-class PremiumActivate(BaseModel):
-    user_id: str
-    plan: str = "weekly"
-
-
-@app.post("/api/premium/activate")
-async def activate_premium(payload: PremiumActivate):
-    user = get_or_create_user(payload.user_id)
-    user["premium"] = True
-    user["premium_until"] = (
-        (utc_now() + timedelta(days=7 if payload.plan == "weekly" else 365)).isoformat()
-    )
-
-    conn = db_connect()
-    conn.execute(
-        "UPDATE users SET premium = 1, premium_until = ?, updated_at = ? WHERE user_id = ?",
-        (user["premium_until"], utc_now().isoformat(), payload.user_id),
-    )
-    conn.commit()
-    conn.close()
-
-    return {
-        "success": True,
-        "premium": True,
-        "premium_until": user["premium_until"],
-    }
-
-
-@app.post("/api/premium/check")
-async def check_premium(payload: UsageQuery):
-    return {"premium": is_premium_active(payload.user_id), "user_id": payload.user_id}
-
-
-@app.post("/api/premium/status")
-async def premium_status(payload: UsageQuery):
-    user = get_or_create_user(payload.user_id)
-    return {
-        "premium": is_premium_active(payload.user_id),
-        "premium_until": user.get("premium_until"),
-        "user_id": payload.user_id,
-    }
-
-
-@app.post("/api/reset")
-async def reset_usage(payload: UsageQuery):
-    conn = db_connect()
-    conn.execute(
-        "UPDATE users SET date = ?, used_today = 0, updated_at = ? WHERE user_id = ?",
-        (utc_now().date().isoformat(), utc_now().isoformat(), payload.user_id),
-    )
-    conn.commit()
-    conn.close()
-    return {"success": True, "remaining": FREE_DAILY_LIMIT}
