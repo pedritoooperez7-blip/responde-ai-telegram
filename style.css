@@ -15,7 +15,8 @@ body {
 }
 
 button,
-label {
+label,
+select {
   -webkit-tap-highlight-color: transparent;
 }
 
@@ -87,7 +88,8 @@ p {
   opacity: 0.75;
 }
 
-button {
+button,
+select {
   border: 0;
   border-radius: 12px;
   font-size: 16px;
@@ -120,9 +122,20 @@ button {
   color: #fff;
 }
 
-.premium-link {
-  margin-top: 16px;
-  align-self: center;
+.inline-actions,
+.top-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.top-actions {
+  align-items: center;
+}
+
+.inline-actions {
+  margin-top: 18px;
 }
 
 .upload-box {
@@ -145,7 +158,8 @@ button {
   line-height: 1;
 }
 
-#imageInput {
+#imageInput,
+#storyImageInput {
   display: none;
 }
 
@@ -173,13 +187,15 @@ button {
   margin-bottom: 16px;
 }
 
-.mode-button {
+.mode-button,
+.story-mode-button {
   padding: 14px 10px;
   background: #1e293b;
   color: #fff;
 }
 
-.mode-button.selected {
+.mode-button.selected,
+.story-mode-button.selected {
   outline: 2px solid #38bdf8;
   background: linear-gradient(135deg, #0ea5e9, #2563eb);
 }
@@ -207,11 +223,20 @@ button {
 }
 
 .premium-box,
-.premium-plan {
+.premium-plan,
+.settings-card {
   background: rgba(30, 41, 59, 0.7);
   border-radius: 16px;
   padding: 18px;
   margin: 16px 0;
+}
+
+#languageToggle {
+  width: 100%;
+  margin-top: 10px;
+  padding: 12px 14px;
+  background: #0f172a;
+  color: #fff;
 }
 
 @media (max-width: 380px) {
