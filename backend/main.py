@@ -8,8 +8,10 @@ import hmac
 import io
 import json
 import os
+import re
 import sqlite3
 import time
+import uuid
 import pytesseract
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
@@ -26,6 +28,11 @@ app.add_middleware(
 )
 
 FREE_DAILY_LIMIT = 3
+
+FREE_CHAT_MODES = {"gracioso", "coquetear", "enamorar"}
+PREMIUM_CHAT_MODES = {"provocativo"}
+FREE_STORY_MODES = {"gracioso", "coquetear"}
+PREMIUM_STORY_MODES = {"provocativo", "enamorar"}
 DB_PATH = os.getenv("DB_PATH", "liggacuba.db")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
@@ -208,6 +215,12 @@ class UsageQuery(BaseModel):
     user_id: str
 
 
+class AnalyzeRequest(BaseModel):
+    user_id: str
+    mode: str = "coquetear"
+    module: str = "chat"
+
+
 class PremiumActivate(BaseModel):
     user_id: str
     plan: str = "weekly"
@@ -221,7 +234,18 @@ class TelegramAuthRequest(BaseModel):
 class GenerateReplyRequest(BaseModel):
     user_id: str
     mode: str = "coquetear"
+    module: str = "chat"
     text: str = ""
+
+
+class PendingPaymentRequest(BaseModel):
+    user_id: str
+    plan: str = "weekly"
+    language: str = "es"
+
+
+class PaymentStatusRequest(BaseModel):
+    operation_id: str
 
 
 @app.get("/")
@@ -320,13 +344,19 @@ async def usage(payload: UsageQuery):
 
 
 @app.post("/api/analyze")
-async def analyze(payload: UsageQuery):
-    status = consume_analysis(payload.user_id, mode="chat")
+async def analyze(payload: AnalyzeRequest):
+    module = payload.module if payload.module in {"chat", "story"} else "chat"
+    mode = payload.mode.lower().strip()
+    allowed_free = FREE_CHAT_MODES if module == "chat" else FREE_STORY_MODES
+    allowed_premium = PREMIUM_CHAT_MODES if module == "chat" else PREMIUM_STORY_MODES
+    if mode not in allowed_free | allowed_premium:
+        raise HTTPException(status_code=400, detail="Modo de respuesta no válido.")
+    premium = is_premium_active(payload.user_id)
+    if mode in allowed_premium and not premium:
+        raise HTTPException(status_code=402, detail="Este modo requiere Premium.")
+    status = consume_analysis(payload.user_id, mode=f"{module}:{mode}")
     if not status["allowed"]:
-        raise HTTPException(
-            status_code=403,
-            detail="Has alcanzado tus 3 análisis gratuitos de hoy. Obtén Premium para continuar.",
-        )
+        raise HTTPException(status_code=403, detail="Has alcanzado tus 3 análisis gratuitos de hoy. Obtén Premium para continuar.")
     return {"allowed": True, "remaining": status["remaining"], "premium": status["premium"]}
 
 
@@ -346,6 +376,30 @@ async def activate_premium(payload: PremiumActivate):
 @app.post("/api/premium/check")
 async def check_premium(payload: UsageQuery):
     return {"premium": is_premium_active(payload.user_id), "user_id": payload.user_id}
+
+
+@app.post("/api/payments/pending")
+async def create_pending_payment(payload: PendingPaymentRequest):
+    if payload.plan not in {"weekly", "annual"}:
+        raise HTTPException(status_code=400, detail="Plan inválido.")
+    if payload.language == "en":
+        amount = "8.99 USD" if payload.plan == "weekly" else "29.99 USD"
+    else:
+        amount = "2500 CUP" if payload.plan == "weekly" else "15500 CUP"
+    operation_id = uuid.uuid4().hex[:12].upper()
+    now = utcnow_iso()
+    conn = get_db_connection()
+    conn.execute("INSERT INTO payment_operations(operation_id,user_id,plan,language,status,amount,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                 (operation_id,str(payload.user_id),payload.plan,payload.language,"pending",amount,now,now))
+    conn.commit(); conn.close()
+    return {"success": True, "operation_id": operation_id, "status": "pending", "amount": amount}
+
+
+@app.post("/api/payments/status")
+async def payment_status(payload: PaymentStatusRequest):
+    conn=get_db_connection(); row=conn.execute("SELECT * FROM payment_operations WHERE operation_id=?",(payload.operation_id,)).fetchone(); conn.close()
+    if not row: raise HTTPException(status_code=404, detail="Operación no encontrada.")
+    return dict(row)
 
 
 @app.get("/api/admin/stats")
@@ -378,7 +432,7 @@ async def admin_users(request: Request):
 
 
 def build_reply_for_mode(mode: str, text: str) -> str:
-    normalized = (text or "").replace("\s+", " ").strip()
+    normalized = re.sub(r"\s+", " ", text or "").strip()
     lower = normalized.lower()
 
     templates = {
@@ -401,9 +455,17 @@ def build_reply_for_mode(mode: str, text: str) -> str:
 
 @app.post("/api/generate-reply")
 async def generate_reply(payload: GenerateReplyRequest):
+    module = payload.module if payload.module in {"chat", "story"} else "chat"
+    mode = payload.mode.lower().strip()
+    allowed_free = FREE_CHAT_MODES if module == "chat" else FREE_STORY_MODES
+    allowed_premium = PREMIUM_CHAT_MODES if module == "chat" else PREMIUM_STORY_MODES
+    if mode not in allowed_free | allowed_premium:
+        raise HTTPException(status_code=400, detail="Modo de respuesta no válido.")
+    if mode in allowed_premium and not is_premium_active(payload.user_id):
+        raise HTTPException(status_code=402, detail="Este modo requiere Premium.")
     if not payload.text:
         return {"success": True, "reply": "No pude detectar texto suficiente para generar una respuesta útil."}
-    reply = build_reply_for_mode(payload.mode, payload.text)
+    reply = build_reply_for_mode(mode, payload.text)
     return {"success": True, "reply": reply}
 
 
