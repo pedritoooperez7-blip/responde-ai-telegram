@@ -1,540 +1,358 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from PIL import Image
-import base64
-import hashlib
-import hmac
-import io
-import json
-import os
-import re
-import sqlite3
-import time
-import uuid
+import base64, hashlib, hmac, io, json, os, re, sqlite3, time, uuid
 import pytesseract
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs
 
-app = FastAPI(title="LiggaCuba OCR API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+app = FastAPI(title="LiggaCuba API", version="2.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 FREE_DAILY_LIMIT = 3
-
 FREE_CHAT_MODES = {"gracioso", "coquetear", "enamorar"}
-PREMIUM_CHAT_MODES = {"provocativo"}
+PREMIUM_CHAT_MODES = {"provocativo", "salvar"}
 FREE_STORY_MODES = {"gracioso", "coquetear"}
 PREMIUM_STORY_MODES = {"provocativo", "enamorar"}
-DB_PATH = os.getenv("DB_PATH", "liggacuba.db")
+DB_PATH = os.getenv("DB_PATH", os.path.join(ROOT, "liggacuba.db"))
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 
 
-def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def db():
+    c = sqlite3.connect(DB_PATH)
+    c.row_factory = sqlite3.Row
+    return c
 
 
-def init_db() -> None:
-    conn = get_db_connection()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            user_id TEXT PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            last_name TEXT,
-            premium_until TEXT,
-            created_at TEXT,
-            updated_at TEXT,
-            usage_today INTEGER DEFAULT 0,
-            last_reset_date TEXT
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS usage_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT,
-            used_at TEXT,
-            mode TEXT,
-            premium_used INTEGER DEFAULT 0
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
+def now(): return datetime.utcnow().isoformat()
+def today(): return datetime.utcnow().date().isoformat()
 
 
+def init_db():
+    c = db()
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS users(
+      user_id TEXT PRIMARY KEY, username TEXT, first_name TEXT, last_name TEXT,
+      premium_until TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      usage_today INTEGER NOT NULL DEFAULT 0, last_reset_date TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS usage_logs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, used_at TEXT, module TEXT, mode TEXT, premium_used INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS payment_operations(
+      operation_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, plan TEXT NOT NULL, language TEXT NOT NULL,
+      status TEXT NOT NULL, amount TEXT NOT NULL, proof_text TEXT, proof_image TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, verified_at TEXT, cancelled_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS saved_situations(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, ocr_text TEXT, reply TEXT, created_at TEXT NOT NULL
+    );
+    """)
+    c.commit(); c.close()
 init_db()
 
 
-def utcnow_iso() -> str:
-    return datetime.utcnow().isoformat()
-
-
-def today_iso() -> str:
-    return datetime.utcnow().date().isoformat()
-
-
-def get_or_create_user(user_id: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    user_id = str(user_id or "guest-user")
-    now = utcnow_iso()
-    conn = get_db_connection()
-    row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-
-    if row is None:
-        conn.execute(
-            """
-            INSERT INTO users (
-                user_id, username, first_name, last_name, premium_until,
-                created_at, updated_at, usage_today, last_reset_date
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
-            """,
-            (user_id, None, None, None, None, now, now, today_iso()),
-        )
-        conn.commit()
-        row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-
+def user(user_id: str, extra: Optional[Dict[str, Any]] = None):
+    uid = str(user_id or "guest-user")
+    c = db(); row = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not row:
+        t=now(); c.execute("INSERT INTO users(user_id,created_at,updated_at,last_reset_date) VALUES(?,?,?,?)", (uid,t,t,today()))
+        c.commit(); row=c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
     if extra:
-        update_fields = []
-        update_values = []
-        for key, value in extra.items():
-            if value is not None:
-                update_fields.append(f"{key} = ?")
-                update_values.append(value)
-        if update_fields:
-            update_fields.append("updated_at = ?")
-            update_values.extend([now, user_id])
-            conn.execute(
-                f"UPDATE users SET {', '.join(update_fields)} WHERE user_id = ?",
-                tuple(update_values),
-            )
-            conn.commit()
-        row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-
-    conn.close()
-    return dict(row) if row else {"user_id": user_id}
+        allowed={"username","first_name","last_name","premium_until"}; fields=[]; vals=[]
+        for k,v in extra.items():
+            if k in allowed and v is not None: fields.append(f"{k}=?"); vals.append(v)
+        if fields:
+            fields.append("updated_at=?"); vals.extend([now(),uid]); c.execute(f"UPDATE users SET {','.join(fields)} WHERE user_id=?", vals); c.commit()
+            row=c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    c.close(); return dict(row)
 
 
-def reset_if_needed(user_id: str) -> None:
-    user = get_or_create_user(user_id)
-    today = today_iso()
-    if user.get("last_reset_date") != today:
-        conn = get_db_connection()
-        conn.execute(
-            "UPDATE users SET usage_today = 0, last_reset_date = ?, updated_at = ? WHERE user_id = ?",
-            (today, utcnow_iso(), user_id),
-        )
-        conn.commit()
-        conn.close()
+def reset(uid):
+    u=user(uid)
+    if u["last_reset_date"] != today():
+        c=db(); c.execute("UPDATE users SET usage_today=0,last_reset_date=?,updated_at=? WHERE user_id=?",(today(),now(),uid)); c.commit(); c.close()
 
 
-def is_premium_active(user_id: str) -> bool:
-    user = get_or_create_user(user_id)
-    if not user.get("premium_until"):
-        return False
-    try:
-        return datetime.utcnow() < datetime.fromisoformat(user["premium_until"])
-    except ValueError:
-        return False
+def premium(uid):
+    p=user(uid).get("premium_until")
+    if not p: return False
+    try: return datetime.utcnow() < datetime.fromisoformat(p)
+    except ValueError: return False
 
 
-def can_use_analysis(user_id: str) -> Dict[str, Any]:
-    reset_if_needed(user_id)
-    user = get_or_create_user(user_id)
-
-    if is_premium_active(user_id):
-        return {
-            "allowed": True,
-            "remaining": 999,
-            "used_today": int(user.get("usage_today") or 0),
-            "premium": True,
-            "message": "Premium activo",
-        }
-
-    remaining = max(0, FREE_DAILY_LIMIT - int(user.get("usage_today") or 0))
-    return {
-        "allowed": int(user.get("usage_today") or 0) < FREE_DAILY_LIMIT,
-        "remaining": remaining,
-        "used_today": int(user.get("usage_today") or 0),
-        "premium": False,
-        "message": "Límite gratuito alcanzado" if remaining == 0 else "Disponible",
-    }
+def usage(uid):
+    reset(uid); u=user(uid); used=int(u.get("usage_today") or 0); prem=premium(uid)
+    return {"allowed": prem or used < FREE_DAILY_LIMIT, "remaining": 999 if prem else max(0,FREE_DAILY_LIMIT-used), "used_today":used, "premium":prem}
 
 
-def consume_analysis(user_id: str, mode: str = "chat") -> Dict[str, Any]:
-    reset_if_needed(user_id)
-    user = get_or_create_user(user_id)
-
-    if is_premium_active(user_id):
-        conn = get_db_connection()
-        conn.execute(
-            "INSERT INTO usage_logs (user_id, used_at, mode, premium_used) VALUES (?, ?, ?, 1)",
-            (user_id, utcnow_iso(), mode),
-        )
-        conn.commit()
-        conn.close()
-        return {"allowed": True, "remaining": 999, "premium": True}
-
-    used_today = int(user.get("usage_today") or 0)
-    if used_today >= FREE_DAILY_LIMIT:
-        return {"allowed": False, "remaining": 0, "premium": False}
-
-    conn = get_db_connection()
-    conn.execute(
-        "UPDATE users SET usage_today = usage_today + 1, updated_at = ? WHERE user_id = ?",
-        (utcnow_iso(), user_id),
-    )
-    conn.execute(
-        "INSERT INTO usage_logs (user_id, used_at, mode, premium_used) VALUES (?, ?, ?, 0)",
-        (user_id, utcnow_iso(), mode),
-    )
-    conn.commit()
-    conn.close()
-
-    remaining = max(0, FREE_DAILY_LIMIT - (used_today + 1))
-    return {"allowed": True, "remaining": remaining, "premium": False}
+def consume(uid,module,mode):
+    reset(uid); prem=premium(uid); c=db();
+    if not prem:
+        u=user(uid); used=int(u.get("usage_today") or 0)
+        if used >= FREE_DAILY_LIMIT: c.close(); return {"allowed":False,"remaining":0,"premium":False}
+        c.execute("UPDATE users SET usage_today=usage_today+1,updated_at=? WHERE user_id=?",(now(),uid)); remaining=FREE_DAILY_LIMIT-used-1
+    else: remaining=999
+    c.execute("INSERT INTO usage_logs(user_id,used_at,module,mode,premium_used) VALUES(?,?,?,?,?)",(uid,now(),module,mode,1 if prem else 0)); c.commit(); c.close()
+    return {"allowed":True,"remaining":remaining,"premium":prem}
 
 
-class OCRBase64Request(BaseModel):
-    image: str
+class TelegramAuth(BaseModel): initData:str=""; user_id:Optional[str]=None
+class Usage(BaseModel): user_id:str
+class Analyze(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"
+class Generate(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"; text:str=""
+class Pending(BaseModel): user_id:str; plan:str="weekly"; language:str="es"
+class PaymentId(BaseModel): operation_id:str; user_id:str
+class Proof(BaseModel): operation_id:str; user_id:str; proof_text:str=""; proof_image:str=""
+class SaveSituation(BaseModel): user_id:str; ocr_text:str=""; reply:str=""
+class OCR(BaseModel): image:str
 
 
-class UsageQuery(BaseModel):
-    user_id: str
+def parse_init(s): return {k:v[0] for k,v in parse_qs(s,keep_blank_values=True).items() if v}
+
+def verify_init(s):
+    if not s: raise ValueError("initData vacío")
+    p=parse_init(s); received=p.pop("hash","")
+    if not BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN no configurado")
+    if not received: raise ValueError("Falta hash de Telegram")
+    try: auth_date=int(p.get("auth_date","0"))
+    except ValueError: raise ValueError("auth_date inválido")
+    if abs(time.time()-auth_date)>86400: raise ValueError("Sesión de Telegram expirada")
+    check="\n".join(f"{k}={p[k]}" for k in sorted(p)); secret=hmac.new(b"WebAppData",BOT_TOKEN.encode(),hashlib.sha256).digest(); calc=hmac.new(secret,check.encode(),hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc,received): raise ValueError("Hash de Telegram inválido")
+    u=json.loads(p.get("user","{}"));
+    if not u: raise ValueError("Usuario Telegram ausente")
+    return u
 
 
-class AnalyzeRequest(BaseModel):
-    user_id: str
-    mode: str = "coquetear"
-    module: str = "chat"
+def admin(request:Request):
+    if not ADMIN_KEY: raise HTTPException(503,"ADMIN_KEY no configurado en Railway")
+    if not hmac.compare_digest(request.headers.get("x-admin-key", ""), ADMIN_KEY): raise HTTPException(401,"No autorizado")
 
 
-class PremiumActivate(BaseModel):
-    user_id: str
-    plan: str = "weekly"
-
-
-class TelegramAuthRequest(BaseModel):
-    initData: str = ""
-    user_id: Optional[str] = None
-
-
-class GenerateReplyRequest(BaseModel):
-    user_id: str
-    mode: str = "coquetear"
-    module: str = "chat"
-    text: str = ""
-
-
-class PendingPaymentRequest(BaseModel):
-    user_id: str
-    plan: str = "weekly"
-    language: str = "es"
-
-
-class PaymentStatusRequest(BaseModel):
-    operation_id: str
+def amount(plan,lang):
+    if lang=="en": return "8.99 USD" if plan=="weekly" else "29.99 USD"
+    return "2500 CUP" if plan=="weekly" else "15500 CUP"
 
 
 @app.get("/")
-def root():
-    return {"service": "LiggaCuba OCR API", "status": "ok"}
-
-
+def root(): return FileResponse(os.path.join(ROOT,"index.html"))
+@app.get("/app.js")
+def js(): return FileResponse(os.path.join(ROOT,"app.js"),media_type="application/javascript")
+@app.get("/style.css")
+def css(): return FileResponse(os.path.join(ROOT,"style.css"),media_type="text/css")
+@app.get("/privacy.html")
+def privacy(): return FileResponse(os.path.join(ROOT,"privacy.html"),media_type="text/html")
+@app.get("/terms.html")
+def terms(): return FileResponse(os.path.join(ROOT,"terms.html"),media_type="text/html")
 @app.get("/health")
-def health():
-    return {"status": "ok", "service": "LiggaCuba OCR API"}
-
-
-def parse_telegram_init_data(init_data: str) -> Dict[str, str]:
-    parsed = parse_qs(init_data, keep_blank_values=True)
-    return {key: value[0] for key, value in parsed.items() if value}
-
-
-def verify_telegram_init_data(init_data: str, bot_token: str) -> Dict[str, Any]:
-    if not init_data:
-        raise ValueError("initData vacío")
-
-    if not bot_token:
-        try:
-            params = parse_telegram_init_data(init_data)
-            user = json.loads(params.get("user", "{}"))
-            if user:
-                return user
-        except Exception:
-            pass
-        raise ValueError("No hay TELEGRAM_BOT_TOKEN configurado")
-
-    params = parse_telegram_init_data(init_data)
-    received_hash = params.pop("hash", "")
-    if not received_hash:
-        raise ValueError("Falta hash de Telegram")
-
-    auth_date = int(params.get("auth_date", "0"))
-    if abs(time.time() - auth_date) > 86400:
-        raise ValueError("La sesión de Telegram ha expirado")
-
-    data_check_string = "\n".join(f"{key}={params[key]}" for key in sorted(params))
-    secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
-    calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-
-    if not hmac.compare_digest(calculated_hash, received_hash):
-        raise ValueError("Hash de Telegram inválido")
-
-    user_payload = params.get("user", "{}")
-    user = json.loads(user_payload)
-    if not user:
-        raise ValueError("No se pudo leer el usuario de Telegram")
-    return user
-
-
-def require_admin(request: Request) -> None:
-    if not ADMIN_KEY:
-        return
-    provided = request.headers.get("x-admin-key")
-    if provided != ADMIN_KEY:
-        raise HTTPException(status_code=401, detail="No autorizado")
+def health(): return {"status":"ok","service":"LiggaCuba","version":"2.0"}
 
 
 @app.post("/api/auth/telegram")
-async def auth_telegram(payload: TelegramAuthRequest):
+def auth_telegram(p:TelegramAuth):
     try:
-        user_payload = verify_telegram_init_data(payload.initData, BOT_TOKEN) if payload.initData else {}
-    except ValueError:
-        if payload.user_id:
-            user_payload = {"id": int(payload.user_id), "username": None, "first_name": None, "last_name": None}
+        if p.initData:
+            u=verify_init(p.initData)
+        elif not BOT_TOKEN and p.user_id:
+            u={"id":p.user_id}
         else:
-            raise HTTPException(status_code=400, detail="initData inválido o no disponible")
-
-    user_id = str(user_payload.get("id") or payload.user_id or "guest-user")
-    extra = {
-        "username": user_payload.get("username"),
-        "first_name": user_payload.get("first_name"),
-        "last_name": user_payload.get("last_name"),
-    }
-    user = get_or_create_user(user_id, extra)
-    usage = can_use_analysis(user_id)
-
-    return {
-        "success": True,
-        "user_id": user_id,
-        "username": user.get("username"),
-        "first_name": user.get("first_name"),
-        "last_name": user.get("last_name"),
-        "premium": usage["premium"],
-        "remaining": usage["remaining"],
-    }
-
+            u=None
+    except ValueError as e:
+        raise HTTPException(401,str(e))
+    if not u or not u.get("id"): raise HTTPException(401,"Autenticación requerida")
+    if p.user_id and str(p.user_id) != str(u.get("id")):
+        raise HTTPException(401,"El usuario no coincide con Telegram")
+    uid=str(u["id"]); user(uid,{"username":u.get("username"),"first_name":u.get("first_name"),"last_name":u.get("last_name")}); x=usage(uid)
+    return {"success":True,"user_id":uid,**x}
 
 @app.post("/api/usage")
-async def usage(payload: UsageQuery):
-    return can_use_analysis(payload.user_id)
-
+def api_usage(p:Usage): return usage(p.user_id)
 
 @app.post("/api/analyze")
-async def analyze(payload: AnalyzeRequest):
-    module = payload.module if payload.module in {"chat", "story"} else "chat"
-    mode = payload.mode.lower().strip()
-    allowed_free = FREE_CHAT_MODES if module == "chat" else FREE_STORY_MODES
-    allowed_premium = PREMIUM_CHAT_MODES if module == "chat" else PREMIUM_STORY_MODES
-    if mode not in allowed_free | allowed_premium:
-        raise HTTPException(status_code=400, detail="Modo de respuesta no válido.")
-    premium = is_premium_active(payload.user_id)
-    if mode in allowed_premium and not premium:
-        raise HTTPException(status_code=402, detail="Este modo requiere Premium.")
-    status = consume_analysis(payload.user_id, mode=f"{module}:{mode}")
-    if not status["allowed"]:
-        raise HTTPException(status_code=403, detail="Has alcanzado tus 3 análisis gratuitos de hoy. Obtén Premium para continuar.")
-    return {"allowed": True, "remaining": status["remaining"], "premium": status["premium"]}
-
-
-@app.post("/api/premium/activate")
-async def activate_premium(payload: PremiumActivate):
-    user = get_or_create_user(payload.user_id)
-    plan_days = 7 if payload.plan == "weekly" else 365
-    premium_until = (datetime.utcnow() + timedelta(days=plan_days)).isoformat()
-    get_or_create_user(payload.user_id, {"premium_until": premium_until})
-    return {
-        "success": True,
-        "premium": True,
-        "premium_until": premium_until,
-    }
-
-
-@app.post("/api/premium/check")
-async def check_premium(payload: UsageQuery):
-    return {"premium": is_premium_active(payload.user_id), "user_id": payload.user_id}
-
-
-@app.post("/api/payments/pending")
-async def create_pending_payment(payload: PendingPaymentRequest):
-    if payload.plan not in {"weekly", "annual"}:
-        raise HTTPException(status_code=400, detail="Plan inválido.")
-    if payload.language == "en":
-        amount = "8.99 USD" if payload.plan == "weekly" else "29.99 USD"
-    else:
-        amount = "2500 CUP" if payload.plan == "weekly" else "15500 CUP"
-    operation_id = uuid.uuid4().hex[:12].upper()
-    now = utcnow_iso()
-    conn = get_db_connection()
-    conn.execute("INSERT INTO payment_operations(operation_id,user_id,plan,language,status,amount,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                 (operation_id,str(payload.user_id),payload.plan,payload.language,"pending",amount,now,now))
-    conn.commit(); conn.close()
-    return {"success": True, "operation_id": operation_id, "status": "pending", "amount": amount}
-
-
-@app.post("/api/payments/status")
-async def payment_status(payload: PaymentStatusRequest):
-    conn=get_db_connection(); row=conn.execute("SELECT * FROM payment_operations WHERE operation_id=?",(payload.operation_id,)).fetchone(); conn.close()
-    if not row: raise HTTPException(status_code=404, detail="Operación no encontrada.")
-    return dict(row)
-
-
-@app.get("/api/admin/stats")
-async def admin_stats(request: Request):
-    require_admin(request)
-    conn = get_db_connection()
-    total_users = conn.execute("SELECT COUNT(*) AS total FROM users").fetchone()["total"]
-    premium_users = conn.execute(
-        "SELECT COUNT(*) AS total FROM users WHERE premium_until IS NOT NULL AND premium_until > ?",
-        (utcnow_iso(),),
-    ).fetchone()["total"]
-    today = today_iso()
-    today_usage = conn.execute(
-        "SELECT COUNT(*) AS total FROM usage_logs WHERE used_at >= ?",
-        (f"{today}T00:00:00",),
-    ).fetchone()["total"]
-    conn.close()
-    return {"total_users": total_users, "premium_users": premium_users, "today_usage": today_usage}
-
-
-@app.get("/api/admin/users")
-async def admin_users(request: Request):
-    require_admin(request)
-    conn = get_db_connection()
-    items = conn.execute(
-        "SELECT user_id, username, first_name, last_name, premium_until, usage_today, last_reset_date FROM users ORDER BY updated_at DESC LIMIT 50"
-    ).fetchall()
-    conn.close()
-    return {"users": [dict(item) for item in items]}
-
-
-def build_reply_for_mode(mode: str, text: str) -> str:
-    normalized = re.sub(r"\s+", " ", text or "").strip()
-    lower = normalized.lower()
-
-    templates = {
-        "gracioso": "Responde con un toque ligero y divertido, sin perder naturalidad.",
-        "coquetear": "Usa un tono cálido y atractivo, pero sin presionar ni forzar.",
-        "provocativo": "Da un tono más directo e intenso, pero con control y clase.",
-        "enamorar": "Haz una respuesta elegante, cercana y romántica, con buena energía y respeto.",
-    }
-
-    if not normalized:
-        return "No pude detectar texto suficiente para generar una respuesta útil. Intenta otra captura."
-
-    base = templates.get(mode, templates["coquetear"])
-    if "hola" in lower or "hey" in lower:
-        return f"{base} Además, puedes empezar con un saludo amable y seguir la conversación sin hacerla forzada."
-    if "porque" in lower or "por qué" in lower:
-        return f"{base} Responde con claridad, evita entrar en defensiva y deja la conversación con una línea amable y directa."
-    return f"{base} Mantén la respuesta breve, auténtica y con buena energía."
-
+def analyze(p:Analyze):
+    module=p.module if p.module in {"chat","story"} else "chat"; mode=p.mode.lower().strip(); free=FREE_CHAT_MODES if module=="chat" else FREE_STORY_MODES; premset=PREMIUM_CHAT_MODES if module=="chat" else PREMIUM_STORY_MODES
+    if mode not in free|premset: raise HTTPException(400,"Modo no válido")
+    if mode in premset and not premium(p.user_id): raise HTTPException(402,"Este modo requiere Premium")
+    r=consume(p.user_id,module,mode)
+    if not r["allowed"]: raise HTTPException(403,"Has alcanzado tus 3 análisis gratuitos de hoy")
+    return r
 
 @app.post("/api/generate-reply")
-async def generate_reply(payload: GenerateReplyRequest):
-    module = payload.module if payload.module in {"chat", "story"} else "chat"
-    mode = payload.mode.lower().strip()
-    allowed_free = FREE_CHAT_MODES if module == "chat" else FREE_STORY_MODES
-    allowed_premium = PREMIUM_CHAT_MODES if module == "chat" else PREMIUM_STORY_MODES
-    if mode not in allowed_free | allowed_premium:
-        raise HTTPException(status_code=400, detail="Modo de respuesta no válido.")
-    if mode in allowed_premium and not is_premium_active(payload.user_id):
-        raise HTTPException(status_code=402, detail="Este modo requiere Premium.")
-    if not payload.text:
-        return {"success": True, "reply": "No pude detectar texto suficiente para generar una respuesta útil."}
-    reply = build_reply_for_mode(mode, payload.text)
-    return {"success": True, "reply": reply}
+def generate(p:Generate):
+    module=p.module if p.module in {"chat","story"} else "chat"
+    mode=p.mode.lower().strip()
+    free=FREE_CHAT_MODES if module=="chat" else FREE_STORY_MODES
+    premset=PREMIUM_CHAT_MODES if module=="chat" else PREMIUM_STORY_MODES
 
+    if mode not in free|premset:
+        raise HTTPException(400,"Modo no válido")
+    if mode in premset and not premium(p.user_id):
+        raise HTTPException(402,"Este modo requiere Premium")
 
-def preprocess_image(raw: bytes) -> Image.Image:
-    image = Image.open(io.BytesIO(raw))
-    image.load()
-    if image.mode in ("RGBA", "LA"):
-        image = image.convert("RGB")
-    return image
+    t=re.sub(r"\s+"," ",(p.text or "")).strip()
+    if not t:
+        return {"success":False,"reply":"No pude detectar texto suficiente para generar una respuesta útil."}
 
+    low=t.lower()
+    premium_mode=mode in premset
 
-@app.post("/ocr-base64")
-async def ocr_base64(payload: OCRBase64Request):
-    try:
-        image_data = payload.image or ""
-        if not image_data:
-            raise HTTPException(status_code=400, detail="La imagen está vacía.")
-        if "," in image_data:
-            image_data = image_data.split(",", 1)[1]
-        raw = base64.b64decode(image_data)
-        if not raw:
-            raise HTTPException(status_code=400, detail="La imagen está vacía.")
+    def contains(words):
+        return any(w in low for w in words)
 
-        image = preprocess_image(raw)
-        text = pytesseract.image_to_string(image, lang="spa+eng")
-        return {"success": True, "text": text.strip()}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"No se pudo procesar la imagen: {exc}")
+    if mode=="gracioso":
+        if contains(["jaj","jaja","😂","🤣","lol"]):
+            reply="Puedes seguirle el juego: “JAJA 😂 así empiezas y después no hay quien te aguante.”"
+        elif "?" in t:
+            reply="Puedes responder con humor: “Esa pregunta viene con trampa 😂 pero me gusta la curiosidad.”"
+        else:
+            reply="Puedes responder: “Jajaja, contigo uno nunca sabe qué esperar 😂.”"
+
+    elif mode=="coquetear":
+        if contains(["hola","hey","buenas"]):
+            reply="Puedes responder: “Hola 😏 justo estaba pensando que hacía rato no sabía de ti. ¿Cómo estás?”"
+        elif "?" in t:
+            reply="Puedes responder: “Depende… ¿me lo preguntas porque tienes curiosidad o porque quieres conocer la respuesta? 😉”"
+        else:
+            reply="Puedes responder: “No sé si lo haces a propósito, pero tienes una forma de hablar que engancha 😉.”"
+
+    elif mode=="enamorar":
+        if contains(["hola","hey","buenas"]):
+            reply="Puedes responder: “Qué bonito leerte. Espero que tu día esté yendo bien, porque ya me mejoraste un poquito el mío ❤️.”"
+        elif "?" in t:
+            reply="Puedes responder con cercanía: “Te respondería rápido, pero contigo prefiero pensarlo bien para decirte exactamente lo que siento ❤️.”"
+        else:
+            reply="Puedes responder: “Me gusta hablar contigo porque la conversación se siente diferente, de esas que uno quiere seguir un rato más ❤️.”"
+
+    elif mode=="provocativo":
+        if contains(["hola","hey","buenas"]):
+            reply="Puedes responder: “Hola… aunque tengo la sensación de que contigo un simple hola puede terminar complicándose bastante 😏.”"
+        elif "?" in t:
+            reply="Puedes responder: “Podría darte una respuesta inocente… pero creo que los dos sabemos que sería demasiado aburrido 😏.”"
+        else:
+            reply="Puedes responder: “No sé si estás provocando o simplemente eres así, pero definitivamente conseguiste mi atención 😏.”"
+
+    elif mode=="salvar":
+        if "?" in t:
+            reply="Para salir bien de la situación, puedes responder: “Creo que me expliqué mal 😅. Lo que realmente quería decir era que prefiero hablarlo tranquilamente contigo.”"
+        elif contains(["perdón","perdon","enoj","molest","molesto","molesta","mal","problema"]):
+            reply="Puedes bajar la tensión sin quedar mal: “No era mi intención que sonara así. Prefiero aclararlo contigo antes de que se malinterprete.”"
+        else:
+            reply="Puedes responder de forma segura: “Creo que esto se puede explicar mejor 😅. No quiero que se entienda algo que no quise decir.”"
+
+    else:
+        reply="Puedes responder de forma natural y mantener la conversación abierta."
+
+    if premium_mode and mode!="salvar":
+        reply += " Además, intenta cerrar con una pregunta relacionada con lo que la otra persona acaba de decir para mantener la conversación natural."
+
+    return {"success":True,"reply":reply}
+
 
 
 @app.post("/ocr")
-async def ocr(file: UploadFile = File(...)):
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="El archivo debe ser una imagen.")
-
+async def ocr_upload(request: Request):
+    data = await request.body()
+    if not data:
+        raise HTTPException(400, "Imagen vacía")
     try:
-        data = await file.read()
-        if not data:
-            raise HTTPException(status_code=400, detail="La imagen está vacía.")
+        img = Image.open(io.BytesIO(data))
+        img.thumbnail((1800, 1800))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        text = pytesseract.image_to_string(img, lang="spa+eng", config="--psm 6").strip()
+        return {"ok": True, "text": text}
+    except Exception as e:
+        raise HTTPException(400, f"OCR error: {e}")
 
-        image = preprocess_image(data)
-        text = pytesseract.image_to_string(image, lang="spa+eng")
-        return {"success": True, "text": text.strip()}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"No se pudo procesar la imagen: {exc}")
-
+@app.post("/ocr-base64")
+def ocr_base64(p:OCR):
+    try:
+        s=p.image.split(",",1)[-1]; raw=base64.b64decode(s,validate=True); im=Image.open(io.BytesIO(raw)); im.load(); text=pytesseract.image_to_string(im,lang="spa+eng")
+        return {"success":True,"text":text.strip()}
+    except Exception as e: raise HTTPException(400,f"OCR inválido: {e}")
 
 @app.post("/ocr-base64-simple")
-async def ocr_base64_simple(request: Request):
-    try:
-        raw_body = await request.body()
-        image_data = raw_body.decode("utf-8").strip()
-        if not image_data:
-            raise HTTPException(status_code=400, detail="La imagen está vacía.")
+def ocr_simple(p:OCR): return ocr_base64(p)
 
-        if "," in image_data:
-            image_data = image_data.split(",", 1)[1]
 
-        raw = base64.b64decode(image_data)
-        if not raw:
-            raise HTTPException(status_code=400, detail="La imagen está vacía.")
+@app.post("/api/profile")
+def profile(p:Usage):
+    u=user(p.user_id); c=db(); rows=c.execute("SELECT module,COUNT(*) n FROM usage_logs WHERE user_id=? GROUP BY module",(p.user_id,)).fetchall(); c.close(); counts={r["module"]:r["n"] for r in rows}
+    return {"user_id":p.user_id,"username":u.get("username"),"first_name":u.get("first_name"),"premium":premium(p.user_id),"premium_until":u.get("premium_until"),"chats":counts.get("chat",0),"stories":counts.get("story",0),"analyses":sum(counts.values())}
 
-        image = preprocess_image(raw)
-        text = pytesseract.image_to_string(image, lang="spa+eng")
-        return {"success": True, "text": text.strip()}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"No se pudo procesar la imagen: {exc}")
+@app.post("/api/situations/save")
+def save_situation(p:SaveSituation):
+    c=db(); c.execute("INSERT INTO saved_situations(user_id,ocr_text,reply,created_at) VALUES(?,?,?,?)",(p.user_id,p.ocr_text[:20000],p.reply[:20000],now())); c.commit(); c.close(); return {"success":True}
 
+@app.post("/api/situations/list")
+def list_situations(p:Usage):
+    c=db(); rows=c.execute("SELECT id,ocr_text,reply,created_at FROM saved_situations WHERE user_id=? ORDER BY id DESC LIMIT 30",(p.user_id,)).fetchall(); c.close(); return {"items":[dict(r) for r in rows]}
+
+
+@app.post("/api/premium/check")
+def premium_check(p: Usage):
+    u=user(p.user_id)
+    return {
+        "ok": True,
+        "premium": premium(u),
+        "premium_until": u.get("premium_until")
+    }
+
+@app.post("/api/payments/pending")
+def pending(p:Pending):
+    if p.plan not in {"weekly","annual"}: raise HTTPException(400,"Plan inválido")
+    # Prevent duplicate active operations for the same user/plan.
+    c=db(); existing=c.execute("SELECT * FROM payment_operations WHERE user_id=? AND plan=? AND status IN ('pending','proof_submitted') ORDER BY created_at DESC LIMIT 1",(p.user_id,p.plan)).fetchone()
+    if existing: c.close(); return {"success":True,"operation_id":existing["operation_id"],"status":existing["status"],"amount":existing["amount"]}
+    oid=uuid.uuid4().hex[:12].upper(); t=now(); a=amount(p.plan,p.language); c.execute("INSERT INTO payment_operations(operation_id,user_id,plan,language,status,amount,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(oid,p.user_id,p.plan,p.language,"pending",a,t,t)); c.commit(); c.close()
+    return {"success":True,"operation_id":oid,"status":"pending","amount":a}
+
+@app.post("/api/payments/proof")
+def proof(p:Proof):
+    c=db(); row=c.execute("SELECT * FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,p.user_id)).fetchone()
+    if not row: c.close(); raise HTTPException(404,"Operación no encontrada")
+    if row["status"] not in {"pending","proof_submitted"}: c.close(); raise HTTPException(409,"La operación ya no admite comprobantes")
+    if len(p.proof_text)>4000: raise HTTPException(400,"Comprobante demasiado largo")
+    image=p.proof_image or ""
+    if len(image)>3_000_000: raise HTTPException(400,"El comprobante de imagen supera 3 MB")
+    t=now(); c.execute("UPDATE payment_operations SET status='proof_submitted',proof_text=?,proof_image=?,updated_at=? WHERE operation_id=?",(p.proof_text,image,t,p.operation_id)); c.commit(); c.close(); return {"success":True,"status":"proof_submitted"}
+
+@app.post("/api/payments/cancel")
+def cancel(p:PaymentId):
+    if not p.user_id: raise HTTPException(400,"user_id requerido")
+    c=db(); row=c.execute("SELECT * FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,p.user_id)).fetchone()
+    if not row: c.close(); raise HTTPException(404,"Operación no encontrada")
+    if row["status"] in {"verified","cancelled"}: c.close(); raise HTTPException(409,"La operación ya está cerrada")
+    t=now(); c.execute("UPDATE payment_operations SET status='cancelled',cancelled_at=?,updated_at=? WHERE operation_id=?",(t,t,p.operation_id)); c.commit(); c.close(); return {"success":True,"status":"cancelled"}
+
+@app.post("/api/payments/status")
+def status(p:PaymentId):
+    c=db(); row=c.execute("SELECT operation_id,user_id,plan,language,status,amount,created_at,updated_at,verified_at,cancelled_at FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,p.user_id)).fetchone(); c.close()
+    if not row: raise HTTPException(404,"Operación no encontrada")
+    return dict(row)
+
+@app.post("/api/admin/payments/verify")
+def verify_payment(p:PaymentId, request:Request):
+    admin(request); c=db(); row=c.execute("SELECT * FROM payment_operations WHERE operation_id=?",(p.operation_id,)).fetchone()
+    if not row: c.close(); raise HTTPException(404,"Operación no encontrada")
+    if row["status"] not in {"pending","proof_submitted"}: c.close(); raise HTTPException(409,"Operación no verificable")
+    days=7 if row["plan"]=="weekly" else 365; current=user(row["user_id"]).get("premium_until"); base=datetime.utcnow()
+    if current:
+        try: base=max(base,datetime.fromisoformat(current))
+        except ValueError: pass
+    until=(base+timedelta(days=days)).isoformat(); t=now(); c.execute("UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?",(until,t,row["user_id"])); c.execute("UPDATE payment_operations SET status='verified',verified_at=?,updated_at=? WHERE operation_id=?",(t,t,p.operation_id)); c.commit(); c.close(); return {"success":True,"status":"verified","premium_until":until}
+
+@app.get("/api/admin/stats")
+def admin_stats(request:Request):
+    admin(request); c=db(); out={"total_users":c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"],"premium_users":c.execute("SELECT COUNT(*) n FROM users WHERE premium_until>?",(now(),)).fetchone()["n"],"today_usage":c.execute("SELECT COUNT(*) n FROM usage_logs WHERE used_at>=?",(today()+"T00:00:00",)).fetchone()["n"],"pending_payments":c.execute("SELECT COUNT(*) n FROM payment_operations WHERE status IN ('pending','proof_submitted')").fetchone()["n"]}; c.close(); return out
+
+@app.get("/api/admin/payments")
+def admin_payments(request:Request):
+    admin(request); c=db(); rows=c.execute("SELECT * FROM payment_operations ORDER BY created_at DESC LIMIT 100").fetchall(); c.close(); return {"items":[dict(r) for r in rows]}
