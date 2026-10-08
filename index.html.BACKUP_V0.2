@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#111827">
+  <title>Responde AI</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+  <main class="app">
+    <div class="brand">RESPONDE AI</div>
+
+    <section id="welcomeScreen" class="screen">
+      <h1>Tu asistente de respuestas</h1>
+      <p id="welcome">
+        Analiza una conversación y encuentra una respuesta adecuada.
+      </p>
+      <button id="startButton" type="button">Comenzar</button>
+      <div id="status" class="status" aria-live="polite"></div>
+    </section>
+
+    <section id="analyzeScreen" class="screen hidden">
+      <button id="backButton" class="secondary-button" type="button">Volver</button>
+
+      <h2>Analiza una conversación</h2>
+      <p class="screen-text">
+        Selecciona una captura de pantalla de la conversación.
+      </p>
+
+      <label class="upload-box" for="imageInput">
+        <span class="upload-icon">＋</span>
+        <strong>Seleccionar captura</strong>
+        <span>JPG, PNG o WEBP</span>
+      </label>
+      <input id="imageInput" type="file" accept="image/*">
+
+      <div id="previewContainer" class="preview-container hidden">
+        <img id="previewImage" alt="Vista previa de la captura seleccionada">
+        <button id="removeImageButton" class="secondary-button" type="button">Cambiar captura</button>
+      </div>
+
+      <div id="modeSection" class="hidden">
+        <h3>¿Qué tipo de respuesta buscas?</h3>
+
+        <div class="mode-grid">
+          <button class="mode-button" data-mode="natural" type="button">Natural</button>
+          <button class="mode-button" data-mode="casual" type="button">Casual</button>
+          <button class="mode-button" data-mode="segura" type="button">Segura</button>
+          <button class="mode-button" data-mode="curiosa" type="button">Con curiosidad</button>
+        </div>
+
+        <button id="analyzeButton" class="primary-button" type="button" disabled>
+          Analizar conversación
+        </button>
+
+        <div id="analysisStatus" class="status" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <section id="resultScreen" class="screen hidden">
+      <button id="resultBackButton" class="secondary-button" type="button">Volver</button>
+
+      <h2>Resultado</h2>
+      <p id="resultIntro" class="screen-text">
+        Esta es una respuesta de demostración basada en el modo seleccionado.
+      </p>
+
+      <div class="result-box">
+        <p id="resultText"></p>
+      </div>
+
+      <button id="copyButton" class="primary-button" type="button">Copiar respuesta</button>
+      <div id="copyStatus" class="status" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
