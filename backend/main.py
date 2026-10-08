@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import parse_qs
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-app = FastAPI(title="LiggaCuba API", version="2.0")
+app = FastAPI(title="LiggaCuba API", version="2.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 FREE_DAILY_LIMIT = 3
@@ -21,6 +21,55 @@ PREMIUM_STORY_MODES = {"provocativo", "enamorar"}
 DB_PATH = os.getenv("DB_PATH", os.path.join(ROOT, "liggacuba.db"))
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+ATAJO_KEY = os.getenv("ATAJO_KEY", "")
+BANDEC_ACCOUNT = os.getenv("BANDEC_ACCOUNT", "9244069990684435")
+BPA_ACCOUNT = os.getenv("BPA_ACCOUNT", "")
+PAYMENT_PHONE = os.getenv("PAYMENT_PHONE", "52677163")
+SESSION_TTL = 86400
+
+
+def _b64e(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def _b64d(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def session_token(uid: str) -> str:
+    payload = _b64e(json.dumps({"uid": str(uid), "exp": int(time.time()) + SESSION_TTL}, separators=(",", ":")).encode())
+    secret = hmac.new(b"LiggaCubaSession", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    sig = _b64e(hmac.new(secret, payload.encode(), hashlib.sha256).digest())
+    return payload + "." + sig
+
+
+def verify_session(token: str) -> str:
+    if not token or "." not in token:
+        raise HTTPException(401, "Sesión requerida")
+    payload, sig = token.rsplit(".", 1)
+    secret = hmac.new(b"LiggaCubaSession", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    expected = _b64e(hmac.new(secret, payload.encode(), hashlib.sha256).digest())
+    if not hmac.compare_digest(sig, expected):
+        raise HTTPException(401, "Sesión inválida")
+    try:
+        data = json.loads(_b64d(payload).decode())
+        if int(data.get("exp", 0)) < int(time.time()):
+            raise HTTPException(401, "Sesión expirada")
+        uid = str(data.get("uid", ""))
+        if not uid:
+            raise HTTPException(401, "Usuario inválido")
+        return uid
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(401, "Sesión inválida")
+
+
+def current_user(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(401, "Sesión requerida")
+    return verify_session(auth[7:].strip())
 
 
 def db():
@@ -38,7 +87,8 @@ def init_db():
     c.executescript("""
     CREATE TABLE IF NOT EXISTS users(
       user_id TEXT PRIMARY KEY, username TEXT, first_name TEXT, last_name TEXT,
-      premium_until TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      premium_until TEXT, payment_phone TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
       usage_today INTEGER NOT NULL DEFAULT 0, last_reset_date TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS usage_logs(
@@ -47,12 +97,29 @@ def init_db():
     CREATE TABLE IF NOT EXISTS payment_operations(
       operation_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, plan TEXT NOT NULL, language TEXT NOT NULL,
       status TEXT NOT NULL, amount TEXT NOT NULL, proof_text TEXT, proof_image TEXT,
+      payment_method TEXT, payer_phone TEXT, destination_account TEXT,
+      transaction_id TEXT, transfer_date TEXT, source_sms TEXT,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL, verified_at TEXT, cancelled_at TEXT
     );
     CREATE TABLE IF NOT EXISTS saved_situations(
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, ocr_text TEXT, reply TEXT, created_at TEXT NOT NULL
     );
     """)
+    for sql in (
+        "ALTER TABLE users ADD COLUMN payment_phone TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN payment_method TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN payer_phone TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN destination_account TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN transaction_id TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN transfer_date TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN source_sms TEXT",
+    ):
+        try:
+            c.execute(sql)
+        except sqlite3.OperationalError:
+            pass
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_transaction ON payment_operations(transaction_id) WHERE transaction_id IS NOT NULL AND transaction_id != ''")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_source_sms ON payment_operations(source_sms) WHERE source_sms IS NOT NULL AND source_sms != ''")
     c.commit(); c.close()
 init_db()
 
@@ -64,7 +131,7 @@ def user(user_id: str, extra: Optional[Dict[str, Any]] = None):
         t=now(); c.execute("INSERT INTO users(user_id,created_at,updated_at,last_reset_date) VALUES(?,?,?,?)", (uid,t,t,today()))
         c.commit(); row=c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
     if extra:
-        allowed={"username","first_name","last_name","premium_until"}; fields=[]; vals=[]
+        allowed={"username","first_name","last_name","premium_until","payment_phone"}; fields=[]; vals=[]
         for k,v in extra.items():
             if k in allowed and v is not None: fields.append(f"{k}=?"); vals.append(v)
         if fields:
@@ -106,7 +173,17 @@ class TelegramAuth(BaseModel): initData:str=""; user_id:Optional[str]=None
 class Usage(BaseModel): user_id:str
 class Analyze(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"
 class Generate(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"; text:str=""
-class Pending(BaseModel): user_id:str; plan:str="weekly"; language:str="es"
+class Pending(BaseModel): user_id:str; plan:str="weekly"; language:str="es"; payment_method:str="BANDEC"
+class PaymentPhone(BaseModel): phone:str
+class AtajoPayment(BaseModel):
+    metodo_pago:str
+    telefono_origen:str=""
+    cuenta_destino:str=""
+    monto_recibido:float
+    transaccion:str=""
+    fecha:str=""
+    fecha_ejecucion:str=""
+    sms:str=""
 class PaymentId(BaseModel): operation_id:str; user_id:str
 class Proof(BaseModel): operation_id:str; user_id:str; proof_text:str=""; proof_image:str=""
 class SaveSituation(BaseModel): user_id:str; ocr_text:str=""; reply:str=""
@@ -152,7 +229,7 @@ def privacy(): return FileResponse(os.path.join(ROOT,"privacy.html"),media_type=
 @app.get("/terms.html")
 def terms(): return FileResponse(os.path.join(ROOT,"terms.html"),media_type="text/html")
 @app.get("/health")
-def health(): return {"status":"ok","service":"LiggaCuba","version":"2.0"}
+def health(): return {"status":"ok","service":"LiggaCuba","version":"2.1"}
 
 
 @app.post("/api/auth/telegram")
@@ -160,8 +237,8 @@ def auth_telegram(p:TelegramAuth):
     try:
         if p.initData:
             u=verify_init(p.initData)
-        elif not BOT_TOKEN and p.user_id:
-            u={"id":p.user_id}
+        elif not BOT_TOKEN:
+            raise ValueError("TELEGRAM_BOT_TOKEN no configurado")
         else:
             u=None
     except ValueError as e:
@@ -170,22 +247,26 @@ def auth_telegram(p:TelegramAuth):
     if p.user_id and str(p.user_id) != str(u.get("id")):
         raise HTTPException(401,"El usuario no coincide con Telegram")
     uid=str(u["id"]); user(uid,{"username":u.get("username"),"first_name":u.get("first_name"),"last_name":u.get("last_name")}); x=usage(uid)
-    return {"success":True,"user_id":uid,**x}
+    return {"success":True,"user_id":uid,"token":session_token(uid),**x}
 
 @app.post("/api/usage")
-def api_usage(p:Usage): return usage(p.user_id)
+def api_usage(p:Usage, request:Request):
+    uid=current_user(request)
+    return usage(uid)
 
 @app.post("/api/analyze")
-def analyze(p:Analyze):
+def analyze(p:Analyze, request:Request):
+    uid=current_user(request)
     module=p.module if p.module in {"chat","story"} else "chat"; mode=p.mode.lower().strip(); free=FREE_CHAT_MODES if module=="chat" else FREE_STORY_MODES; premset=PREMIUM_CHAT_MODES if module=="chat" else PREMIUM_STORY_MODES
     if mode not in free|premset: raise HTTPException(400,"Modo no válido")
-    if mode in premset and not premium(p.user_id): raise HTTPException(402,"Este modo requiere Premium")
-    r=consume(p.user_id,module,mode)
+    if mode in premset and not premium(uid): raise HTTPException(402,"Este modo requiere Premium")
+    r=consume(uid,module,mode)
     if not r["allowed"]: raise HTTPException(403,"Has alcanzado tus 3 análisis gratuitos de hoy")
     return r
 
 @app.post("/api/generate-reply")
-def generate(p:Generate):
+def generate(p:Generate, request:Request):
+    uid=current_user(request)
     module=p.module if p.module in {"chat","story"} else "chat"
     mode=p.mode.lower().strip()
     free=FREE_CHAT_MODES if module=="chat" else FREE_STORY_MODES
@@ -193,7 +274,7 @@ def generate(p:Generate):
 
     if mode not in free|premset:
         raise HTTPException(400,"Modo no válido")
-    if mode in premset and not premium(p.user_id):
+    if mode in premset and not premium(uid):
         raise HTTPException(402,"Este modo requiere Premium")
 
     t=re.sub(r"\s+"," ",(p.text or "")).strip()
@@ -256,67 +337,384 @@ def generate(p:Generate):
 
 
 
+def _ocr_variants(img: Image.Image):
+    from PIL import ImageOps, ImageEnhance, ImageFilter
+
+    img = img.convert("RGB")
+    w, h = img.size
+    max_side = max(w, h)
+
+    # Mantener suficiente resolución para texto pequeño, pero evitar imágenes
+    # gigantes que hacen lento el OCR.
+    if max_side > 2600:
+        scale = 2600 / max_side
+        img = img.resize(
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            Image.Resampling.LANCZOS
+        )
+
+    gray = img.convert("L")
+
+    # El OCR funciona mejor cuando el texto ocupa una cantidad razonable
+    # de píxeles. Ampliamos capturas pequeñas.
+    if max(gray.size) < 1800:
+        factor = min(2.5, 1800 / max(gray.size))
+        gray = gray.resize(
+            (max(1, int(gray.width * factor)),
+             max(1, int(gray.height * factor))),
+            Image.Resampling.LANCZOS
+        )
+
+    gray = ImageOps.autocontrast(gray, cutoff=1)
+    gray = ImageEnhance.Contrast(gray).enhance(1.45)
+    gray = gray.filter(ImageFilter.SHARPEN)
+
+    variants = [gray]
+
+    # Umbral claro para capturas con fondo claro.
+    variants.append(
+        gray.point(lambda px: 255 if px > 165 else 0)
+    )
+
+    # Umbral más bajo para texto tenue/gris.
+    variants.append(
+        gray.point(lambda px: 255 if px > 125 else 0)
+    )
+
+    # Variante invertida para modo oscuro.
+    inv = ImageOps.invert(gray)
+    inv = ImageEnhance.Contrast(inv).enhance(1.25)
+    variants.append(inv)
+
+    # Umbral de la variante invertida.
+    variants.append(
+        inv.point(lambda px: 255 if px > 145 else 0)
+    )
+
+    return variants
+
+
+def _ocr_text(img: Image.Image):
+    candidates = []
+
+    for variant_index, variant in enumerate(_ocr_variants(img)):
+        for psm in (6, 11, 12):
+            try:
+                txt = pytesseract.image_to_string(
+                    variant,
+                    lang="spa+eng",
+                    config=f"--oem 3 --psm {psm}"
+                )
+            except Exception:
+                continue
+
+            txt = re.sub(r"[ \t]+", " ", txt)
+            txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+
+            if not txt:
+                continue
+
+            lines = [x.strip() for x in txt.splitlines() if x.strip()]
+            alnum = len(re.findall(
+                r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]", txt
+            ))
+            words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]{2,}", txt)
+
+            # Penalizar resultados que parecen ruido de OCR.
+            junk = len(re.findall(r"[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9\s.,!?¿¡:;()'\"@#$%&+\-_/]", txt))
+
+            score = (
+                alnum
+                + min(len(lines), 25) * 8
+                + min(len(words), 80) * 2
+                - junk * 3
+            )
+
+            # Preferir texto suficientemente largo y con palabras reales.
+            if len(words) >= 2:
+                score += 12
+            if len(txt) >= 20:
+                score += 8
+
+            candidates.append((score, txt, variant_index, psm))
+
+    if not candidates:
+        return ""
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
 @app.post("/ocr")
 async def ocr_upload(request: Request):
-    data = await request.body()
-    if not data:
-        raise HTTPException(400, "Imagen vacía")
+    data=await request.body()
+    if not data: raise HTTPException(400,"Imagen vacía")
     try:
-        img = Image.open(io.BytesIO(data))
-        img.thumbnail((1800, 1800))
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        text = pytesseract.image_to_string(img, lang="spa+eng", config="--psm 6").strip()
-        return {"ok": True, "text": text}
+        img=Image.open(io.BytesIO(data)); img.load()
+        return {"ok":True,"text":_ocr_text(img)}
     except Exception as e:
-        raise HTTPException(400, f"OCR error: {e}")
+        raise HTTPException(400,f"OCR error: {e}")
 
 @app.post("/ocr-base64")
 def ocr_base64(p:OCR):
     try:
-        s=p.image.split(",",1)[-1]; raw=base64.b64decode(s,validate=True); im=Image.open(io.BytesIO(raw)); im.load(); text=pytesseract.image_to_string(im,lang="spa+eng")
-        return {"success":True,"text":text.strip()}
-    except Exception as e: raise HTTPException(400,f"OCR inválido: {e}")
+        raw=base64.b64decode(p.image.split(",",1)[-1],validate=True)
+        img=Image.open(io.BytesIO(raw)); img.load()
+        return {"success":True,"text":_ocr_text(img)}
+    except Exception as e:
+        raise HTTPException(400,f"OCR inválido: {e}")
 
 @app.post("/ocr-base64-simple")
 def ocr_simple(p:OCR): return ocr_base64(p)
 
 
 @app.post("/api/profile")
-def profile(p:Usage):
-    u=user(p.user_id); c=db(); rows=c.execute("SELECT module,COUNT(*) n FROM usage_logs WHERE user_id=? GROUP BY module",(p.user_id,)).fetchall(); c.close(); counts={r["module"]:r["n"] for r in rows}
-    return {"user_id":p.user_id,"username":u.get("username"),"first_name":u.get("first_name"),"premium":premium(p.user_id),"premium_until":u.get("premium_until"),"chats":counts.get("chat",0),"stories":counts.get("story",0),"analyses":sum(counts.values())}
+def profile(p:Usage, request:Request):
+    uid=current_user(request)
+    u=user(uid); c=db(); rows=c.execute("SELECT module,COUNT(*) n FROM usage_logs WHERE user_id=? GROUP BY module",(uid,)).fetchall(); c.close(); counts={r["module"]:r["n"] for r in rows}
+    return {"user_id":uid,"username":u.get("username"),"first_name":u.get("first_name"),"premium":premium(uid),"premium_until":u.get("premium_until"),"chats":counts.get("chat",0),"stories":counts.get("story",0),"analyses":sum(counts.values())}
 
 @app.post("/api/situations/save")
-def save_situation(p:SaveSituation):
-    c=db(); c.execute("INSERT INTO saved_situations(user_id,ocr_text,reply,created_at) VALUES(?,?,?,?)",(p.user_id,p.ocr_text[:20000],p.reply[:20000],now())); c.commit(); c.close(); return {"success":True}
+def save_situation(p:SaveSituation, request:Request):
+    uid=current_user(request)
+    c=db(); c.execute("INSERT INTO saved_situations(user_id,ocr_text,reply,created_at) VALUES(?,?,?,?)",(uid,p.ocr_text[:20000],p.reply[:20000],now())); c.commit(); c.close(); return {"success":True}
 
 @app.post("/api/situations/list")
-def list_situations(p:Usage):
-    c=db(); rows=c.execute("SELECT id,ocr_text,reply,created_at FROM saved_situations WHERE user_id=? ORDER BY id DESC LIMIT 30",(p.user_id,)).fetchall(); c.close(); return {"items":[dict(r) for r in rows]}
+def list_situations(p:Usage, request:Request):
+    uid=current_user(request)
+    c=db(); rows=c.execute("SELECT id,ocr_text,reply,created_at FROM saved_situations WHERE user_id=? ORDER BY id DESC LIMIT 30",(uid,)).fetchall(); c.close(); return {"items":[dict(r) for r in rows]}
 
 
 @app.post("/api/premium/check")
-def premium_check(p: Usage):
-    u=user(p.user_id)
+def premium_check(p: Usage, request:Request):
+    uid=current_user(request)
+    u=user(uid)
     return {
         "ok": True,
-        "premium": premium(u),
+        "premium": premium(uid),
         "premium_until": u.get("premium_until")
     }
 
+@app.post("/api/payment-phone")
+def payment_phone(p:PaymentPhone, request:Request):
+    uid=current_user(request)
+    phone=re.sub(r"\D","",p.phone or "")
+    if len(phone) < 8 or len(phone) > 15:
+        raise HTTPException(400,"Número de teléfono inválido")
+    user(uid, {"payment_phone": phone})
+    return {"success":True,"payment_phone":phone}
+
+
+@app.post("/api/atajo-pago")
+def atajo_pago(p:AtajoPayment, request:Request):
+    key=request.headers.get("x-atajo-key","")
+    if not ATAJO_KEY or not hmac.compare_digest(key, ATAJO_KEY):
+        raise HTTPException(401,"Atajo no autorizado")
+
+    method=(p.metodo_pago or "").strip().upper()
+    if method not in {"BANDEC","BPA","SALDO_MOVIL"}:
+        raise HTTPException(400,"Método de pago inválido")
+
+    phone=re.sub(r"\D","",p.telefono_origen or "")
+    amount_value=round(float(p.monto_recibido or 0),2)
+    transaction=(p.transaccion or "").strip().upper()
+    sms=(p.sms or "").strip()
+    destination=re.sub(r"\D","",p.cuenta_destino or "")
+
+    if amount_value <= 0 or not phone or not sms:
+
+        raise HTTPException(400,"Datos de transferencia incompletos")
+
+    if method=="BANDEC":
+
+        expected=re.sub(r"\D","",BANDEC_ACCOUNT)
+
+    elif method=="BPA":
+
+        expected=re.sub(r"\D","",BPA_ACCOUNT)
+
+        if not expected:
+
+            raise HTTPException(503,"Cuenta BPA no configurada")
+
+    else:
+
+        expected=""
+
+    if method in {"BANDEC","BPA"}:
+
+        if not destination or destination != expected:
+
+            raise HTTPException(409,"Cuenta destino no coincide")
+
+        if not transaction:
+
+            raise HTTPException(400,"Número de transacción requerido")
+
+    fingerprint=hashlib.sha256(sms.encode("utf-8")).hexdigest()
+
+    c=db()
+
+    duplicate=c.execute(
+
+        "SELECT operation_id,status FROM payment_operations WHERE transaction_id=? OR source_sms=? LIMIT 1",
+
+        (transaction,fingerprint)
+
+    ).fetchone() if transaction else c.execute(
+
+        "SELECT operation_id,status FROM payment_operations WHERE source_sms=? LIMIT 1",
+
+        (fingerprint,)
+
+    ).fetchone()
+
+    if duplicate:
+
+        c.close()
+
+        return {"success":False,"status":"duplicate","operation_id":duplicate["operation_id"]}
+
+    rows=c.execute(
+
+        "SELECT * FROM payment_operations WHERE status='pending' AND payment_method=? ORDER BY created_at ASC",
+
+        (method,)
+
+    ).fetchall()
+
+    matched=None
+
+    for row in rows:
+
+        expected_amount=float(re.sub(r"[^0-9.]","",row["amount"] or "0") or 0)
+
+        if round(expected_amount,2) != amount_value:
+
+            continue
+
+        registered=re.sub(r"\D","",user(row["user_id"]).get("payment_phone") or "")
+
+        if registered and registered != phone:
+
+            continue
+
+        matched=row
+
+        break
+
+    if not matched:
+
+        c.close()
+
+        return {"success":False,"status":"unmatched"}
+
+    t=now()
+
+    c.execute(
+
+        """UPDATE payment_operations
+
+           SET status='verified', payer_phone=?, destination_account=?,
+
+               transaction_id=?, transfer_date=?, source_sms=?,
+
+               verified_at=?, updated_at=?
+
+           WHERE operation_id=? AND status='pending'""",
+
+        (phone,destination,transaction,p.fecha or p.fecha_ejecucion or "",
+
+         fingerprint,t,t,matched["operation_id"])
+
+    )
+
+    if c.execute("SELECT changes()").fetchone()[0] != 1:
+
+        c.rollback()
+
+        c.close()
+
+        return {"success":False,"status":"already_processed"}
+
+    days=7 if matched["plan"]=="weekly" else 365
+
+    current=user(matched["user_id"]).get("premium_until")
+
+    base=datetime.utcnow()
+
+    if current:
+
+        try:
+
+            base=max(base,datetime.fromisoformat(current))
+
+        except ValueError:
+
+            pass
+
+    until=(base+timedelta(days=days)).isoformat()
+
+    c.execute(
+
+        "UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?",
+
+        (until,t,matched["user_id"])
+
+    )
+
+    c.commit()
+
+    c.close()
+
+    return {
+
+        "success":True,
+
+        "status":"verified",
+
+        "operation_id":matched["operation_id"],
+
+        "user_id":matched["user_id"],
+
+        "premium_until":until
+
+    }
+
 @app.post("/api/payments/pending")
-def pending(p:Pending):
+
+def pending(p:Pending, request:Request):
+    uid=current_user(request)
     if p.plan not in {"weekly","annual"}: raise HTTPException(400,"Plan inválido")
     # Prevent duplicate active operations for the same user/plan.
-    c=db(); existing=c.execute("SELECT * FROM payment_operations WHERE user_id=? AND plan=? AND status IN ('pending','proof_submitted') ORDER BY created_at DESC LIMIT 1",(p.user_id,p.plan)).fetchone()
+    c=db(); existing=c.execute("SELECT * FROM payment_operations WHERE user_id=? AND plan=? AND status IN ('pending','proof_submitted') ORDER BY created_at DESC LIMIT 1",(uid,p.plan)).fetchone()
     if existing: c.close(); return {"success":True,"operation_id":existing["operation_id"],"status":existing["status"],"amount":existing["amount"]}
-    oid=uuid.uuid4().hex[:12].upper(); t=now(); a=amount(p.plan,p.language); c.execute("INSERT INTO payment_operations(operation_id,user_id,plan,language,status,amount,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(oid,p.user_id,p.plan,p.language,"pending",a,t,t)); c.commit(); c.close()
-    return {"success":True,"operation_id":oid,"status":"pending","amount":a}
+    method=(p.payment_method or "BANDEC").upper()
+    if method not in {"BANDEC","BPA","SALDO_MOVIL"}: raise HTTPException(400,"Método de pago inválido")
+    oid=uuid.uuid4().hex[:12].upper(); t=now(); a=amount(p.plan,p.language)
+    destination={"BANDEC":BANDEC_ACCOUNT,"BPA":BPA_ACCOUNT,"SALDO_MOVIL":""}[method]
+    phone=user(uid).get("payment_phone") or ""
+    c.execute(
+        """INSERT INTO payment_operations(
+           operation_id,user_id,plan,language,status,amount,payment_method,
+           payer_phone,destination_account,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (oid,uid,p.plan,p.language,"pending",a,method,phone,destination,t,t)
+    )
+    c.commit(); c.close()
+    return {
+        "success":True,
+        "operation_id":oid,
+        "status":"pending",
+        "amount":a,
+        "payment_method":method,
+        "destination_account":destination,
+        "payment_phone":phone
+    }
 
 @app.post("/api/payments/proof")
-def proof(p:Proof):
-    c=db(); row=c.execute("SELECT * FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,p.user_id)).fetchone()
+def proof(p:Proof, request:Request):
+    uid=current_user(request)
+    c=db(); row=c.execute("SELECT * FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,uid)).fetchone()
     if not row: c.close(); raise HTTPException(404,"Operación no encontrada")
     if row["status"] not in {"pending","proof_submitted"}: c.close(); raise HTTPException(409,"La operación ya no admite comprobantes")
     if len(p.proof_text)>4000: raise HTTPException(400,"Comprobante demasiado largo")
@@ -325,16 +723,18 @@ def proof(p:Proof):
     t=now(); c.execute("UPDATE payment_operations SET status='proof_submitted',proof_text=?,proof_image=?,updated_at=? WHERE operation_id=?",(p.proof_text,image,t,p.operation_id)); c.commit(); c.close(); return {"success":True,"status":"proof_submitted"}
 
 @app.post("/api/payments/cancel")
-def cancel(p:PaymentId):
-    if not p.user_id: raise HTTPException(400,"user_id requerido")
-    c=db(); row=c.execute("SELECT * FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,p.user_id)).fetchone()
+def cancel(p:PaymentId, request:Request):
+    uid=current_user(request)
+    if not uid: raise HTTPException(400,"user_id requerido")
+    c=db(); row=c.execute("SELECT * FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,uid)).fetchone()
     if not row: c.close(); raise HTTPException(404,"Operación no encontrada")
     if row["status"] in {"verified","cancelled"}: c.close(); raise HTTPException(409,"La operación ya está cerrada")
     t=now(); c.execute("UPDATE payment_operations SET status='cancelled',cancelled_at=?,updated_at=? WHERE operation_id=?",(t,t,p.operation_id)); c.commit(); c.close(); return {"success":True,"status":"cancelled"}
 
 @app.post("/api/payments/status")
-def status(p:PaymentId):
-    c=db(); row=c.execute("SELECT operation_id,user_id,plan,language,status,amount,created_at,updated_at,verified_at,cancelled_at FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,p.user_id)).fetchone(); c.close()
+def status(p:PaymentId, request:Request):
+    uid=current_user(request)
+    c=db(); row=c.execute("SELECT operation_id,user_id,plan,language,status,amount,created_at,updated_at,verified_at,cancelled_at FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,uid)).fetchone(); c.close()
     if not row: raise HTTPException(404,"Operación no encontrada")
     return dict(row)
 
