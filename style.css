@@ -31,3 +31,6 @@
 .payment-instructions{margin-top:11px;padding:11px 12px;border-radius:13px;background:#f0edff;color:#51477b;font-size:11px;line-height:1.5}
 .payment-flow>.secondary{margin-top:10px}
 @media(max-width:390px){.payment-methods{grid-template-columns:1fr}.payment-method{min-height:62px}}
+
+/* Actualización de navegación, perfil y métodos de pago */
+.payment-methods{grid-template-columns:1fr!important;gap:8px}.payment-method{width:100%;min-height:62px}.profile-phone-card{background:#fff;border-radius:18px;padding:14px;margin:12px 0;box-shadow:var(--shadow)}.profile-phone-card label{display:block;font-weight:800;font-size:12px;margin-bottom:8px}.profile-phone-card small{display:block;color:var(--muted);font-size:10px;margin-top:7px;line-height:1.4}.profile-phone-card input,.admin-input{min-width:0;flex:1;width:100%;border:1px solid var(--line);border-radius:12px;padding:11px;background:#faf9ff;color:var(--text)}.profile-benefits{margin:12px 0}.screen-heading{margin-bottom:16px}.screen-heading h2{margin:0}.screen-heading p{color:var(--muted);font-size:12px;margin:6px 0}.admin-entry{color:var(--purple)}.back-btn{position:relative;z-index:1;margin:8px 0 18px;padding:10px 0;min-height:40px}.payment-flow{width:100%;box-sizing:border-box}.screen{padding-top:env(safe-area-inset-top,0px)}
