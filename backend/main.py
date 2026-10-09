@@ -104,6 +104,14 @@ def init_db():
     CREATE TABLE IF NOT EXISTS saved_situations(
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, ocr_text TEXT, reply TEXT, created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS admin_users(
+      username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, permissions TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS admin_audit(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT NOT NULL, action TEXT NOT NULL,
+      target TEXT, details TEXT, created_at TEXT NOT NULL
+    );
     """)
     for sql in (
         "ALTER TABLE users ADD COLUMN payment_phone TEXT",
@@ -185,6 +193,11 @@ class AtajoPayment(BaseModel):
     fecha_ejecucion:str=""
     sms:str=""
 class PaymentId(BaseModel): operation_id:str; user_id:str
+class AdminLogin(BaseModel): username:str=""; password:str=""; master_key:str=""
+class AdminCreate(BaseModel): username:str; password:str; permissions:list[str]=[]
+class AdminStatus(BaseModel): username:str; is_active:bool=True
+class PremiumChange(BaseModel): user_id:str; action:str; days:int=7
+class PaymentReview(BaseModel): operation_id:str; action:str; reason:str=""
 class Proof(BaseModel): operation_id:str; user_id:str; proof_text:str=""; proof_image:str=""
 class SaveSituation(BaseModel): user_id:str; ocr_text:str=""; reply:str=""
 class OCR(BaseModel): image:str
@@ -208,9 +221,44 @@ def verify_init(s):
     return u
 
 
-def admin(request:Request):
-    if not ADMIN_KEY: raise HTTPException(503,"ADMIN_KEY no configurado en Railway")
-    if not hmac.compare_digest(request.headers.get("x-admin-key", ""), ADMIN_KEY): raise HTTPException(401,"No autorizado")
+def admin_identity(request: Request):
+    if not ADMIN_KEY:
+        raise HTTPException(503, "ADMIN_KEY no configurado en Railway")
+    key = request.headers.get("x-admin-key", "")
+    if hmac.compare_digest(key, ADMIN_KEY):
+        return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings"]}
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not token or "." not in token:
+        raise HTTPException(401, "No autorizado")
+    payload, sig = token.rsplit(".", 1)
+    expected = _b64e(hmac.new(ADMIN_KEY.encode(), payload.encode(), hashlib.sha256).digest())
+    if not hmac.compare_digest(sig, expected):
+        raise HTTPException(401, "Sesión administrativa inválida")
+    try:
+        data = json.loads(_b64d(payload).decode())
+        if int(data.get("exp", 0)) < int(time.time()):
+            raise HTTPException(401, "Sesión administrativa expirada")
+        username = str(data.get("username", ""))
+        if username == "owner" and data.get("role") == "owner":
+            return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings", "audit"]}
+        c = db()
+        row = c.execute("SELECT * FROM admin_users WHERE username=? AND is_active=1", (username,)).fetchone()
+        c.close()
+        if not row:
+            raise HTTPException(401, "Administrador desactivado")
+        return {"username": row["username"], "permissions": json.loads(row["permissions"])}
+    except HTTPException: raise
+    except Exception: raise HTTPException(401, "Sesión administrativa inválida")
+
+def admin(request:Request, permission: str = None):
+    identity = admin_identity(request)
+    if permission and permission not in identity["permissions"]:
+        raise HTTPException(403, "No tienes permiso para esta acción")
+    return identity
+
+def audit(actor, action, target=None, details=None):
+    c=db(); c.execute("INSERT INTO admin_audit(actor,action,target,details,created_at) VALUES(?,?,?,?,?)", (actor,action,str(target or ""),json.dumps(details or {},ensure_ascii=False),now())); c.commit(); c.close()
 
 
 def amount(plan,lang):
@@ -220,6 +268,14 @@ def amount(plan,lang):
 
 @app.get("/")
 def root(): return FileResponse(os.path.join(ROOT,"index.html"))
+@app.get("/admin.html")
+def admin_page(): return FileResponse(os.path.join(ROOT,"admin.html"), media_type="text/html")
+
+@app.post("/api/admin/telegram-access")
+def admin_telegram_access(p: Usage, request: Request):
+    uid = current_user(request)
+    allowed = {x.strip() for x in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if x.strip()}
+    return {"allowed": bool(uid in allowed), "url": "/admin.html" if uid in allowed else None}
 @app.get("/app.js")
 def js(): return FileResponse(os.path.join(ROOT,"app.js"),media_type="application/javascript")
 @app.get("/style.css")
@@ -471,7 +527,7 @@ def ocr_simple(p:OCR): return ocr_base64(p)
 def profile(p:Usage, request:Request):
     uid=current_user(request)
     u=user(uid); c=db(); rows=c.execute("SELECT module,COUNT(*) n FROM usage_logs WHERE user_id=? GROUP BY module",(uid,)).fetchall(); c.close(); counts={r["module"]:r["n"] for r in rows}
-    return {"user_id":uid,"username":u.get("username"),"first_name":u.get("first_name"),"premium":premium(uid),"premium_until":u.get("premium_until"),"chats":counts.get("chat",0),"stories":counts.get("story",0),"analyses":sum(counts.values())}
+    return {"user_id":uid,"username":u.get("username"),"first_name":u.get("first_name"),"payment_phone":u.get("payment_phone") or "","premium":premium(uid),"premium_until":u.get("premium_until"),"chats":counts.get("chat",0),"stories":counts.get("story",0),"analyses":sum(counts.values())}
 
 @app.post("/api/situations/save")
 def save_situation(p:SaveSituation, request:Request):
@@ -791,24 +847,153 @@ def status(p:PaymentId, request:Request):
     if not row: raise HTTPException(404,"Operación no encontrada")
     return dict(row)
 
+@app.post("/api/admin/login")
+def admin_login(p: AdminLogin):
+    if not ADMIN_KEY: raise HTTPException(503,"ADMIN_KEY no configurado en Railway")
+    username="owner"; permissions=["users","premium","payments","stats","admins","settings","audit"]
+    if p.master_key and hmac.compare_digest(p.master_key, ADMIN_KEY):
+        pass
+    else:
+        c=db(); row=c.execute("SELECT * FROM admin_users WHERE username=? AND is_active=1",(p.username.strip(),)).fetchone(); c.close()
+        if not row:
+            raise HTTPException(401,"Credenciales incorrectas")
+        salt_hex, stored_hash = row["password_hash"].split(":", 1)
+        calculated = hashlib.pbkdf2_hmac("sha256", p.password.encode(), bytes.fromhex(salt_hex), 180000).hex()
+        if not hmac.compare_digest(stored_hash, calculated):
+            raise HTTPException(401,"Credenciales incorrectas")
+        username=row["username"]; permissions=json.loads(row["permissions"])
+    claims={"username":username,"exp":int(time.time())+8*3600}
+    if username=="owner": claims["role"]="owner"
+    payload=_b64e(json.dumps(claims,separators=(",",":")).encode())
+    token=payload+"."+_b64e(hmac.new(ADMIN_KEY.encode(),payload.encode(),hashlib.sha256).digest())
+    return {"success":True,"token":token,"username":username,"permissions":permissions}
+
+@app.get("/api/admin/me")
+def admin_me(request:Request): return admin_identity(request)
+
+@app.get("/api/admin/users")
+def admin_users(request:Request, q:str=""):
+    ident=admin(request,"users"); c=db(); term=f"%{q.strip()}%"
+    rows=c.execute("SELECT user_id,username,first_name,last_name,premium_until,payment_phone,created_at FROM users WHERE user_id LIKE ? OR username LIKE ? OR first_name LIKE ? ORDER BY created_at DESC LIMIT 200",(term,term,term)).fetchall(); c.close()
+    return {"items":[{**dict(r),"premium":bool(r["premium_until"] and r["premium_until"]>now())} for r in rows]}
+
+@app.post("/api/admin/premium")
+def admin_premium(p:PremiumChange, request:Request):
+    ident=admin(request,"premium"); uid=str(p.user_id); u=user(uid); t=now()
+    if p.action=="revoke": until=None
+    elif p.action=="grant": until=(datetime.utcnow()+timedelta(days=max(1,min(int(p.days),3650)))).isoformat()
+    elif p.action=="extend":
+        base=datetime.utcnow()
+        try:
+            if u.get("premium_until"): base=max(base,datetime.fromisoformat(u["premium_until"]))
+        except ValueError: pass
+        until=(base+timedelta(days=max(1,min(int(p.days),3650)))).isoformat()
+    else: raise HTTPException(400,"Acción inválida")
+    c=db(); c.execute("UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?",(until,t,uid)); c.commit(); c.close(); audit(ident["username"],"premium_"+p.action,uid,{"days":p.days,"premium_until":until}); return {"success":True,"user_id":uid,"premium_until":until,"premium":bool(until and until>now())}
+
+@app.get("/api/admin/admins")
+def admin_list(request:Request):
+    admin(request,"admins"); c=db(); rows=c.execute("SELECT username,permissions,is_active,created_at FROM admin_users ORDER BY created_at DESC").fetchall(); c.close(); return {"items":[{**dict(r),"permissions":json.loads(r["permissions"])} for r in rows]}
+
+@app.post("/api/admin/admins")
+def admin_create(p:AdminCreate, request:Request):
+    ident=admin(request,"admins"); username=re.sub(r"[^a-zA-Z0-9_.-]","",p.username.strip())
+    if len(username)<3 or len(p.password)<10: raise HTTPException(400,"Usuario mínimo 3 caracteres y contraseña mínimo 10")
+    allowed={"users","premium","payments","stats","audit"}; perms=sorted(set(p.permissions)&allowed)
+    if not perms: raise HTTPException(400,"Selecciona al menos un permiso")
+    salt=os.urandom(16); digest=salt.hex()+":"+hashlib.pbkdf2_hmac("sha256",p.password.encode(),salt,180000).hex(); t=now(); c=db()
+    try: c.execute("INSERT INTO admin_users(username,password_hash,permissions,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?)",(username,digest,json.dumps(perms),1,t,t)); c.commit()
+    except sqlite3.IntegrityError: c.close(); raise HTTPException(409,"Ese administrador ya existe")
+    c.close(); audit(ident["username"],"admin_created",username,{"permissions":perms}); return {"success":True,"username":username,"permissions":perms}
+
+@app.post("/api/admin/admins/status")
+def admin_admin_status(p:AdminStatus, request:Request):
+    ident=admin(request,"admins")
+    if p.username=="owner": raise HTTPException(400,"No se puede desactivar al administrador principal")
+    c=db(); cur=c.execute("UPDATE admin_users SET is_active=?,updated_at=? WHERE username=?",(1 if p.is_active else 0,now(),p.username)); c.commit(); c.close()
+    if not cur.rowcount: raise HTTPException(404,"Administrador no encontrado")
+    audit(ident["username"],"admin_status",p.username,{"active":p.is_active}); return {"success":True}
+
+@app.get("/api/admin/audit")
+def admin_audit(request:Request):
+    admin(request,"audit"); c=db(); rows=c.execute("SELECT actor,action,target,details,created_at FROM admin_audit ORDER BY id DESC LIMIT 200").fetchall(); c.close(); return {"items":[dict(r) for r in rows]}
+
 @app.post("/api/admin/payments/verify")
 def verify_payment(p:PaymentId, request:Request):
-    admin(request); c=db(); row=c.execute("SELECT * FROM payment_operations WHERE operation_id=?",(p.operation_id,)).fetchone()
-    if not row: c.close(); raise HTTPException(404,"Operación no encontrada")
-    if row["status"] not in {"pending","proof_submitted"}: c.close(); raise HTTPException(409,"Operación no verificable")
-    days=7 if row["plan"]=="weekly" else 365; current=user(row["user_id"]).get("premium_until"); base=datetime.utcnow()
-    if current:
-        try: base=max(base,datetime.fromisoformat(current))
-        except ValueError: pass
-    until=(base+timedelta(days=days)).isoformat(); t=now(); c.execute("UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?",(until,t,row["user_id"])); c.execute("UPDATE payment_operations SET status='verified',verified_at=?,updated_at=? WHERE operation_id=?",(t,t,p.operation_id)); c.commit(); c.close(); return {"success":True,"status":"verified","premium_until":until}
+    ident=admin(request,"payments")
+    c=db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row=c.execute("SELECT * FROM payment_operations WHERE operation_id=?",(p.operation_id,)).fetchone()
+        if not row:
+            c.rollback()
+            raise HTTPException(404,"Operación no encontrada")
+        if row["status"] not in {"pending","proof_submitted"}:
+            c.rollback()
+            raise HTTPException(409,"Operación no verificable o ya procesada")
+        # Reserve the operation atomically so a concurrent request cannot grant Premium twice.
+        t=now()
+        cur=c.execute("UPDATE payment_operations SET status='processing',updated_at=? WHERE operation_id=? AND status IN ('pending','proof_submitted')",(t,p.operation_id))
+        if cur.rowcount != 1:
+            c.rollback()
+            raise HTTPException(409,"La operación ya está siendo procesada")
+        current_row=c.execute("SELECT premium_until FROM users WHERE user_id=?",(row["user_id"],)).fetchone()
+        current=current_row["premium_until"] if current_row else None
+        base=datetime.utcnow()
+        if current:
+            try: base=max(base,datetime.fromisoformat(current))
+            except ValueError: pass
+        days=7 if row["plan"]=="weekly" else 365
+        until=(base+timedelta(days=days)).isoformat()
+        c.execute("UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?",(until,t,row["user_id"]))
+        c.execute("UPDATE payment_operations SET status='verified',verified_at=?,updated_at=? WHERE operation_id=? AND status='processing'",(t,t,p.operation_id))
+        c.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        c.rollback()
+        raise HTTPException(500,"No se pudo verificar el pago")
+    finally:
+        c.close()
+    audit(ident["username"],"payment_verified",p.operation_id,{"user_id":row["user_id"],"premium_until":until})
+    return {"success":True,"status":"verified","premium_until":until}
+
+@app.post("/api/admin/payments/reject")
+def reject_payment(p: PaymentReview, request:Request):
+    ident=admin(request,"payments")
+    c=db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row=c.execute("SELECT * FROM payment_operations WHERE operation_id=?",(p.operation_id,)).fetchone()
+        if not row:
+            c.rollback()
+            raise HTTPException(404,"Operación no encontrada")
+        if row["status"] not in {"pending","proof_submitted"}:
+            c.rollback()
+            raise HTTPException(409,"Operación ya procesada")
+        t=now()
+        cur=c.execute("UPDATE payment_operations SET status='rejected',updated_at=? WHERE operation_id=? AND status IN ('pending','proof_submitted')",(t,p.operation_id))
+        if cur.rowcount != 1:
+            c.rollback()
+            raise HTTPException(409,"La operación ya fue procesada")
+        c.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        c.rollback()
+        raise HTTPException(500,"No se pudo rechazar el pago")
+    finally:
+        c.close()
+    audit(ident["username"],"payment_rejected",p.operation_id,{"reason":p.reason,"user_id":row["user_id"]})
+    return {"success":True,"status":"rejected"}
 
 @app.get("/api/admin/stats")
 def admin_stats(request:Request):
-    admin(request); c=db(); out={"total_users":c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"],"premium_users":c.execute("SELECT COUNT(*) n FROM users WHERE premium_until>?",(now(),)).fetchone()["n"],"today_usage":c.execute("SELECT COUNT(*) n FROM usage_logs WHERE used_at>=?",(today()+"T00:00:00",)).fetchone()["n"],"pending_payments":c.execute("SELECT COUNT(*) n FROM payment_operations WHERE status IN ('pending','proof_submitted')").fetchone()["n"]}; c.close(); return out
+    admin(request,"stats"); c=db(); out={"total_users":c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"],"premium_users":c.execute("SELECT COUNT(*) n FROM users WHERE premium_until>?",(now(),)).fetchone()["n"],"today_usage":c.execute("SELECT COUNT(*) n FROM usage_logs WHERE used_at>=?",(today()+"T00:00:00",)).fetchone()["n"],"pending_payments":c.execute("SELECT COUNT(*) n FROM payment_operations WHERE status IN ('pending','proof_submitted')").fetchone()["n"]}; c.close(); return out
 
 @app.get("/api/admin/payments")
 def admin_payments(request:Request):
-    admin(request); c=db(); rows=c.execute("SELECT * FROM payment_operations ORDER BY created_at DESC LIMIT 100").fetchall(); c.close(); return {"items":[dict(r) for r in rows]}
+    admin(request,"payments"); c=db(); rows=c.execute("SELECT * FROM payment_operations ORDER BY created_at DESC LIMIT 100").fetchall(); c.close(); return {"items":[dict(r) for r in rows]}
 
 @app.post("/api/atajo-diagnostico")
 async def atajo_diagnostico(request: Request):
