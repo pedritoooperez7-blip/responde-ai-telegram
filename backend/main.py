@@ -14,6 +14,8 @@ app = FastAPI(title="LiggaCuba API", version="2.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 FREE_DAILY_LIMIT = 3
+MAX_OCR_BYTES = 8 * 1024 * 1024
+MAX_OCR_PIXELS = 25_000_000
 FREE_CHAT_MODES = {"gracioso", "coquetear", "enamorar"}
 PREMIUM_CHAT_MODES = {"provocativo", "salvar"}
 FREE_STORY_MODES = {"gracioso", "coquetear"}
@@ -166,15 +168,60 @@ def usage(uid):
     return {"allowed": prem or used < FREE_DAILY_LIMIT, "remaining": 999 if prem else max(0,FREE_DAILY_LIMIT-used), "used_today":used, "premium":prem}
 
 
-def consume(uid,module,mode):
-    reset(uid); prem=premium(uid); c=db();
-    if not prem:
-        u=user(uid); used=int(u.get("usage_today") or 0)
-        if used >= FREE_DAILY_LIMIT: c.close(); return {"allowed":False,"remaining":0,"premium":False}
-        c.execute("UPDATE users SET usage_today=usage_today+1,updated_at=? WHERE user_id=?",(now(),uid)); remaining=FREE_DAILY_LIMIT-used-1
-    else: remaining=999
-    c.execute("INSERT INTO usage_logs(user_id,used_at,module,mode,premium_used) VALUES(?,?,?,?,?)",(uid,now(),module,mode,1 if prem else 0)); c.commit(); c.close()
-    return {"allowed":True,"remaining":remaining,"premium":prem}
+def consume(uid, module, mode):
+    """Atomically consume one free use; concurrent requests cannot exceed the limit."""
+    reset(uid)
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute(
+            "SELECT usage_today, last_reset_date, premium_until FROM users WHERE user_id=?",
+            (uid,),
+        ).fetchone()
+        if row is None:
+            t = now()
+            c.execute(
+                "INSERT INTO users(user_id,created_at,updated_at,last_reset_date) VALUES(?,?,?,?)",
+                (uid, t, t, today()),
+            )
+            row = c.execute(
+                "SELECT usage_today,last_reset_date,premium_until FROM users WHERE user_id=?",
+                (uid,),
+            ).fetchone()
+        if row["last_reset_date"] != today():
+            c.execute(
+                "UPDATE users SET usage_today=0,last_reset_date=?,updated_at=? WHERE user_id=?",
+                (today(), now(), uid),
+            )
+            used = 0
+        else:
+            used = int(row["usage_today"] or 0)
+        try:
+            is_premium = bool(row["premium_until"] and datetime.utcnow() < datetime.fromisoformat(row["premium_until"]))
+        except (TypeError, ValueError):
+            is_premium = False
+        if not is_premium and used >= FREE_DAILY_LIMIT:
+            c.commit()
+            return {"allowed": False, "remaining": 0, "premium": False}
+        if not is_premium:
+            c.execute(
+                "UPDATE users SET usage_today=usage_today+1,updated_at=? WHERE user_id=?",
+                (now(), uid),
+            )
+            remaining = max(0, FREE_DAILY_LIMIT - used - 1)
+        else:
+            remaining = 999
+        c.execute(
+            "INSERT INTO usage_logs(user_id,used_at,module,mode,premium_used) VALUES(?,?,?,?,?)",
+            (uid, now(), module, mode, 1 if is_premium else 0),
+        )
+        c.commit()
+        return {"allowed": True, "remaining": remaining, "premium": is_premium}
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 
 class TelegramAuth(BaseModel): initData:str=""; user_id:Optional[str]=None
@@ -499,24 +546,57 @@ def _ocr_text(img: Image.Image):
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
 
+def _decode_ocr_image(raw: bytes) -> Image.Image:
+    if not raw:
+        raise HTTPException(400, "Imagen vacía")
+    if len(raw) > MAX_OCR_BYTES:
+        raise HTTPException(413, "La imagen supera el límite de 8 MB")
+    try:
+        with Image.open(io.BytesIO(raw)) as source:
+            if source.format not in {"PNG", "JPEG", "WEBP", "BMP", "TIFF"}:
+                raise HTTPException(415, "Formato de imagen no admitido")
+            width, height = source.size
+            if width < 1 or height < 1 or width * height > MAX_OCR_PIXELS:
+                raise HTTPException(413, "La imagen tiene demasiados píxeles")
+            source.load()
+            return source.convert("RGB")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(400, "Imagen inválida o dañada")
+
+
 @app.post("/ocr")
 async def ocr_upload(request: Request):
-    data=await request.body()
-    if not data: raise HTTPException(400,"Imagen vacía")
+    # OCR is expensive; only authenticated Telegram WebApp sessions may invoke it.
+    current_user(request)
+    chunks = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_OCR_BYTES:
+            raise HTTPException(413, "La imagen supera el límite de 8 MB")
+        chunks.append(chunk)
+    img = _decode_ocr_image(b"".join(chunks))
     try:
-        img=Image.open(io.BytesIO(data)); img.load()
-        return {"ok":True,"text":_ocr_text(img)}
-    except Exception as e:
-        raise HTTPException(400,f"OCR error: {e}")
+        return {"ok": True, "text": _ocr_text(img)}
+    except Exception:
+        raise HTTPException(503, "El servicio OCR no está disponible temporalmente")
 
 @app.post("/ocr-base64")
-def ocr_base64(p:OCR):
+def ocr_base64(p: OCR):
+    encoded = p.image.split(",", 1)[-1]
+    if len(encoded) > ((MAX_OCR_BYTES + 2) // 3) * 4 + 8:
+        raise HTTPException(413, "La imagen supera el límite de 8 MB")
     try:
-        raw=base64.b64decode(p.image.split(",",1)[-1],validate=True)
-        img=Image.open(io.BytesIO(raw)); img.load()
-        return {"success":True,"text":_ocr_text(img)}
-    except Exception as e:
-        raise HTTPException(400,f"OCR inválido: {e}")
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception:
+        raise HTTPException(400, "Imagen Base64 inválida")
+    img = _decode_ocr_image(raw)
+    try:
+        return {"success": True, "text": _ocr_text(img)}
+    except Exception:
+        raise HTTPException(503, "El servicio OCR no está disponible temporalmente")
 
 @app.post("/ocr-base64-simple")
 def ocr_simple(p:OCR): return ocr_base64(p)
@@ -550,13 +630,13 @@ def premium_check(p: Usage, request:Request):
     }
 
 @app.post("/api/payment-phone")
-def payment_phone(p:PaymentPhone, request:Request):
-    uid=current_user(request)
-    phone=re.sub(r"\D","",p.phone or "")
+def payment_phone(p: PaymentPhone, request: Request):
+    uid = current_user(request)
+    phone = normalize_payment_phone(p.phone or "")
     if len(phone) < 8 or len(phone) > 15:
-        raise HTTPException(400,"Número de teléfono inválido")
+        raise HTTPException(400, "Número de teléfono inválido")
     user(uid, {"payment_phone": phone})
-    return {"success":True,"payment_phone":phone}
+    return {"success": True, "payment_phone": phone}
 
 
 def normalize_payment_phone(value: str) -> str:
@@ -996,15 +1076,15 @@ def admin_payments(request:Request):
 
 @app.post("/api/atajo-diagnostico")
 async def atajo_diagnostico(request: Request):
+    # This diagnostic endpoint must not be an unauthenticated public reflector.
+    key = request.headers.get("x-atajo-key", "")
+    if not ATAJO_KEY or not hmac.compare_digest(key, ATAJO_KEY):
+        raise HTTPException(401, "Atajo no autorizado")
     body = await request.body()
-
-    print(
-        f"ATAJO_DIAGNOSTICO recibido: "
-        f"bytes={len(body)}"
-    )
-
+    if len(body) > 16 * 1024:
+        raise HTTPException(413, "Solicitud demasiado grande")
     return {
         "success": True,
-        "mensaje": "Atajos se comunica con Railway",
-        "bytes_recibidos": len(body)
+        "mensaje": "Atajos se comunica con el servidor",
+        "bytes_recibidos": len(body),
     }
