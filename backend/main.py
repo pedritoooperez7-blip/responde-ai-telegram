@@ -809,3 +809,18 @@ def admin_stats(request:Request):
 @app.get("/api/admin/payments")
 def admin_payments(request:Request):
     admin(request); c=db(); rows=c.execute("SELECT * FROM payment_operations ORDER BY created_at DESC LIMIT 100").fetchall(); c.close(); return {"items":[dict(r) for r in rows]}
+
+@app.post("/api/atajo-diagnostico")
+async def atajo_diagnostico(request: Request):
+    body = await request.body()
+
+    print(
+        f"ATAJO_DIAGNOSTICO recibido: "
+        f"bytes={len(body)}"
+    )
+
+    return {
+        "success": True,
+        "mensaje": "Atajos se comunica con Railway",
+        "bytes_recibidos": len(body)
+    }
