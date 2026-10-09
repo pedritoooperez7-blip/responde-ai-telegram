@@ -224,9 +224,8 @@ def verify_init(s):
 def admin_identity(request: Request):
     if not ADMIN_KEY:
         raise HTTPException(503, "ADMIN_KEY no configurado en Railway")
-    key = request.headers.get("x-admin-key", "")
-    if hmac.compare_digest(key, ADMIN_KEY):
-        return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings"]}
+    # The master key is accepted only by /api/admin/login. All subsequent
+    # administrative requests must use a short-lived signed session token.
     auth = request.headers.get("authorization", "")
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
     if not token or "." not in token:
