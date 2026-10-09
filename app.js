@@ -44,11 +44,18 @@ async function createPayment(){
     const d=await r.json();
     if(!r.ok)throw new Error(d.detail||"Error");
     state.operationId=d.operation_id;
+    // Keep the UI aligned with the operation returned by the backend.
+    const actualMethod=d.payment_method||method;
+    if(["BANDEC","BPA","SALDO_MOVIL"].includes(actualMethod))state.paymentMethod=actualMethod;
+    else if(method==="BANDEC"||method==="BPA")state.paymentMethod=method;
+    $$(".payment-method[data-method]").forEach(b=>b.classList.toggle("selected",b.dataset.method===state.paymentMethod));
+    state.paymentPhone=d.payment_phone||state.paymentPhone||"";
+    if($("#paymentPhone")&&!$("#paymentPhone").value)$("#paymentPhone").value=state.paymentPhone;
     $("#paymentStatus").textContent=(state.language==="es"?"Operación ":"Operation ")+d.operation_id+" · "+d.amount;
-    $("#paymentMethodLabel").textContent=method==="SALDO_MOVIL"?"Saldo móvil":method;
+    $("#paymentMethodLabel").textContent=state.paymentMethod==="SALDO_MOVIL"?"Saldo móvil":state.paymentMethod;
     $("#paymentAmount").textContent=d.amount;
-    $("#paymentDestination").textContent=method==="SALDO_MOVIL"?"52677163":(d.destination_account||"").replace(/(\d{4})(?=\d)/g,"$1 ");
-    $("#paymentConfirmPhoneRow").classList.toggle("hidden",method==="SALDO_MOVIL");
+    $("#paymentDestination").textContent=state.paymentMethod==="SALDO_MOVIL"?"52677163":(d.destination_account||"").replace(/(\d{4})(?=\d)/g,"$1 ");
+    $("#paymentConfirmPhoneRow").classList.remove("hidden");
     $("#paymentFlow").classList.remove("hidden");
     $("#startPayment").classList.add("hidden");
     startPaymentStatusPolling();
@@ -64,5 +71,30 @@ function profile(){['#homeScreen','#settingsScreen','#premiumScreen','#moreScree
 function home(){['#profileScreen','#settingsScreen','#premiumScreen','#moreScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#homeScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden');$$('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.nav==='home'));setModule(state.module)}
 function settings(){['#homeScreen','#profileScreen','#premiumScreen','#moreScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#settingsScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden');}
 function more(){['#homeScreen','#profileScreen','#settingsScreen','#premiumScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#moreScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden')}
+$$('.payment-method[data-method]').forEach(b=>b.onclick=async()=>{
+  const next=b.dataset.method;
+  if(next===state.paymentMethod)return;
+  state.paymentMethod=next;
+  $$('.payment-method[data-method]').forEach(x=>x.classList.toggle('selected',x===b));
+  if(state.operationId){
+    try{await cancelPayment();await createPayment()}catch(e){toast(e.message||'Error')}
+  }
+});
+$('#savePaymentPhone').onclick=async()=>{
+  const phone=$('#paymentPhone').value.trim();
+  if(!phone)return toast(state.language==='es'?'Escribe el número desde el que pagarás':'Enter the number you will pay from');
+  try{
+    const r=await fetch('/api/payment-phone',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone})});
+    const d=await r.json();
+    if(!r.ok)throw new Error(d.detail||'Error');
+    state.paymentPhone=d.payment_phone||phone;
+    $('#paymentPhone').value=state.paymentPhone;
+    toast(state.language==='es'?'Número guardado':'Phone saved');
+  }catch(e){toast(e.message||'Error')}
+};
+$('#copyPaymentValue').onclick=async()=>{
+  try{await navigator.clipboard.writeText($('#paymentDestination').textContent.replace(/\s/g,''));toast(state.language==='es'?'Destino copiado':'Destination copied')}
+  catch(e){toast(state.language==='es'?'No se pudo copiar':'Could not copy')}
+};
 $('#imageInput').onchange=()=>openFile($('#imageInput'));$('#storyInput').onchange=()=>openFile($('#storyInput'));$('#uploadCard').onclick=e=>{if(!e.target.closest('button'))$('#imageInput').click()};$('#storyAdd').onclick=()=>$('#storyInput').click();$('#replaceImage').onclick=()=>$('#imageInput').click();$('#storyReplace').onclick=()=>$('#storyInput').click();$('#deleteImage').onclick=clearImage;$('#storyDelete').onclick=clearImage;$('#cropCancel').onclick=closeCrop;$('#cropClose').onclick=closeCrop;$('#cropUse').onclick=useCrop;$('#cropViewport').addEventListener('pointerdown',beginCrop);window.addEventListener('pointermove',moveCrop);window.addEventListener('pointerup',endCrop);window.addEventListener('resize',syncCrop);$('#analyzeButton').onclick=analyze;$('#storyAnalyze').onclick=analyze;$('#refreshUsage').onclick=refreshUsage;$('#storyRefreshUsage').onclick=refreshUsage;$('#settingsButton').onclick=settings;$('#backFromSettings').onclick=profile;$('#profilePremiumButton').onclick=()=>showPremium();$('#backFromPremium').onclick=hidePremium;$('#startPayment').onclick=createPayment;$('#cancelPayment').onclick=()=>cancelPayment().catch(e=>toast(e.message));$('#resultClose').onclick=()=>$('#resultModal').classList.add('hidden');$('#anotherAnalysis').onclick=()=>{$('#resultModal').classList.add('hidden');clearImage()};$('#copyResponse').onclick=async()=>{try{await navigator.clipboard.writeText($('#replyOutput').textContent);$('#copyStatus').textContent=t('copy')}catch(e){toast('Copy failed')}};$$('.segment').forEach(b=>b.onclick=()=>setModule(b.dataset.module));$$('.nav-item').forEach(b=>b.onclick=()=>b.dataset.nav==='profile'?profile():home());$$('.plan').forEach(b=>b.onclick=()=>{$$('.plan').forEach(x=>x.classList.remove('selected'));b.classList.add('selected');state.plan=b.dataset.plan});$('#languageButton').onclick=()=>{state.language=state.language==='es'?'en':'es';localStorage.setItem('liggacuba_lang',state.language);applyLanguage();loadProfile()};$('#contactButton').onclick=()=>$('#supportModal').classList.remove('hidden');$('#supportClose').onclick=()=>$('#supportModal').classList.add('hidden');$$('.support-link').forEach(b=>b.onclick=()=>window.open(b.dataset.support==='telegram'?'https://t.me/pedritoficial':'https://wa.me/5352677163','_blank'));$('#moreButton').onclick=more;$('#moreBack').onclick=settings;
 applyLanguage();auth();setTimeout(()=>{$('#splash').classList.add('hidden');$('#app').classList.remove('hidden')},650);

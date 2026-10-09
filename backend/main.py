@@ -504,212 +504,265 @@ def payment_phone(p:PaymentPhone, request:Request):
     return {"success":True,"payment_phone":phone}
 
 
+def normalize_payment_phone(value: str) -> str:
+    """Normalize Cuban mobile numbers with or without the +53 country prefix."""
+    digits = re.sub(r"\D", "", value or "")
+    if len(digits) == 10 and digits.startswith("53"):
+        return digits[2:]
+    return digits
+
+
 @app.post("/api/atajo-pago")
-def atajo_pago(p:AtajoPayment, request:Request):
-    key=request.headers.get("x-atajo-key","")
+def atajo_pago(p: AtajoPayment, request: Request):
+    """Recibe los datos existentes de los atajos Apple y procesa pagos idempotentemente."""
+    key = request.headers.get("x-atajo-key", "")
     if not ATAJO_KEY or not hmac.compare_digest(key, ATAJO_KEY):
-        raise HTTPException(401,"Atajo no autorizado")
+        raise HTTPException(401, "Atajo no autorizado")
 
-    method=(p.metodo_pago or "").strip().upper()
-    if method not in {"BANDEC","BPA","SALDO_MOVIL"}:
-        raise HTTPException(400,"Método de pago inválido")
+    method = (p.metodo_pago or "").strip().upper()
+    # El atajo bancario no distingue BANDEC de BPA: se conserva su identificador.
+    if method in {"BANDEC", "BPA"}:
+        method = "BANDEC_BPA"
+    if method not in {"BANDEC_BPA", "SALDO_MOVIL"}:
+        raise HTTPException(400, "Método de pago inválido")
 
-    phone=re.sub(r"\D","",p.telefono_origen or "")
-    amount_value=round(float(p.monto_recibido or 0),2)
-    transaction=(p.transaccion or "").strip().upper()
-    sms=(p.sms or "").strip()
-    destination=re.sub(r"\D","",p.cuenta_destino or "")
+    phone = re.sub(r"\D", "", p.telefono_origen or "")
+    try:
+        amount_value = round(float(p.monto_recibido or 0), 2)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Importe inválido")
+    transaction = (p.transaccion or "").strip().upper()
+    sms = (p.sms or "").strip()
+    destination = re.sub(r"\D", "", p.cuenta_destino or "")
+    transfer_date = (p.fecha or p.fecha_ejecucion or "").strip()
 
-    if amount_value <= 0 or not phone or not sms:
-
-        raise HTTPException(400,"Datos de transferencia incompletos")
-
-    if method=="BANDEC":
-
-        expected=re.sub(r"\D","",BANDEC_ACCOUNT)
-
-    elif method=="BPA":
-
-        expected=re.sub(r"\D","",BPA_ACCOUNT)
-
-        if not expected:
-
-            raise HTTPException(503,"Cuenta BPA no configurada")
-
+    if amount_value <= 0 or not phone:
+        raise HTTPException(400, "Faltan teléfono de origen o importe válido")
+    if method == "BANDEC_BPA":
+        if not destination or not transaction:
+            raise HTTPException(400, "Faltan cuenta de destino o número de transacción")
+        # Acepta la cuenta bancaria configurada. Si BPA_ACCOUNT está configurada,
+        # también la admite; no intenta inferir qué banco originó el SMS.
+        configured_accounts = {
+            re.sub(r"\D", "", value)
+            for value in (BANDEC_ACCOUNT, BPA_ACCOUNT)
+            if value and re.sub(r"\D", "", value)
+        }
+        if not configured_accounts:
+            raise HTTPException(503, "No hay cuentas bancarias configuradas")
+        if destination not in configured_accounts:
+            raise HTTPException(409, "Cuenta destino no configurada")
+        # El atajo bancario no manda el SMS completo: construimos una huella estable
+        # a partir de los campos extraídos que sí envía.
+        fingerprint_source = "|".join(
+            ["BANDEC_BPA", phone, destination, f"{amount_value:.2f}", transaction, transfer_date]
+        )
     else:
-
-        expected=""
-
-    if method in {"BANDEC","BPA"}:
-
-        if not destination or destination != expected:
-
-            raise HTTPException(409,"Cuenta destino no coincide")
-
-        if not transaction:
-
-            raise HTTPException(400,"Número de transacción requerido")
-
-    fingerprint=hashlib.sha256(sms.encode("utf-8")).hexdigest()
-
-    c=db()
-
-    duplicate=c.execute(
-
-        "SELECT operation_id,status FROM payment_operations WHERE transaction_id=? OR source_sms=? LIMIT 1",
-
-        (transaction,fingerprint)
-
-    ).fetchone() if transaction else c.execute(
-
-        "SELECT operation_id,status FROM payment_operations WHERE source_sms=? LIMIT 1",
-
-        (fingerprint,)
-
-    ).fetchone()
-
-    if duplicate:
-
-        c.close()
-
-        return {"success":False,"status":"duplicate","operation_id":duplicate["operation_id"]}
-
-    rows=c.execute(
-
-        "SELECT * FROM payment_operations WHERE status='pending' AND payment_method=? ORDER BY created_at ASC",
-
-        (method,)
-
-    ).fetchall()
-
-    matched=None
-
-    for row in rows:
-
-        expected_amount=float(re.sub(r"[^0-9.]","",row["amount"] or "0") or 0)
-
-        if round(expected_amount,2) != amount_value:
-
-            continue
-
-        registered=re.sub(r"\D","",user(row["user_id"]).get("payment_phone") or "")
-
-        if registered and registered != phone:
-
-            continue
-
-        matched=row
-
-        break
-
-    if not matched:
-
-        c.close()
-
-        return {"success":False,"status":"unmatched"}
-
-    t=now()
-
-    c.execute(
-
-        """UPDATE payment_operations
-
-           SET status='verified', payer_phone=?, destination_account=?,
-
-               transaction_id=?, transfer_date=?, source_sms=?,
-
-               verified_at=?, updated_at=?
-
-           WHERE operation_id=? AND status='pending'""",
-
-        (phone,destination,transaction,p.fecha or p.fecha_ejecucion or "",
-
-         fingerprint,t,t,matched["operation_id"])
-
-    )
-
-    if c.execute("SELECT changes()").fetchone()[0] != 1:
-
-        c.rollback()
-
-        c.close()
-
-        return {"success":False,"status":"already_processed"}
-
-    days=7 if matched["plan"]=="weekly" else 365
-
-    current=user(matched["user_id"]).get("premium_until")
-
-    base=datetime.utcnow()
-
-    if current:
-
+        if not sms:
+            raise HTTPException(400, "Falta el SMS original de Saldo Móvil")
+        # Validar que el SMS tenga estructura compatible con el aviso de ETECSA.
+        sms_norm = " ".join(sms.lower().split())
+        if "ha recibido" not in sms_norm or "numero" not in sms_norm:
+            raise HTTPException(400, "El SMS no tiene el formato esperado de Saldo Móvil")
+        # Verifica que teléfono e importe coincidan con el aviso original.
+        sms_phone_match = re.search(r"numero\s+(\+?\d{8,12})", sms_norm, re.IGNORECASE)
+        if not sms_phone_match or normalize_payment_phone(sms_phone_match.group(1)) != normalize_payment_phone(phone):
+            raise HTTPException(400, "El teléfono no coincide con el SMS")
+        amount_match = re.search(r"ha recibido\s+([0-9.,]+)\s*CUP", sms_norm, re.IGNORECASE)
+        if not amount_match:
+            raise HTTPException(400, "No se pudo leer el importe del SMS")
         try:
-
-            base=max(base,datetime.fromisoformat(current))
-
+            sms_amount = round(float(amount_match.group(1).replace(",", "")), 2)
         except ValueError:
+            raise HTTPException(400, "El importe del SMS no es válido")
+        if sms_amount != amount_value:
+            raise HTTPException(400, "El importe no coincide con el SMS")
+        fingerprint_source = "SALDO_MOVIL|" + sms
+    fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
 
-            pass
+    c = db()
+    try:
+        # Serializa recepción concurrente: evita procesar dos veces la misma operación.
+        c.execute("BEGIN IMMEDIATE")
+        if transaction:
+            duplicate = c.execute(
+                "SELECT operation_id,status FROM payment_operations WHERE transaction_id=? LIMIT 1",
+                (transaction,),
+            ).fetchone()
+        else:
+            duplicate = None
+        if not duplicate:
+            duplicate = c.execute(
+                "SELECT operation_id,status FROM payment_operations WHERE source_sms=? LIMIT 1",
+                (fingerprint,),
+            ).fetchone()
+        if duplicate:
+            c.rollback()
+            return {
+                "success": False,
+                "status": "duplicate",
+                "operation_id": duplicate["operation_id"],
+            }
 
-    until=(base+timedelta(days=days)).isoformat()
+        # Una sola operación activa por usuario: el pago debe coincidir con
+        # teléfono registrado, método, importe y destino cuando aplica.
+        rows = c.execute(
+            """SELECT po.*, u.payment_phone
+               FROM payment_operations po
+               JOIN users u ON u.user_id=po.user_id
+               WHERE po.status='pending'
+               ORDER BY po.created_at ASC"""
+        ).fetchall()
+        candidates = []
+        for row in rows:
+            row_method = (row["payment_method"] or "").strip().upper()
+            if method == "BANDEC_BPA":
+                if row_method not in {"BANDEC_BPA", "BANDEC", "BPA"}:
+                    continue
+                row_destination = re.sub(r"\D", "", row["destination_account"] or "")
+                if not row_destination or row_destination != destination:
+                    continue
+            else:
+                if row_method != "SALDO_MOVIL":
+                    continue
+            expected_amount = float(re.sub(r"[^0-9.]", "", row["amount"] or "0") or 0)
+            if round(expected_amount, 2) != amount_value:
+                continue
+            registered = row["payment_phone"] or row["payer_phone"] or ""
+            if not registered or normalize_payment_phone(registered) != normalize_payment_phone(phone):
+                continue
+            candidates.append(row)
 
-    c.execute(
+        if len(candidates) != 1:
+            c.rollback()
+            return {
+                "success": False,
+                "status": "unmatched" if not candidates else "ambiguous",
+                "matches": len(candidates),
+            }
 
-        "UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?",
+        matched = candidates[0]
+        t = now()
+        updated = c.execute(
+            """UPDATE payment_operations
+               SET status='verified', payer_phone=?, destination_account=?,
+                   transaction_id=?, transfer_date=?, source_sms=?,
+                   verified_at=?, updated_at=?
+               WHERE operation_id=? AND status='pending'""",
+            (
+                phone, destination, transaction, transfer_date, fingerprint,
+                t, t, matched["operation_id"],
+            ),
+        )
+        if updated.rowcount != 1:
+            c.rollback()
+            return {"success": False, "status": "already_processed"}
 
-        (until,t,matched["user_id"])
-
-    )
-
-    c.commit()
-
-    c.close()
-
-    return {
-
-        "success":True,
-
-        "status":"verified",
-
-        "operation_id":matched["operation_id"],
-
-        "user_id":matched["user_id"],
-
-        "premium_until":until
-
-    }
+        # Actualización de pago y Premium en la misma transacción.
+        user_row = c.execute(
+            "SELECT premium_until FROM users WHERE user_id=?",
+            (matched["user_id"],),
+        ).fetchone()
+        days = 7 if matched["plan"] == "weekly" else 365
+        base_time = datetime.utcnow()
+        current = user_row["premium_until"] if user_row else None
+        if current:
+            try:
+                base_time = max(base_time, datetime.fromisoformat(current))
+            except (ValueError, TypeError):
+                pass
+        until = (base_time + timedelta(days=days)).isoformat()
+        c.execute(
+            "UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?",
+            (until, t, matched["user_id"]),
+        )
+        c.commit()
+        return {
+            "success": True,
+            "status": "verified",
+            "operation_id": matched["operation_id"],
+            "user_id": matched["user_id"],
+            "premium_until": until,
+        }
+    except sqlite3.IntegrityError:
+        c.rollback()
+        return {"success": False, "status": "duplicate"}
+    finally:
+        c.close()
 
 @app.post("/api/payments/pending")
+def pending(p: Pending, request: Request):
+    uid = current_user(request)
+    if p.plan not in {"weekly", "annual"}:
+        raise HTTPException(400, "Plan inválido")
+    method = (p.payment_method or "BANDEC").strip().upper()
+    if method not in {"BANDEC", "BPA", "SALDO_MOVIL"}:
+        raise HTTPException(400, "Método de pago inválido")
 
-def pending(p:Pending, request:Request):
-    uid=current_user(request)
-    if p.plan not in {"weekly","annual"}: raise HTTPException(400,"Plan inválido")
-    # Prevent duplicate active operations for the same user/plan.
-    c=db(); existing=c.execute("SELECT * FROM payment_operations WHERE user_id=? AND plan=? AND status IN ('pending','proof_submitted') ORDER BY created_at DESC LIMIT 1",(uid,p.plan)).fetchone()
-    if existing: c.close(); return {"success":True,"operation_id":existing["operation_id"],"status":existing["status"],"amount":existing["amount"]}
-    method=(p.payment_method or "BANDEC").upper()
-    if method not in {"BANDEC","BPA","SALDO_MOVIL"}: raise HTTPException(400,"Método de pago inválido")
-    oid=uuid.uuid4().hex[:12].upper(); t=now(); a=amount(p.plan,p.language)
-    destination={"BANDEC":BANDEC_ACCOUNT,"BPA":BPA_ACCOUNT,"SALDO_MOVIL":""}[method]
-    phone=user(uid).get("payment_phone") or ""
-    c.execute(
-        """INSERT INTO payment_operations(
-           operation_id,user_id,plan,language,status,amount,payment_method,
-           payer_phone,destination_account,created_at,updated_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-        (oid,uid,p.plan,p.language,"pending",a,method,phone,destination,t,t)
-    )
-    c.commit(); c.close()
-    return {
-        "success":True,
-        "operation_id":oid,
-        "status":"pending",
-        "amount":a,
-        "payment_method":method,
-        "destination_account":destination,
-        "payment_phone":phone
-    }
+    registered_user = user(uid)
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        existing = c.execute(
+            """SELECT * FROM payment_operations
+               WHERE user_id=? AND status IN ('pending','proof_submitted')
+               ORDER BY created_at DESC LIMIT 1""",
+            (uid,),
+        ).fetchone()
+        if existing:
+            # No permitir cambiar método/plan en mitad de una operación.
+            c.commit()
+            return {
+                "success": True,
+                "operation_id": existing["operation_id"],
+                "status": existing["status"],
+                "amount": existing["amount"],
+                "payment_method": existing["payment_method"],
+                "destination_account": existing["destination_account"] or "",
+                "payment_phone": existing["payer_phone"] or registered_user.get("payment_phone") or "",
+                "existing_operation": True,
+                "requires_cancel_to_change": (
+                    existing["payment_method"] != method or existing["plan"] != p.plan
+                ),
+            }
+
+        oid = uuid.uuid4().hex[:12].upper()
+        t = now()
+        a = amount(p.plan, p.language)
+        if method == "BANDEC":
+            destination = BANDEC_ACCOUNT
+            if not re.sub(r"\D", "", destination or ""):
+                raise HTTPException(503, "Cuenta BANDEC no configurada")
+        elif method == "BPA":
+            destination = BPA_ACCOUNT
+            if not re.sub(r"\D", "", destination or ""):
+                raise HTTPException(503, "Cuenta BPA no configurada")
+        else:
+            destination = ""
+        phone = registered_user.get("payment_phone") or ""
+        c.execute(
+            """INSERT INTO payment_operations(
+               operation_id,user_id,plan,language,status,amount,payment_method,
+               payer_phone,destination_account,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (oid, uid, p.plan, p.language, "pending", a, method, phone, destination, t, t),
+        )
+        c.commit()
+        return {
+            "success": True,
+            "operation_id": oid,
+            "status": "pending",
+            "amount": a,
+            "payment_method": method,
+            "destination_account": destination,
+            "payment_phone": phone,
+            "existing_operation": False,
+        }
+    except sqlite3.IntegrityError:
+        c.rollback()
+        raise HTTPException(409, "Ya existe una operación de pago activa")
+    finally:
+        c.close()
 
 @app.post("/api/payments/proof")
 def proof(p:Proof, request:Request):
