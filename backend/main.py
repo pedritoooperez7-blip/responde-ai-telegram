@@ -106,6 +106,11 @@ def init_db():
     CREATE TABLE IF NOT EXISTS saved_situations(
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, ocr_text TEXT, reply TEXT, created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS analysis_attempts(
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, analysis_date TEXT NOT NULL,
+      module TEXT NOT NULL, mode TEXT NOT NULL, retry_used INTEGER NOT NULL DEFAULT 0,
+      generation_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS admin_users(
       username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, permissions TEXT NOT NULL,
       is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -123,6 +128,7 @@ def init_db():
         "ALTER TABLE payment_operations ADD COLUMN transaction_id TEXT",
         "ALTER TABLE payment_operations ADD COLUMN transfer_date TEXT",
         "ALTER TABLE payment_operations ADD COLUMN source_sms TEXT",
+        "ALTER TABLE analysis_attempts ADD COLUMN generation_count INTEGER NOT NULL DEFAULT 0",
     ):
         try:
             c.execute(sql)
@@ -227,7 +233,8 @@ def consume(uid, module, mode):
 class TelegramAuth(BaseModel): initData:str=""; user_id:Optional[str]=None
 class Usage(BaseModel): user_id:str
 class Analyze(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"
-class Generate(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"; text:str=""
+class Generate(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"; text:str=""; analysis_id:str=""
+class Retry(BaseModel): analysis_id:str; text:str=""
 class Pending(BaseModel): user_id:str; plan:str="weekly"; language:str="es"; payment_method:str="BANDEC"
 class PaymentPhone(BaseModel): phone:str
 class AtajoPayment(BaseModel):
@@ -364,13 +371,68 @@ def analyze(p:Analyze, request:Request):
     if mode in premset and not premium(uid): raise HTTPException(402,"Este modo requiere Premium")
     r=consume(uid,module,mode)
     if not r["allowed"]: raise HTTPException(403,"Has alcanzado tus 3 análisis gratuitos de hoy")
-    return r
+    analysis_id=uuid.uuid4().hex
+    c=db()
+    try:
+        c.execute("INSERT INTO analysis_attempts(id,user_id,analysis_date,module,mode,retry_used,created_at) VALUES(?,?,?,?,?,0,?)",
+                  (analysis_id,uid,today(),module,mode,now()))
+        c.commit()
+    finally:
+        c.close()
+    return {**r,"analysis_id":analysis_id}
+
+@app.post("/api/retry")
+def retry_analysis(p: Retry, request: Request):
+    uid=current_user(request)
+    if not p.text.strip(): raise HTTPException(400,"No hay texto para reintentar")
+    c=db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row=c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?",(p.analysis_id,uid)).fetchone()
+        if row is None: raise HTTPException(404,"No se encontró este análisis")
+        if row["analysis_date"] != today(): raise HTTPException(403,"El reintento de este análisis ya no está disponible")
+        if row["retry_used"]: raise HTTPException(409,"Este análisis ya utilizó su único reintento")
+        c.execute("UPDATE analysis_attempts SET retry_used=1 WHERE id=? AND user_id=? AND retry_used=0",(p.analysis_id,uid))
+        if c.total_changes < 1: raise HTTPException(409,"Este análisis ya utilizó su único reintento")
+        c.commit()
+        return {"success":True,"retry_used":True,"analysis_id":p.analysis_id,"module":row["module"],"mode":row["mode"]}
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 @app.post("/api/generate-reply")
 def generate(p:Generate, request:Request):
     uid=current_user(request)
     module=p.module if p.module in {"chat","story"} else "chat"
     mode=p.mode.lower().strip()
+    if not p.analysis_id:
+        raise HTTPException(400,"Falta el identificador del análisis")
+    # Validate and reserve this generation atomically. Each analysis permits one
+    # initial generation and at most one additional generation after its retry.
+    c=db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        attempt=c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?",(p.analysis_id,uid)).fetchone()
+        if attempt is None:
+            raise HTTPException(404,"No se encontró este análisis")
+        if attempt["analysis_date"] != today():
+            raise HTTPException(403,"Este análisis ya no está disponible")
+        if attempt["module"] != module or attempt["mode"] != mode:
+            raise HTTPException(400,"El modo no coincide con el análisis original")
+        count=int(attempt["generation_count"] or 0)
+        if count >= 1 and not attempt["retry_used"]:
+            raise HTTPException(409,"Debes usar el reintento disponible para generar otra respuesta")
+        if count >= 2:
+            raise HTTPException(409,"Este análisis ya utilizó su único reintento")
+        c.execute("UPDATE analysis_attempts SET generation_count=generation_count+1 WHERE id=? AND user_id=?",(p.analysis_id,uid))
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
     free=FREE_CHAT_MODES if module=="chat" else FREE_STORY_MODES
     premset=PREMIUM_CHAT_MODES if module=="chat" else PREMIUM_STORY_MODES
 
