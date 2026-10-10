@@ -321,6 +321,13 @@ def amount(plan,lang):
 
 @app.get("/")
 def root(): return FileResponse(os.path.join(ROOT,"index.html"))
+@app.get("/liggacuba-logo.jpg")
+def liggacuba_logo():
+    return FileResponse(
+        os.path.join(ROOT, "liggacuba-logo.jpg"),
+        media_type="image/jpeg"
+    )
+
 @app.get("/admin.html")
 def admin_page(): return FileResponse(os.path.join(ROOT,"admin.html"), media_type="text/html")
 
