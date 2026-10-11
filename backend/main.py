@@ -425,12 +425,20 @@ def release_retry(p: Retry, request: Request):
             raise HTTPException(404, "No se encontró este análisis")
         if row["analysis_date"] != today():
             raise HTTPException(403, "Este análisis ya no está disponible")
-        if not row["retry_used"]:
+        # The browser may request a release after a failed network call, but it
+        # must never be able to reset a retry that already reached generation.
+        # Once generation_count is 2, the retry was consumed and is immutable.
+        generation_count = int(row["generation_count"] or 0)
+        if not row["retry_used"] or generation_count > 1:
+            c.rollback()
             return {"success": True, "released": False, "analysis_id": p.analysis_id}
-        c.execute(
-            "UPDATE analysis_attempts SET retry_used=0, generation_count=MIN(generation_count,1) WHERE id=? AND user_id=?",
+        updated = c.execute(
+            "UPDATE analysis_attempts SET retry_used=0 WHERE id=? AND user_id=? AND retry_used=1 AND generation_count<=1",
             (p.analysis_id, uid),
         )
+        if updated.rowcount != 1:
+            c.rollback()
+            return {"success": True, "released": False, "analysis_id": p.analysis_id}
         c.commit()
         return {"success": True, "released": True, "analysis_id": p.analysis_id}
     except Exception:
