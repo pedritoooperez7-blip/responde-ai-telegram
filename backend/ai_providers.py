@@ -127,7 +127,9 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
 
     if not providers:
         logger.warning("AI providers: none configured or eligible for this request")
-        return None
+        if image_data_url:
+            raise ProviderError("No hay un proveedor de IA con visión configurado. Configura GEMINI_API_KEY u OPENROUTER_API_KEY.")
+        raise ProviderError("No hay proveedores de IA configurados para generar respuestas.")
 
     for name, call in providers:
         try:
@@ -144,8 +146,8 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
         except ProviderError as exc:
             logger.warning("AI provider failed: %s (error_type=%s)", name, type(exc).__name__)
             continue
-    logger.warning("AI providers exhausted; returning None for fallback")
-    return None
+    logger.warning("AI providers exhausted; refusing local fallback")
+    raise ProviderError("No se pudo generar una respuesta con la IA. Comprueba la configuración del proveedor e inténtalo de nuevo.")
 
 
 def _gemini(prompt: str, content: Any) -> str:

@@ -110,7 +110,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS analysis_attempts(
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL, analysis_date TEXT NOT NULL,
       module TEXT NOT NULL, mode TEXT NOT NULL, retry_used INTEGER NOT NULL DEFAULT 0,
-      generation_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+      generation_count INTEGER NOT NULL DEFAULT 0, generation_in_progress INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS admin_users(
       username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, permissions TEXT NOT NULL,
@@ -130,6 +130,7 @@ def init_db():
         "ALTER TABLE payment_operations ADD COLUMN transfer_date TEXT",
         "ALTER TABLE payment_operations ADD COLUMN source_sms TEXT",
         "ALTER TABLE analysis_attempts ADD COLUMN generation_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE analysis_attempts ADD COLUMN generation_in_progress INTEGER NOT NULL DEFAULT 0",
     ):
         try:
             c.execute(sql)
@@ -392,7 +393,6 @@ def analyze(p:Analyze, request:Request):
 @app.post("/api/retry")
 def retry_analysis(p: Retry, request: Request):
     uid=current_user(request)
-    if not p.text.strip(): raise HTTPException(400,"No hay texto para reintentar")
     c=db()
     try:
         c.execute("BEGIN IMMEDIATE")
@@ -400,8 +400,8 @@ def retry_analysis(p: Retry, request: Request):
         if row is None: raise HTTPException(404,"No se encontró este análisis")
         if row["analysis_date"] != today(): raise HTTPException(403,"El reintento de este análisis ya no está disponible")
         if row["retry_used"]: raise HTTPException(409,"Este análisis ya utilizó su único reintento")
-        c.execute("UPDATE analysis_attempts SET retry_used=1 WHERE id=? AND user_id=? AND retry_used=0",(p.analysis_id,uid))
-        if c.total_changes < 1: raise HTTPException(409,"Este análisis ya utilizó su único reintento")
+        updated=c.execute("UPDATE analysis_attempts SET retry_used=1 WHERE id=? AND user_id=? AND retry_used=0 AND generation_in_progress=0",(p.analysis_id,uid))
+        if updated.rowcount != 1: raise HTTPException(409,"Este análisis ya utilizó su único reintento o tiene una generación en curso")
         c.commit()
         return {"success":True,"retry_used":True,"analysis_id":p.analysis_id,"module":row["module"],"mode":row["mode"]}
     except Exception:
@@ -425,15 +425,13 @@ def release_retry(p: Retry, request: Request):
             raise HTTPException(404, "No se encontró este análisis")
         if row["analysis_date"] != today():
             raise HTTPException(403, "Este análisis ya no está disponible")
-        # The browser may request a release after a failed network call, but it
-        # must never be able to reset a retry that already reached generation.
-        # Once generation_count is 2, the retry was consumed and is immutable.
-        generation_count = int(row["generation_count"] or 0)
-        if not row["retry_used"] or generation_count > 1:
+        # Only release a retry after the backend has cleared its in-flight lock.
+        # generation_count records successful provider generations, not failed calls.
+        if not row["retry_used"] or int(row["generation_in_progress"] or 0):
             c.rollback()
             return {"success": True, "released": False, "analysis_id": p.analysis_id}
         updated = c.execute(
-            "UPDATE analysis_attempts SET retry_used=0 WHERE id=? AND user_id=? AND retry_used=1 AND generation_count<=1",
+            "UPDATE analysis_attempts SET retry_used=0 WHERE id=? AND user_id=? AND retry_used=1 AND generation_in_progress=0 AND generation_count<=1",
             (p.analysis_id, uid),
         )
         if updated.rowcount != 1:
@@ -455,138 +453,82 @@ def generate(p:Generate, request:Request):
     mode=p.mode.lower().strip()
     if not p.analysis_id:
         raise HTTPException(400,"Falta el identificador del análisis")
-    # Validate and reserve this generation atomically. Each analysis permits one
-    # initial generation and at most one additional generation after its retry.
-    c=db()
-    try:
-        c.execute("BEGIN IMMEDIATE")
-        attempt=c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?",(p.analysis_id,uid)).fetchone()
-        if attempt is None:
-            raise HTTPException(404,"No se encontró este análisis")
-        if attempt["analysis_date"] != today():
-            raise HTTPException(403,"Este análisis ya no está disponible")
-        if attempt["module"] != module or attempt["mode"] != mode:
-            raise HTTPException(400,"El modo no coincide con el análisis original")
-        count=int(attempt["generation_count"] or 0)
-        if count >= 1 and not attempt["retry_used"]:
-            raise HTTPException(409,"Debes usar el reintento disponible para generar otra respuesta")
-        if count >= 2:
-            raise HTTPException(409,"Este análisis ya utilizó su único reintento")
-        c.execute("UPDATE analysis_attempts SET generation_count=generation_count+1 WHERE id=? AND user_id=?",(p.analysis_id,uid))
-        c.commit()
-    except Exception:
-        c.rollback()
-        raise
-    finally:
-        c.close()
     free=FREE_CHAT_MODES if module=="chat" else FREE_STORY_MODES
     premset=PREMIUM_CHAT_MODES if module=="chat" else PREMIUM_STORY_MODES
-
     if mode not in free|premset:
         raise HTTPException(400,"Modo no válido")
     if mode in premset and not premium(uid):
         raise HTTPException(402,"Este modo requiere Premium")
 
     t=re.sub(r"\s+"," ",(p.text or "")).strip()
-    image_data_url = (p.image or "").strip()
-
+    image_data_url=(p.image or "").strip()
     if image_data_url:
-        header, sep, encoded = image_data_url.partition(",")
-        if (
-            not sep
-            or not header.startswith("data:image/")
-            or ";base64" not in header
-            or not encoded
-            or len(encoded) > 11_200_000
-        ):
-            raise HTTPException(400, "Imagen inválida o demasiado grande")
-
+        header, sep, encoded=image_data_url.partition(",")
+        if (not sep or not header.startswith("data:image/") or ";base64" not in header or not encoded or len(encoded)>11_200_000):
+            raise HTTPException(400,"Imagen inválida o demasiado grande")
     if not t and not image_data_url:
-        return {"success":False,"reply":"No pude detectar texto suficiente para generar una respuesta útil."}
+        raise HTTPException(400,"Adjunta una imagen o proporciona el texto que quieres analizar")
+
+    # Reserve one generation atomically. The count is incremented only after a valid AI response.
+    c=db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        attempt=c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?",(p.analysis_id,uid)).fetchone()
+        if attempt is None: raise HTTPException(404,"No se encontró este análisis")
+        if attempt["analysis_date"] != today(): raise HTTPException(403,"Este análisis ya no está disponible")
+        if attempt["module"] != module or attempt["mode"] != mode: raise HTTPException(400,"El modo no coincide con el análisis original")
+        count=int(attempt["generation_count"] or 0)
+        if count >= 1 and not attempt["retry_used"]: raise HTTPException(409,"Debes usar el reintento disponible para generar otra respuesta")
+        if count >= 2: raise HTTPException(409,"Este análisis ya utilizó su único reintento")
+        if int(attempt["generation_in_progress"] or 0): raise HTTPException(409,"Ya hay una generación en curso para este análisis")
+        updated=c.execute("UPDATE analysis_attempts SET generation_in_progress=1 WHERE id=? AND user_id=? AND generation_in_progress=0",(p.analysis_id,uid))
+        if updated.rowcount != 1: raise HTTPException(409,"Ya hay una generación en curso para este análisis")
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
     try:
-        ai_reply = ai_generate_reply(t, mode, module, image_data_url or None)
-    except Exception:
+        ai_reply=ai_generate_reply(t,mode,module,image_data_url or None)
+        if isinstance(ai_reply,dict):
+            reply=ai_reply.get("reply")
+            alternative=ai_reply.get("alternative")
+            provider=str(ai_reply.get("provider") or "desconocido")
+            if not isinstance(reply,str) or not reply.strip():
+                raise HTTPException(502,"El proveedor de IA no devolvió una respuesta válida. Puedes reintentar.")
+            alt=alternative.strip()[:1200] if isinstance(alternative,str) and alternative.strip() else ""
+            if not alt or alt.casefold()==reply.strip().casefold():
+                raise HTTPException(502,"La IA no generó dos respuestas diferentes. Puedes reintentar.")
+            result={"success":True,"reply":reply.strip()[:1200],"alternative":alt,"provider":provider}
+        elif isinstance(ai_reply,str) and ai_reply.strip():
+            reply=ai_reply.strip()[:1200]
+            result={"success":True,"reply":reply,"alternative":"Otra opción, con un enfoque diferente: "+reply[:900],"provider":"desconocido"}
+        else:
+            raise HTTPException(503,"La IA no está disponible en este momento. Puedes reintentar.")
+    except HTTPException:
+        raise
+    except Exception as exc:
         import logging
-        logging.getLogger(__name__).exception("Error inesperado al generar respuesta con IA")
-        ai_reply = None
-
-    if isinstance(ai_reply, dict):
-        reply = ai_reply.get("reply")
-        alternative = ai_reply.get("alternative")
-        if isinstance(reply, str) and reply.strip():
-            alt = alternative.strip()[:1200] if isinstance(alternative, str) and alternative.strip() else ""
-            if not alt:
-                alt = "También podrías decirlo de otra manera: " + reply.strip()[:900]
-            return {
-                "success": True,
-                "reply": reply.strip()[:1200],
-                "alternative": alt,
-                "provider": str(ai_reply.get("provider") or "desconocido"),
-            }
-    if isinstance(ai_reply, str) and ai_reply.strip():
-        # Compatibility for any legacy/custom provider that returns plain text.
-        reply = ai_reply.strip()[:1200]
-        return {"success":True,"reply":reply,"alternative":"Otra opción, con un enfoque diferente: "+reply[:900],"provider":"desconocido"}
-
-    # Respaldo: conservar las respuestas por reglas si ningún proveedor responde.
-    if not t:
-        return {"success":False,"reply":"No pude generar una respuesta con la imagen. Inténtalo con otra captura."}
-
-    low=t.lower()
-    premium_mode=mode in premset
-
-    def contains(words):
-        return any(w in low for w in words)
-
-    if mode=="gracioso":
-        if contains(["jaj","jaja","😂","🤣","lol"]):
-            reply="Puedes seguirle el juego: “JAJA 😂 así empiezas y después no hay quien te aguante.”"
-        elif "?" in t:
-            reply="Puedes responder con humor: “Esa pregunta viene con trampa 😂 pero me gusta la curiosidad.”"
-        else:
-            reply="Puedes responder: “Jajaja, contigo uno nunca sabe qué esperar 😂.”"
-
-    elif mode=="coquetear":
-        if contains(["hola","hey","buenas"]):
-            reply="Puedes responder: “Hola 😏 justo estaba pensando que hacía rato no sabía de ti. ¿Cómo estás?”"
-        elif "?" in t:
-            reply="Puedes responder: “Depende… ¿me lo preguntas porque tienes curiosidad o porque quieres conocer la respuesta? 😉”"
-        else:
-            reply="Puedes responder: “No sé si lo haces a propósito, pero tienes una forma de hablar que engancha 😉.”"
-
-    elif mode=="enamorar":
-        if contains(["hola","hey","buenas"]):
-            reply="Puedes responder: “Qué bonito leerte. Espero que tu día esté yendo bien, porque ya me mejoraste un poquito el mío ❤️.”"
-        elif "?" in t:
-            reply="Puedes responder con cercanía: “Te respondería rápido, pero contigo prefiero pensarlo bien para decirte exactamente lo que siento ❤️.”"
-        else:
-            reply="Puedes responder: “Me gusta hablar contigo porque la conversación se siente diferente, de esas que uno quiere seguir un rato más ❤️.”"
-
-    elif mode=="provocativo":
-        if contains(["hola","hey","buenas"]):
-            reply="Puedes responder: “Hola… aunque tengo la sensación de que contigo un simple hola puede terminar complicándose bastante 😏.”"
-        elif "?" in t:
-            reply="Puedes responder: “Podría darte una respuesta inocente… pero creo que los dos sabemos que sería demasiado aburrido 😏.”"
-        else:
-            reply="Puedes responder: “No sé si estás provocando o simplemente eres así, pero definitivamente conseguiste mi atención 😏.”"
-
-    elif mode=="salvar":
-        if "?" in t:
-            reply="Para salir bien de la situación, puedes responder: “Creo que me expliqué mal 😅. Lo que realmente quería decir era que prefiero hablarlo tranquilamente contigo.”"
-        elif contains(["perdón","perdon","enoj","molest","molesto","molesta","mal","problema"]):
-            reply="Puedes bajar la tensión sin quedar mal: “No era mi intención que sonara así. Prefiero aclararlo contigo antes de que se malinterprete.”"
-        else:
-            reply="Puedes responder de forma segura: “Creo que esto se puede explicar mejor 😅. No quiero que se entienda algo que no quise decir.”"
-
-    else:
-        reply="Puedes responder de forma natural y mantener la conversación abierta."
-
-    if premium_mode and mode!="salvar":
-        reply += " Además, intenta cerrar con una pregunta relacionada con lo que la otra persona acaba de decir para mantener la conversación natural."
-
-    alternative = _local_alternative(reply, mode, t)
-    return {"success":True,"reply":reply,"alternative":alternative,"provider":"local"}
+        logging.getLogger(__name__).exception("Error generando respuesta con IA")
+        raise HTTPException(503,"No se pudo generar la respuesta con la IA. Comprueba la configuración del proveedor e inténtalo de nuevo.") from exc
+    finally:
+        # Always release the in-flight lock. Failed generations do not consume a generation.
+        c=db()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            if 'result' in locals():
+                c.execute("UPDATE analysis_attempts SET generation_count=generation_count+1,generation_in_progress=0 WHERE id=? AND user_id=?",(p.analysis_id,uid))
+            else:
+                c.execute("UPDATE analysis_attempts SET generation_in_progress=0 WHERE id=? AND user_id=?",(p.analysis_id,uid))
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+        finally:
+            c.close()
+    return result
 
 
 def _local_alternative(reply: str, mode: str, text: str) -> str:
@@ -1210,6 +1152,51 @@ def reject_payment(p: PaymentReview, request:Request):
     try:
         c.execute("BEGIN IMMEDIATE")
         row=c.execute("SELECT * FROM payment_operations WHERE operation_id=?",(p.operation_id,)).fetchone()
+        if not row:
+            c.rollback()
+            raise HTTPException(404,"Operación no encontrada")
+        if row["status"] not in {"pending","proof_submitted"}:
+            c.rollback()
+            raise HTTPException(409,"Operación ya procesada")
+        t=now()
+        cur=c.execute("UPDATE payment_operations SET status='rejected',updated_at=? WHERE operation_id=? AND status IN ('pending','proof_submitted')",(t,p.operation_id))
+        if cur.rowcount != 1:
+            c.rollback()
+            raise HTTPException(409,"La operación ya fue procesada")
+        c.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        c.rollback()
+        raise HTTPException(500,"No se pudo rechazar el pago")
+    finally:
+        c.close()
+    audit(ident["username"],"payment_rejected",p.operation_id,{"reason":p.reason,"user_id":row["user_id"]})
+    return {"success":True,"status":"rejected"}
+
+@app.get("/api/admin/stats")
+def admin_stats(request:Request):
+    admin(request,"stats"); c=db(); out={"total_users":c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"],"premium_users":c.execute("SELECT COUNT(*) n FROM users WHERE premium_until>?",(now(),)).fetchone()["n"],"today_usage":c.execute("SELECT COUNT(*) n FROM usage_logs WHERE used_at>=?",(today()+"T00:00:00",)).fetchone()["n"],"pending_payments":c.execute("SELECT COUNT(*) n FROM payment_operations WHERE status IN ('pending','proof_submitted')").fetchone()["n"]}; c.close(); return out
+
+@app.get("/api/admin/payments")
+def admin_payments(request:Request):
+    admin(request,"payments"); c=db(); rows=c.execute("SELECT * FROM payment_operations ORDER BY created_at DESC LIMIT 100").fetchall(); c.close(); return {"items":[dict(r) for r in rows]}
+
+@app.post("/api/atajo-diagnostico")
+async def atajo_diagnostico(request: Request):
+    # This diagnostic endpoint must not be an unauthenticated public reflector.
+    key = request.headers.get("x-atajo-key", "")
+    if not ATAJO_KEY or not hmac.compare_digest(key, ATAJO_KEY):
+        raise HTTPException(401, "Atajo no autorizado")
+    body = await request.body()
+    if len(body) > 16 * 1024:
+        raise HTTPException(413, "Solicitud demasiado grande")
+    return {
+        "success": True,
+        "mensaje": "Atajos se comunica con el servidor",
+        "bytes_recibidos": len(body),
+    }
+ELECT * FROM payment_operations WHERE operation_id=?",(p.operation_id,)).fetchone()
         if not row:
             c.rollback()
             raise HTTPException(404,"Operación no encontrada")
