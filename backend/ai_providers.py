@@ -26,9 +26,42 @@ def _request_json(url: str, headers: dict[str, str], body: dict[str, Any], timeo
         try: retry_after = max(0.0, min(30.0, float(exc.headers.get("Retry-After", ""))))
         except (TypeError, ValueError): pass
         transient = exc.code in (408, 425, 429, 500, 502, 503, 504)
+
+        # Extraer solo campos de diagnóstico; nunca registrar el cuerpo completo.
+        provider_status = None
+        provider_code = None
+        provider_message = None
+        try:
+            error_data = json.loads(exc.read().decode("utf-8", errors="replace"))
+            if isinstance(error_data, dict):
+                detail = error_data.get("error", error_data)
+                if isinstance(detail, dict):
+                    provider_status = detail.get("status")
+                    provider_code = detail.get("code")
+                    provider_message = detail.get("message")
+        except Exception:
+            pass
+
+        # Limitar y sanear el texto para evitar exponer credenciales.
+        if isinstance(provider_message, str):
+            provider_message = provider_message[:300]
+            provider_message = re.sub(
+                r"(?i)(bearer\s+)\S+", r"\1[REDACTED]", provider_message
+            )
+            provider_message = re.sub(
+                r"(?i)(api[_ -]?key\s*[:=]\s*)\S+",
+                r"\1[REDACTED]", provider_message
+            )
+            provider_message = re.sub(
+                r"(?i)(key=)[^&\s]+", r"\1[REDACTED]", provider_message
+            )
+        else:
+            provider_message = None
+
         logging.getLogger(__name__).warning(
-            "AI HTTP request failed: status=%s transient=%s",
-            exc.code, transient
+            "AI HTTP request failed: status=%s transient=%s provider_status=%s "
+            "provider_code=%s provider_message=%s",
+            exc.code, transient, provider_status, provider_code, provider_message
         )
         raise ProviderError(f"Proveedor respondió HTTP {exc.code}", transient, retry_after) from None
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
