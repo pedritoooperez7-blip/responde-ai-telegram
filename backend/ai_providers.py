@@ -161,7 +161,7 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
     if os.getenv("GROQ_API_KEY") and not image_data_url:
         providers.append(("groq", lambda: _openai_compatible("https://api.groq.com/openai/v1/chat/completions", os.environ["GROQ_API_KEY"], os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"), prompt, user_content)))
     if os.getenv("OPENROUTER_API_KEY"):
-        providers.append(("openrouter", lambda: _openai_compatible("https://openrouter.ai/api/v1/chat/completions", os.environ["OPENROUTER_API_KEY"], os.getenv("OPENROUTER_MODEL", "openrouter/free"), prompt, user_content)))
+        providers.append(("openrouter", lambda: _openai_compatible("https://openrouter.ai/api/v1/chat/completions", os.environ["OPENROUTER_API_KEY"], os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"), prompt, user_content)))
     # Cohere is text-only here; it is a fallback, not a vision provider.
     if os.getenv("COHERE_API_KEY") and not image_data_url:
         providers.append(("cohere", lambda: _cohere(prompt, str(user_content))))
@@ -193,24 +193,138 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
 
 
 def _gemini(prompt: str, content: Any) -> str:
-    key = os.environ["GEMINI_API_KEY"]
-    parts = [{"text":prompt}]
-    if isinstance(content, list):
-        parts.append({"text":content[0]["text"]})
-        url = content[1]["image_url"]["url"]
-        header, encoded = url.split(",", 1)
-        import base64
-        parts.append({"inline_data":{"mime_type":header[5:].split(";",1)[0],"data":encoded}})
-    else: parts.append({"text":content})
-    data = _with_retry(lambda: _request_json(f"https://generativelanguage.googleapis.com/v1beta/models/{os.getenv('GEMINI_MODEL','gemini-2.5-flash')}:generateContent?key={key}", {}, {"contents":[{"parts":parts}],"generationConfig":{"temperature":0.7,"maxOutputTokens":500}}))
-    try: return data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError, TypeError): raise ProviderError("Respuesta inválida de Gemini")
+    import base64
 
+    key = os.environ["GEMINI_API_KEY"]
+    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+
+    # Interactions API: el prompt y el contenido del usuario
+    # se envían como bloques de texto.
+    inputs = [
+        {"type": "text", "text": prompt}
+    ]
+
+    if isinstance(content, list):
+        if not content or not isinstance(content[0], dict):
+            raise ProviderError("Contenido de imagen inválido")
+
+        user_text = content[0].get("text", "")
+        if isinstance(user_text, str) and user_text:
+            inputs.append({"type": "text", "text": user_text})
+
+        try:
+            image_url = content[1]["image_url"]["url"]
+            header, encoded = image_url.split(",", 1)
+            mime_type = header[5:].split(";", 1)[0]
+
+            if not mime_type.startswith("image/"):
+                raise ValueError("Tipo de imagen inválido")
+
+            base64.b64decode(encoded, validate=True)
+
+            inputs.append({
+                "type": "image",
+                "mime_type": mime_type,
+                "data": encoded,
+            })
+        except (IndexError, KeyError, TypeError, ValueError):
+            raise ProviderError("Formato de imagen inválido") from None
+    else:
+        if not isinstance(content, str):
+            raise ProviderError("Contenido de usuario inválido")
+        inputs.append({"type": "text", "text": content})
+
+    data = _with_retry(lambda: _request_json(
+        "https://generativelanguage.googleapis.com/v1beta/interactions",
+        {"x-goog-api-key": key},
+        {
+            "model": model,
+            "input": inputs,
+            "store": False,
+        },
+    ))
+
+    # La respuesta de Interactions contiene pasos; la respuesta
+    # final del modelo aparece en los pasos model_output.
+    steps = data.get("steps", [])
+    text_parts = []
+
+    if isinstance(steps, list):
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            if step.get("type") != "model_output":
+                continue
+
+            blocks = step.get("content", [])
+            if not isinstance(blocks, list):
+                continue
+
+            for block in blocks:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                ):
+                    text_parts.append(block["text"])
+
+    answer = "".join(text_parts).strip()
+    if answer:
+        return answer
+
+    logging.getLogger(__name__).warning(
+        "Gemini Interactions returned no model text (status=%s)",
+        data.get("status") if isinstance(data, dict) else "invalid",
+    )
+    raise ProviderError("Respuesta inválida de Gemini")
 
 def _openai_compatible(url: str, key: str, model: str, prompt: str, content: Any) -> str:
-    data = _with_retry(lambda: _request_json(url, {"Authorization":f"Bearer {key}"}, {"model":model,"messages":[{"role":"system","content":prompt},{"role":"user","content":content}],"temperature":0.7,"max_tokens":500}))
-    try: return data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError): raise ProviderError("Respuesta inválida del proveedor")
+    data = _with_retry(lambda: _request_json(
+        url,
+        {"Authorization": f"Bearer {key}"},
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": content},
+            ],
+            "temperature": 0.7,
+            "max_tokens": 500,
+        },
+    ))
+
+    try:
+        choices = data["choices"]
+        first_choice = choices[0]
+        message = first_choice["message"]
+    except (KeyError, IndexError, TypeError):
+        logging.getLogger(__name__).warning(
+            "AI provider returned an unexpected response structure"
+        )
+        raise ProviderError("Respuesta inválida del proveedor") from None
+
+    answer = message.get("content") if isinstance(message, dict) else None
+
+    if isinstance(answer, str):
+        return answer
+
+    if isinstance(answer, list):
+        text_parts = [
+            part.get("text", "")
+            for part in answer
+            if isinstance(part, dict)
+            and part.get("type") in ("text", "output_text")
+            and isinstance(part.get("text", ""), str)
+        ]
+        return "".join(text_parts)
+
+    # Solo registrar metadatos; nunca el prompt ni el contenido privado.
+    logging.getLogger(__name__).warning(
+        "AI provider response has no text content (content_type=%s, finish_reason=%s)",
+        type(answer).__name__,
+        first_choice.get("finish_reason") if isinstance(first_choice, dict) else None,
+    )
+    return ""
 
 
 def _cohere(prompt: str, text: str) -> str:
