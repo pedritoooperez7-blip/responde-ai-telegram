@@ -105,6 +105,57 @@ class TestHardening(unittest.TestCase):
         self.assertEqual(payment["transaction_id"], "TX-UNIQUE-001")
         self.assertTrue(premium_until)
 
+
+    def test_bpa_shortcut_uses_configured_bpa_destination(self):
+        uid = 'bpa-clean'
+        headers = auth(uid)
+        self.assertEqual(client.post('/api/payment-phone', headers=headers, json={'phone':'52677163'}).status_code, 200)
+        pending = client.post('/api/payments/pending', headers=headers, json={
+            'user_id': uid, 'plan': 'weekly', 'language': 'es', 'payment_method': 'BPA'
+        })
+        self.assertEqual(pending.status_code, 200, pending.text)
+        result = client.post('/api/atajo-pago', headers={'x-atajo-key': os.environ['ATAJO_KEY']}, json={
+            'metodo_pago': 'BPA', 'telefono_origen': '52677163',
+            'cuenta_destino': os.environ['BPA_ACCOUNT'], 'monto_recibido': 2500,
+            'transaccion': 'BPA-TX-UNIQUE-002', 'fecha': '2026-10-10'
+        })
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json().get('status'), 'verified', result.json())
+        self.assertTrue(main.premium(uid))
+
+    def test_saldo_movil_shortcut_checks_sms_phone_amount_and_duplicate(self):
+        uid = 'saldo-clean'
+        headers = auth(uid)
+        self.assertEqual(client.post('/api/payment-phone', headers=headers, json={'phone':'52677164'}).status_code, 200)
+        pending = client.post('/api/payments/pending', headers=headers, json={
+            'user_id': uid, 'plan': 'weekly', 'language': 'es', 'payment_method': 'SALDO_MOVIL'
+        })
+        self.assertEqual(pending.status_code, 200, pending.text)
+        payload = {
+            'metodo_pago': 'SALDO_MOVIL', 'telefono_origen': '52677164',
+            'monto_recibido': 2500, 'sms': 'El numero 52677164 ha recibido 2500 CUP'
+        }
+        result = client.post('/api/atajo-pago', headers={'x-atajo-key': os.environ['ATAJO_KEY']}, json=payload)
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json().get('status'), 'verified', result.json())
+        self.assertTrue(main.premium(uid))
+        duplicate = client.post('/api/atajo-pago', headers={'x-atajo-key': os.environ['ATAJO_KEY']}, json=payload)
+        self.assertEqual(duplicate.status_code, 200, duplicate.text)
+        self.assertEqual(duplicate.json().get('status'), 'duplicate', duplicate.json())
+
+    def test_saldo_movil_rejects_amount_mismatch(self):
+        uid = 'saldo-mismatch'
+        headers = auth(uid)
+        client.post('/api/payment-phone', headers=headers, json={'phone':'52677165'})
+        client.post('/api/payments/pending', headers=headers, json={
+            'user_id': uid, 'plan': 'weekly', 'language': 'es', 'payment_method': 'SALDO_MOVIL'
+        })
+        result = client.post('/api/atajo-pago', headers={'x-atajo-key': os.environ['ATAJO_KEY']}, json={
+            'metodo_pago': 'SALDO_MOVIL', 'telefono_origen': '52677165',
+            'monto_recibido': 2500, 'sms': 'El numero 52677165 ha recibido 1500 CUP'
+        })
+        self.assertEqual(result.status_code, 400, result.text)
+
     def test_duplicate_bank_transaction_does_not_grant_again(self):
         # Replaying the exact same transaction is idempotently rejected as duplicate.
         payload = {"metodo_pago":"BANDEC", "telefono_origen":"52677163", "cuenta_destino":"9244069990684435", "monto_recibido":2500, "transaccion":"TX-UNIQUE-001", "fecha":"2026-10-09"}
@@ -148,6 +199,43 @@ class TestPremiumAndRetries(unittest.TestCase):
         self.assertEqual(client.post('/api/retry/release',headers=headers,json=payload).status_code,200)
         c=main.db(); value=c.execute('SELECT retry_used FROM analysis_attempts WHERE id=?',(created['analysis_id'],)).fetchone()[0]; c.close()
         self.assertEqual(value,0)
+
+
+    def test_retry_release_cannot_reset_a_successful_retry(self):
+        from unittest.mock import patch
+        uid = 'retry-release-abuse'
+        headers = auth(uid)
+        created = client.post('/api/analyze', headers=headers, json={
+            'user_id': uid, 'module': 'chat', 'mode': 'coquetear'
+        })
+        self.assertEqual(created.status_code, 200, created.text)
+        aid = created.json()['analysis_id']
+        payload = {
+            'user_id': uid, 'module': 'chat', 'mode': 'coquetear',
+            'text': '¿Qué haces hoy?', 'analysis_id': aid,
+        }
+        with patch.object(main, 'ai_generate_reply', return_value={
+            'reply': 'Podríamos hablar un rato.',
+            'alternative': '¿Tienes algún plan para hoy?',
+            'provider': 'test-provider',
+        }):
+            first = client.post('/api/generate-reply', headers=headers, json=payload)
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(client.post('/api/retry', headers=headers, json={
+                'analysis_id': aid, 'text': payload['text']
+            }).status_code, 200)
+            second = client.post('/api/generate-reply', headers=headers, json=payload)
+            self.assertEqual(second.status_code, 200, second.text)
+
+        released = client.post('/api/retry/release', headers=headers, json={
+            'analysis_id': aid, 'text': payload['text']
+        })
+        self.assertEqual(released.status_code, 200, released.text)
+        self.assertFalse(released.json()['released'])
+        again = client.post('/api/retry', headers=headers, json={
+            'analysis_id': aid, 'text': payload['text']
+        })
+        self.assertEqual(again.status_code, 409, again.text)
 
     def test_retry_cannot_be_claimed_twice(self):
         uid='retry-once'
