@@ -120,3 +120,88 @@ class TestHardening(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class TestPremiumAndRetries(unittest.TestCase):
+    def test_free_user_cannot_use_premium_mode(self):
+        r = client.post('/api/analyze', headers=auth('premium-denied'), json={'user_id':'x','module':'chat','mode':'provocativo'})
+        self.assertEqual(r.status_code, 402)
+        self.assertEqual(main.usage('premium-denied')['used_today'], 0)
+
+    def test_premium_user_can_use_premium_modes_without_free_quota(self):
+        uid = 'premium-allowed'
+        main.user(uid, {'premium_until': (main.datetime.utcnow() + main.timedelta(days=2)).isoformat()})
+        headers = auth(uid)
+        for _ in range(4):
+            r = client.post('/api/analyze', headers=headers, json={'user_id':uid,'module':'chat','mode':'provocativo'})
+            self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(main.usage(uid)['remaining'], 999)
+        self.assertEqual(main.usage(uid)['used_today'], 0)
+
+    def test_retry_is_reserved_then_released_after_failure(self):
+        uid='retry-state'
+        headers=auth(uid)
+        created=client.post('/api/analyze',headers=headers,json={'user_id':uid,'module':'chat','mode':'coquetear'}).json()
+        payload={'analysis_id':created['analysis_id'],'text':'hola'}
+        self.assertEqual(client.post('/api/retry',headers=headers,json=payload).status_code,200)
+        c=main.db(); value=c.execute('SELECT retry_used FROM analysis_attempts WHERE id=?',(created['analysis_id'],)).fetchone()[0]; c.close()
+        self.assertEqual(value,2)
+        self.assertEqual(client.post('/api/retry/release',headers=headers,json=payload).status_code,200)
+        c=main.db(); value=c.execute('SELECT retry_used FROM analysis_attempts WHERE id=?',(created['analysis_id'],)).fetchone()[0]; c.close()
+        self.assertEqual(value,0)
+
+    def test_retry_cannot_be_claimed_twice(self):
+        uid='retry-once'
+        headers=auth(uid)
+        created=client.post('/api/analyze',headers=headers,json={'user_id':uid,'module':'chat','mode':'coquetear'}).json()
+        payload={'analysis_id':created['analysis_id'],'text':'hola'}
+        self.assertEqual(client.post('/api/retry',headers=headers,json=payload).status_code,200)
+        self.assertEqual(client.post('/api/retry',headers=headers,json=payload).status_code,409)
+
+
+class TestAIProviderRetries(unittest.TestCase):
+    def test_provider_retry_after_and_temporary_retry(self):
+        from unittest.mock import patch
+        import ai_providers
+        from urllib.error import HTTPError
+        import email.message
+        headers=email.message.Message(); headers['Retry-After']='0'
+        errors=[ai_providers.ProviderError('busy',True,0), 'ok']
+        def call():
+            value=errors.pop(0)
+            if isinstance(value, Exception): raise value
+            return value
+        with patch.object(ai_providers.time,'sleep') as sleep:
+            self.assertEqual(ai_providers._with_retry(call),'ok')
+            sleep.assert_called_once_with(0)
+
+    def test_permanent_provider_error_is_not_retried(self):
+        from unittest.mock import patch
+        import ai_providers
+        call_count=[0]
+        def call():
+            call_count[0]+=1
+            raise ai_providers.ProviderError('bad request',False)
+        with patch.object(ai_providers.time,'sleep') as sleep:
+            with self.assertRaises(ai_providers.ProviderError): ai_providers._with_retry(call)
+            self.assertEqual(call_count[0],1)
+            sleep.assert_not_called()
+
+class TestVisualAnalysis(unittest.TestCase):
+    def test_chat_and_story_forward_visual_context_to_shared_provider(self):
+        from unittest.mock import patch
+        uid='visual-premium'
+        main.user(uid, {'premium_until': (main.datetime.utcnow() + main.timedelta(days=2)).isoformat()})
+        headers=auth(uid)
+        image='data:image/jpeg;base64,' + ('a' * 64)
+        for module, mode in [('chat','coquetear'),('story','gracioso')]:
+            with patch.object(main, 'ai_generate_reply', return_value='Respuesta contextual') as provider:
+                r=client.post('/api/generate-reply', headers=headers, json={'user_id':uid,'module':module,'mode':mode,'text':'texto OCR','image':image})
+                self.assertEqual(r.status_code,200,r.text)
+                self.assertEqual(r.json()['reply'],'Respuesta contextual')
+                self.assertEqual(provider.call_args.args[2],module)
+                self.assertEqual(provider.call_args.args[3],image)
+
+    def test_invalid_visual_payload_rejected(self):
+        uid='visual-invalid'; headers=auth(uid)
+        r=client.post('/api/generate-reply',headers=headers,json={'user_id':uid,'module':'chat','mode':'coquetear','text':'hola','image':'data:text/plain;base64,abcd'})
+        self.assertEqual(r.status_code,400)
