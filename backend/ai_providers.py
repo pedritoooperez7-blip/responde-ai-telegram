@@ -1,6 +1,7 @@
 """Shared, server-side AI provider adapter with bounded transient retries."""
 from __future__ import annotations
 import json, os, time, urllib.error, urllib.request
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -65,12 +66,23 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
     # Cohere is text-only here; it is a fallback, not a vision provider.
     if os.getenv("COHERE_API_KEY") and not image_data_url:
         providers.append(("cohere", lambda: _cohere(prompt, str(user_content))))
+    logger = logging.getLogger(__name__)
+
+    if not providers:
+        logger.warning("AI providers: none configured or eligible for this request")
+        return None
+
     for name, call in providers:
         try:
             answer = _with_retry(call)
-            if isinstance(answer, str) and answer.strip(): return answer.strip()[:4000]
-        except ProviderError:
+            if isinstance(answer, str) and answer.strip():
+                logger.info("AI provider success: %s", name)
+                return answer.strip()[:4000]
+            logger.warning("AI provider returned an empty response: %s", name)
+        except ProviderError as exc:
+            logger.warning("AI provider failed: %s (error_type=%s)", name, type(exc).__name__)
             continue
+    logger.warning("AI providers exhausted; returning None for fallback")
     return None
 
 
