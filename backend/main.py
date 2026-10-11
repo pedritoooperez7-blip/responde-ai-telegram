@@ -234,7 +234,7 @@ def consume(uid, module, mode):
 class TelegramAuth(BaseModel): initData:str=""; user_id:Optional[str]=None
 class Usage(BaseModel): user_id:str
 class Analyze(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"
-class Generate(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"; text:str=""; analysis_id:str=""
+class Generate(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"; text:str=""; analysis_id:str=""; image:str=""
 class Retry(BaseModel): analysis_id:str; text:str=""
 class Pending(BaseModel): user_id:str; plan:str="weekly"; language:str="es"; payment_method:str="BANDEC"
 class PaymentPhone(BaseModel): phone:str
