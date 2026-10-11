@@ -8,7 +8,7 @@ import pytesseract
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs
-from ai_providers import generate_reply as ai_generate_reply
+from backend.ai_providers import generate_reply as ai_generate_reply
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 app = FastAPI(title="LiggaCuba API", version="2.1")
