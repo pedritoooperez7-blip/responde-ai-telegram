@@ -161,7 +161,7 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
     if os.getenv("GROQ_API_KEY") and not image_data_url:
         providers.append(("groq", lambda: _openai_compatible("https://api.groq.com/openai/v1/chat/completions", os.environ["GROQ_API_KEY"], os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"), prompt, user_content)))
     if os.getenv("OPENROUTER_API_KEY"):
-        providers.append(("openrouter", lambda: _openai_compatible("https://openrouter.ai/api/v1/chat/completions", os.environ["OPENROUTER_API_KEY"], os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"), prompt, user_content)))
+        providers.append(("openrouter", lambda: _openai_compatible("https://openrouter.ai/api/v1/chat/completions", os.environ["OPENROUTER_API_KEY"], os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"), prompt, user_content)))
     # Cohere is text-only here; it is a fallback, not a vision provider.
     if os.getenv("COHERE_API_KEY") and not image_data_url:
         providers.append(("cohere", lambda: _cohere(prompt, str(user_content))))
