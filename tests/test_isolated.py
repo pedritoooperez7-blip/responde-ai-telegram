@@ -144,7 +144,7 @@ class TestPremiumAndRetries(unittest.TestCase):
         payload={'analysis_id':created['analysis_id'],'text':'hola'}
         self.assertEqual(client.post('/api/retry',headers=headers,json=payload).status_code,200)
         c=main.db(); value=c.execute('SELECT retry_used FROM analysis_attempts WHERE id=?',(created['analysis_id'],)).fetchone()[0]; c.close()
-        self.assertEqual(value,2)
+        self.assertEqual(value,1)
         self.assertEqual(client.post('/api/retry/release',headers=headers,json=payload).status_code,200)
         c=main.db(); value=c.execute('SELECT retry_used FROM analysis_attempts WHERE id=?',(created['analysis_id'],)).fetchone()[0]; c.close()
         self.assertEqual(value,0)
@@ -194,10 +194,14 @@ class TestVisualAnalysis(unittest.TestCase):
         headers=auth(uid)
         image='data:image/jpeg;base64,' + ('a' * 64)
         for module, mode in [('chat','coquetear'),('story','gracioso')]:
-            with patch.object(main, 'ai_generate_reply', return_value='Respuesta contextual') as provider:
-                r=client.post('/api/generate-reply', headers=headers, json={'user_id':uid,'module':module,'mode':mode,'text':'texto OCR','image':image})
+            attempt=client.post('/api/analyze',headers=headers,json={'user_id':uid,'module':module,'mode':mode})
+            self.assertEqual(attempt.status_code,200,attempt.text)
+            with patch.object(main, 'ai_generate_reply', return_value={'reply':'Respuesta contextual','alternative':'Otra alternativa','provider':'gemini'}) as provider:
+                r=client.post('/api/generate-reply', headers=headers, json={'user_id':uid,'module':module,'mode':mode,'text':'texto OCR','image':image,'analysis_id':attempt.json()['analysis_id']})
                 self.assertEqual(r.status_code,200,r.text)
                 self.assertEqual(r.json()['reply'],'Respuesta contextual')
+                self.assertEqual(r.json()['alternative'],'Otra alternativa')
+                self.assertEqual(r.json()['provider'],'gemini')
                 self.assertEqual(provider.call_args.args[2],module)
                 self.assertEqual(provider.call_args.args[3],image)
 
@@ -205,3 +209,21 @@ class TestVisualAnalysis(unittest.TestCase):
         uid='visual-invalid'; headers=auth(uid)
         r=client.post('/api/generate-reply',headers=headers,json={'user_id':uid,'module':'chat','mode':'coquetear','text':'hola','image':'data:text/plain;base64,abcd'})
         self.assertEqual(r.status_code,400)
+
+
+class TestAIReplyQualityHelpers(unittest.TestCase):
+    def test_prompt_prioritizes_recent_context_and_distinct_alternatives(self):
+        import ai_providers
+        prompt = ai_providers._build_prompt("coquetear", "chat")
+        self.assertIn("mensajes más recientes", prompt)
+        self.assertIn("No reinicies una conversación", prompt)
+        self.assertIn("DOS alternativas realmente distintas", prompt)
+
+    def test_parser_rejects_duplicate_replies(self):
+        import ai_providers
+        self.assertIsNone(ai_providers._parse_replies('{"reply":"Hola","alternative":"Hola"}'))
+
+    def test_parser_accepts_two_distinct_replies(self):
+        import ai_providers
+        result = ai_providers._parse_replies('{"reply":"¿A qué hora sales?","alternative":"¿Qué planes tienes después?"}')
+        self.assertEqual(result, {"reply":"¿A qué hora sales?","alternative":"¿Qué planes tienes después?"})

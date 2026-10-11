@@ -67,8 +67,10 @@ def _build_prompt(mode: str, module: str) -> str:
         f"Módulo: {module}. Estilo solicitado: {style}.",
         context_rule,
         "Usa español conversacional actual. Puedes usar un toque coloquial cubano si encaja de forma natural, pero no fuerces jerga ni caricaturices acentos.",
-        "Primero interpreta el contexto internamente; no expliques tu análisis ni des consejos fuera de las respuestas.",
-        "Genera exactamente DOS alternativas realmente distintas: una más directa y otra con un enfoque diferente, ambas apropiadas al estilo elegido.",
+        "Interpreta primero el contexto internamente. Da prioridad a los mensajes más recientes que haya enviado la otra persona y a lo que el usuario respondió inmediatamente antes.",
+        "El texto puede proceder de OCR y contener ruido. Reconstruye solo lo que sea razonablemente claro; no trates fragmentos ilegibles como hechos. Si hay marcas de interlocutor, distingue quién dijo cada mensaje.",
+        "No reinicies una conversación ya iniciada con saludos ni repitas preguntas que ya fueron respondidas. Responde al último mensaje significativo y aprovecha el hilo previo.",
+        "Genera exactamente DOS alternativas realmente distintas: la primera directa y natural; la segunda con un enfoque conversacional diferente. No hagas dos paráfrasis casi idénticas.",
         "Cada alternativa debe sonar humana, específica al contexto y lista para copiar y enviar; normalmente 1 frase y como máximo 2.",
         "No repitas el mensaje original, no añadas etiquetas como 'Respuesta 1', comillas, prefacios, explicaciones ni emojis por obligación.",
         "No inventes hechos, sentimientos, relaciones ni detalles ausentes. Si el contexto es ambiguo, elige una respuesta ligera que invite a aclararlo.",
@@ -133,7 +135,11 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
             if isinstance(answer, str) and answer.strip():
                 logger.info("AI provider success: %s", name)
                 structured = _parse_replies(answer)
-                return structured if structured else answer.strip()[:4000]
+                if structured:
+                    return {**structured, "provider": name}
+                # Do not silently present malformed model output as a valid two-reply result.
+                logger.warning("AI provider returned unstructured output: %s", name)
+                continue
             logger.warning("AI provider returned an empty response: %s", name)
         except ProviderError as exc:
             logger.warning("AI provider failed: %s (error_type=%s)", name, type(exc).__name__)

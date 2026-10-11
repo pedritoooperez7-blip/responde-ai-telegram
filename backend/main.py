@@ -410,6 +410,36 @@ def retry_analysis(p: Retry, request: Request):
     finally:
         c.close()
 
+@app.post("/api/retry/release")
+def release_retry(p: Retry, request: Request):
+    """Release a retry reservation when generation fails before producing results."""
+    uid = current_user(request)
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute(
+            "SELECT * FROM analysis_attempts WHERE id=? AND user_id=?",
+            (p.analysis_id, uid),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "No se encontró este análisis")
+        if row["analysis_date"] != today():
+            raise HTTPException(403, "Este análisis ya no está disponible")
+        if not row["retry_used"]:
+            return {"success": True, "released": False, "analysis_id": p.analysis_id}
+        c.execute(
+            "UPDATE analysis_attempts SET retry_used=0, generation_count=MIN(generation_count,1) WHERE id=? AND user_id=?",
+            (p.analysis_id, uid),
+        )
+        c.commit()
+        return {"success": True, "released": True, "analysis_id": p.analysis_id}
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+
+
 @app.post("/api/generate-reply")
 def generate(p:Generate, request:Request):
     uid=current_user(request)
@@ -477,12 +507,19 @@ def generate(p:Generate, request:Request):
         reply = ai_reply.get("reply")
         alternative = ai_reply.get("alternative")
         if isinstance(reply, str) and reply.strip():
-            payload = {"success": True, "reply": reply.strip()[:1200]}
-            if isinstance(alternative, str) and alternative.strip():
-                payload["alternative"] = alternative.strip()[:1200]
-            return payload
+            alt = alternative.strip()[:1200] if isinstance(alternative, str) and alternative.strip() else ""
+            if not alt:
+                alt = "También podrías decirlo de otra manera: " + reply.strip()[:900]
+            return {
+                "success": True,
+                "reply": reply.strip()[:1200],
+                "alternative": alt,
+                "provider": str(ai_reply.get("provider") or "desconocido"),
+            }
     if isinstance(ai_reply, str) and ai_reply.strip():
-        return {"success":True,"reply":ai_reply.strip()[:4000]}
+        # Compatibility for any legacy/custom provider that returns plain text.
+        reply = ai_reply.strip()[:1200]
+        return {"success":True,"reply":reply,"alternative":"Otra opción, con un enfoque diferente: "+reply[:900],"provider":"desconocido"}
 
     # Respaldo: conservar las respuestas por reglas si ningún proveedor responde.
     if not t:
@@ -540,8 +577,24 @@ def generate(p:Generate, request:Request):
     if premium_mode and mode!="salvar":
         reply += " Además, intenta cerrar con una pregunta relacionada con lo que la otra persona acaba de decir para mantener la conversación natural."
 
-    return {"success":True,"reply":reply}
+    alternative = _local_alternative(reply, mode, t)
+    return {"success":True,"reply":reply,"alternative":alternative,"provider":"local"}
 
+
+def _local_alternative(reply: str, mode: str, text: str) -> str:
+    """Produce a clearly identified local fallback alternative without claiming an AI provider."""
+    clean = re.sub(r"^Puedes responder(?: de forma segura| con humor| con cercanía)?[: ]*", "", reply, flags=re.I).strip().strip("“”\"")
+    if mode == "gracioso":
+        return "Otra opción más ligera: “Jajaja, y eso que la conversación todavía no se ha puesto buena 😂.”"
+    if mode == "coquetear":
+        return "Otra opción más coqueta: “Jajaja, me gusta hablar contigo; siempre sale algo que comentar 😏.”"
+    if mode == "enamorar":
+        return "Otra opción más cálida: “Me gusta que podamos hablar así, sin forzar nada 😊.”"
+    if mode == "provocativo":
+        return "Otra opción con picardía: “Jajaja, ahora me dejaste con curiosidad 😏.”"
+    if mode == "salvar":
+        return "Otra opción tranquila: “Quizá no me expliqué bien; prefiero que lo hablemos con calma.”"
+    return ("Otra forma de decirlo: " + clean[:900]) if clean else "¿Y tú qué piensas?"
 
 
 def _ocr_variants(img: Image.Image):

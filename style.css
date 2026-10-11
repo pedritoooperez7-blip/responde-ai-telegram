@@ -40,3 +40,7 @@
 
 /* Save Situation remains only in Chat; center that one option without rearranging other modes. */
 #chatModes .mode-card[data-mode="salvar"]{grid-column:1/-1;justify-self:center;width:calc(50% - 5px);min-height:76px}
+
+
+/* Provider provenance shown below each generated suggestion. */
+.provider-label{display:inline-block;margin-left:.45rem;font-size:.72em;font-weight:500;opacity:.75;}
