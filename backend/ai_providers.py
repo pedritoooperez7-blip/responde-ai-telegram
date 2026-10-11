@@ -26,8 +26,16 @@ def _request_json(url: str, headers: dict[str, str], body: dict[str, Any], timeo
         try: retry_after = max(0.0, min(30.0, float(exc.headers.get("Retry-After", ""))))
         except (TypeError, ValueError): pass
         transient = exc.code in (408, 425, 429, 500, 502, 503, 504)
+        logging.getLogger(__name__).warning(
+            "AI HTTP request failed: status=%s transient=%s",
+            exc.code, transient
+        )
         raise ProviderError(f"Proveedor respondió HTTP {exc.code}", transient, retry_after) from None
-    except (urllib.error.URLError, TimeoutError, OSError):
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        logging.getLogger(__name__).warning(
+            "AI connection failed: error_type=%s",
+            type(exc).__name__
+        )
         raise ProviderError("Proveedor temporalmente no disponible", True) from None
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise ProviderError("Respuesta inválida del proveedor") from None
