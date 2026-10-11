@@ -8,6 +8,7 @@ import pytesseract
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs
+from ai_providers import generate_reply as ai_generate_reply
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 app = FastAPI(title="LiggaCuba API", version="2.1")
@@ -449,8 +450,35 @@ def generate(p:Generate, request:Request):
         raise HTTPException(402,"Este modo requiere Premium")
 
     t=re.sub(r"\s+"," ",(p.text or "")).strip()
-    if not t:
+    image_data_url = (p.image or "").strip()
+
+    if image_data_url:
+        header, sep, encoded = image_data_url.partition(",")
+        if (
+            not sep
+            or not header.startswith("data:image/")
+            or ";base64" not in header
+            or not encoded
+            or len(encoded) > 11_200_000
+        ):
+            raise HTTPException(400, "Imagen inválida o demasiado grande")
+
+    if not t and not image_data_url:
         return {"success":False,"reply":"No pude detectar texto suficiente para generar una respuesta útil."}
+
+    try:
+        ai_reply = ai_generate_reply(t, mode, module, image_data_url or None)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Error inesperado al generar respuesta con IA")
+        ai_reply = None
+
+    if isinstance(ai_reply, str) and ai_reply.strip():
+        return {"success":True,"reply":ai_reply.strip()[:4000]}
+
+    # Respaldo: conservar las respuestas por reglas si ningún proveedor responde.
+    if not t:
+        return {"success":False,"reply":"No pude generar una respuesta con la imagen. Inténtalo con otra captura."}
 
     low=t.lower()
     premium_mode=mode in premset
