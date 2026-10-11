@@ -4,6 +4,7 @@ import json, os, time, urllib.error, urllib.request
 import logging
 from dataclasses import dataclass
 from typing import Any
+import re
 
 @dataclass
 class ProviderError(Exception):
