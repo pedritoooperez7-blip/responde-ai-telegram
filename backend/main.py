@@ -473,6 +473,14 @@ def generate(p:Generate, request:Request):
         logging.getLogger(__name__).exception("Error inesperado al generar respuesta con IA")
         ai_reply = None
 
+    if isinstance(ai_reply, dict):
+        reply = ai_reply.get("reply")
+        alternative = ai_reply.get("alternative")
+        if isinstance(reply, str) and reply.strip():
+            payload = {"success": True, "reply": reply.strip()[:1200]}
+            if isinstance(alternative, str) and alternative.strip():
+                payload["alternative"] = alternative.strip()[:1200]
+            return payload
     if isinstance(ai_reply, str) and ai_reply.strip():
         return {"success":True,"reply":ai_reply.strip()[:4000]}
 
