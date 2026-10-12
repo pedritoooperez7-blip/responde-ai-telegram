@@ -8,7 +8,7 @@ import pytesseract
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs
-from backend.ai_providers import generate_reply as ai_generate_reply
+from backend.ai_providers import ProviderError, generate_reply as ai_generate_reply
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 app = FastAPI(title="LiggaCuba API", version="2.1")
@@ -388,6 +388,34 @@ def _ai_model_for(provider: str) -> str:
     return os.getenv(env_names.get(provider, ""), defaults.get(provider, "desconocido"))
 
 
+def _generate_with_ocr_fallback(text: str, mode: str, module: str, image_data_url: Optional[str]):
+    """Use OCR only after visual AI generation fails, then retry with text-capable providers."""
+    try:
+        return ai_generate_reply(text, mode, module, image_data_url), ""
+    except ProviderError as vision_error:
+        if not image_data_url:
+            raise
+        try:
+            _, separator, encoded = image_data_url.partition(",")
+            if not separator:
+                raise ValueError("Imagen inválida")
+            image_bytes = base64.b64decode(encoded, validate=True)
+            recognized_text = _ocr_text(_decode_ocr_image(image_bytes))
+        except Exception:
+            # Preserve the original vision-provider failure if local OCR cannot run.
+            raise vision_error
+
+        recognized_text = re.sub(r"\s+", " ", recognized_text or "").strip()[:12000]
+        if not recognized_text:
+            raise HTTPException(
+                422,
+                "La IA visual no está disponible y el OCR no pudo leer texto. Usa una captura más clara.",
+            ) from vision_error
+
+        fallback_text = " ".join(part for part in (text.strip(), recognized_text) if part)
+        return ai_generate_reply(fallback_text, mode, module, None), recognized_text
+
+
 def _quality_estimate(reply: str, alternative: str, context: str, mode: str) -> int:
     """Heuristic diagnostic only; it is not a semantic quality guarantee."""
     a, b = reply.strip(), alternative.strip()
@@ -538,8 +566,9 @@ def generate(p:Generate, request:Request):
     provider = "unknown"
     model = "unknown"
     retry_number = 1 if int(attempt["retry_used"] or 0) else 0
+    ocr_fallback_text = ""
     try:
-        ai_reply=ai_generate_reply(t,mode,module,image_data_url or None)
+        ai_reply, ocr_fallback_text = _generate_with_ocr_fallback(t, mode, module, image_data_url or None)
         if isinstance(ai_reply,dict):
             reply=ai_reply.get("reply")
             alternative=ai_reply.get("alternative")
@@ -550,8 +579,8 @@ def generate(p:Generate, request:Request):
             alt=alternative.strip()[:1200] if isinstance(alternative,str) and alternative.strip() else ""
             if not alt or alt.casefold()==reply.strip().casefold():
                 raise HTTPException(502,"La IA no generó dos respuestas diferentes. Puedes reintentar.")
-            quality_score = _quality_estimate(reply.strip(), alt, t, mode)
-            result={"success":True,"reply":reply.strip()[:1200],"alternative":alt,"provider":provider,"model":model,"quality_score":quality_score}
+            quality_score = _quality_estimate(reply.strip(), alt, t or ocr_fallback_text, mode)
+            result={"success":True,"reply":reply.strip()[:1200],"alternative":alt,"provider":provider,"model":model,"quality_score":quality_score,"ocr_fallback":bool(ocr_fallback_text),"ocr_text":ocr_fallback_text}
         elif isinstance(ai_reply,str) and ai_reply.strip():
             raise HTTPException(502,"El proveedor no devolvió dos respuestas estructuradas y diferentes. Puedes reintentar.")
         else:
