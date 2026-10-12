@@ -173,7 +173,9 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
             raise ProviderError("No hay un proveedor de IA con visión configurado. Configura GEMINI_API_KEY u OPENROUTER_API_KEY.")
         raise ProviderError("No hay proveedores de IA configurados para generar respuestas.")
 
+    provider_failures = []
     for name, call in providers:
+        provider_started = time.monotonic()
         try:
             answer = _with_retry(call)
             if isinstance(answer, str) and answer.strip():
@@ -183,20 +185,25 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
                     return {**structured, "provider": name}
                 # Do not silently present malformed model output as a valid two-reply result.
                 logger.warning("AI provider returned unstructured output: %s", name)
+                provider_failures.append({"provider": name, "error_code": "invalid_response", "latency_ms": int((time.monotonic()-provider_started)*1000)})
                 continue
             logger.warning("AI provider returned an empty response: %s", name)
+            provider_failures.append({"provider": name, "error_code": "empty_response", "latency_ms": int((time.monotonic()-provider_started)*1000)})
         except ProviderError as exc:
             logger.warning("AI provider failed: %s (error_type=%s)", name, type(exc).__name__)
+            provider_failures.append({"provider": name, "error_code": type(exc).__name__, "latency_ms": int((time.monotonic()-provider_started)*1000)})
             continue
     logger.warning("AI providers exhausted; refusing local fallback")
-    raise ProviderError("No se pudo generar una respuesta con la IA. Comprueba la configuración del proveedor e inténtalo de nuevo.")
+    error = ProviderError("No se pudo generar una respuesta con la IA. Comprueba la configuración del proveedor e inténtalo de nuevo.")
+    error.provider_failures = provider_failures
+    raise error
 
 
 def _gemini(prompt: str, content: Any) -> str:
     import base64
 
     key = os.environ["GEMINI_API_KEY"]
-    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
     # Interactions API: el prompt y el contenido del usuario
     # se envían como bloques de texto.

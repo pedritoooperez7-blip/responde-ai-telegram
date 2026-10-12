@@ -290,8 +290,36 @@ class TestVisualAnalysis(unittest.TestCase):
                 self.assertEqual(r.json()['reply'],'Respuesta contextual')
                 self.assertEqual(r.json()['alternative'],'Otra alternativa')
                 self.assertEqual(r.json()['provider'],'gemini')
+                self.assertEqual(r.json()['model'], 'gemini-2.5-flash')
+                self.assertGreaterEqual(r.json()['quality_score'], 1)
+                self.assertLessEqual(r.json()['quality_score'], 100)
+                conn=main.db()
+                event=conn.execute("SELECT * FROM ai_generation_events WHERE analysis_id=? ORDER BY id DESC LIMIT 1",(attempt.json()['analysis_id'],)).fetchone()
+                conn.close()
+                self.assertIsNotNone(event)
+                self.assertEqual(event['status'],'success')
+                self.assertEqual(event['provider'],'gemini')
+                self.assertNotIn('texto OCR', str(dict(event)))
                 self.assertEqual(provider.call_args.args[2],module)
                 self.assertEqual(provider.call_args.args[3],image)
+
+
+    def test_failed_generation_is_logged_without_raw_error_content(self):
+        from unittest.mock import patch
+        uid='monitor-failed-generation'
+        headers=auth(uid)
+        attempt=client.post('/api/analyze',headers=headers,json={'user_id':uid,'module':'chat','mode':'coquetear'})
+        self.assertEqual(attempt.status_code,200,attempt.text)
+        with patch.object(main, 'ai_generate_reply', side_effect=RuntimeError('secret api_key=SHOULD_NOT_BE_STORED')):
+            r=client.post('/api/generate-reply',headers=headers,json={'user_id':uid,'module':'chat','mode':'coquetear','text':'hola','analysis_id':attempt.json()['analysis_id']})
+        self.assertEqual(r.status_code,503)
+        conn=main.db()
+        event=conn.execute("SELECT * FROM ai_generation_events WHERE analysis_id=? ORDER BY id DESC LIMIT 1",(attempt.json()['analysis_id'],)).fetchone()
+        conn.close()
+        self.assertIsNotNone(event)
+        self.assertEqual(event['status'],'error')
+        self.assertEqual(event['error_code'],'RuntimeError')
+        self.assertNotIn('SHOULD_NOT_BE_STORED',str(dict(event)))
 
     def test_invalid_visual_payload_rejected(self):
         uid='visual-invalid'; headers=auth(uid)
@@ -315,3 +343,37 @@ class TestAIReplyQualityHelpers(unittest.TestCase):
         import ai_providers
         result = ai_providers._parse_replies('{"reply":"¿A qué hora sales?","alternative":"¿Qué planes tienes después?"}')
         self.assertEqual(result, {"reply":"¿A qué hora sales?","alternative":"¿Qué planes tienes después?"})
+
+
+class TestAIMonitorSecurity(unittest.TestCase):
+    def test_monitor_requires_admin_authentication(self):
+        self.assertEqual(client.get('/api/admin/ai-monitor').status_code, 401)
+
+    def test_owner_can_access_monitor_and_response_has_safe_metadata(self):
+        login=client.post('/api/admin/login',json={'master_key':'dummy-admin-key-for-tests','username':'','password':''})
+        self.assertEqual(login.status_code,200,login.text)
+        headers={'Authorization':'Bearer '+login.json()['token']}
+        r=client.get('/api/admin/ai-monitor',headers=headers)
+        self.assertEqual(r.status_code,200,r.text)
+        data=r.json()
+        self.assertIn('summary',data)
+        self.assertIn('providers',data)
+        self.assertIn('users',data)
+        self.assertIn('events',data)
+        self.assertIn('quality_note',data)
+        serialized=str(data).lower()
+        self.assertNotIn('api_key',serialized)
+        self.assertNotIn('texto ocr',serialized)
+
+    def test_admin_without_ai_permission_is_forbidden(self):
+        uid='limited-admin'
+        salt=os.urandom(16)
+        digest=salt.hex()+':'+__import__('hashlib').pbkdf2_hmac('sha256',b'long-password-123',salt,180000).hex()
+        conn=main.db()
+        conn.execute("INSERT INTO admin_users(username,password_hash,permissions,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                     (uid,digest,'["users"]',1,main.now(),main.now()))
+        conn.commit(); conn.close()
+        login=client.post('/api/admin/login',json={'username':uid,'password':'long-password-123','master_key':''})
+        self.assertEqual(login.status_code,200,login.text)
+        r=client.get('/api/admin/ai-monitor',headers={'Authorization':'Bearer '+login.json()['token']})
+        self.assertEqual(r.status_code,403)
