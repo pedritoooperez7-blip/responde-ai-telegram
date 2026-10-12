@@ -384,7 +384,7 @@ def api_usage(p:Usage, request:Request):
 
 def _ai_model_for(provider: str) -> str:
     env_names = {"gemini": "GEMINI_MODEL", "groq": "GROQ_MODEL", "openrouter": "OPENROUTER_MODEL", "cohere": "COHERE_MODEL"}
-    defaults = {"gemini": "gemini-2.5-flash", "groq": "llama-3.3-70b-versatile", "openrouter": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "cohere": "command-r7b-12-2024"}
+    defaults = {"gemini": "gemini-3.8-flash", "groq": "llama-3.3-70b-versatile", "openrouter": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "cohere": "command-r7b-12-2024"}
     return os.getenv(env_names.get(provider, ""), defaults.get(provider, "desconocido"))
 
 

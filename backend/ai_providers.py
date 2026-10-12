@@ -14,7 +14,7 @@ class ProviderError(Exception):
     def __str__(self): return self.message
 
 
-def _request_json(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float = 25) -> dict[str, Any]:
+def _request_json(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float = 12) -> dict[str, Any]:
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, headers={**headers, "Content-Type": "application/json"}, method="POST")
     try:
@@ -76,10 +76,10 @@ def _request_json(url: str, headers: dict[str, str], body: dict[str, Any], timeo
 
 
 def _with_retry(call):
-    for attempt in range(3):
+    for attempt in range(2):
         try: return call()
         except ProviderError as exc:
-            if not exc.transient or attempt == 2: raise
+            if not exc.transient or attempt == 1: raise
             delay = exc.retry_after if exc.retry_after is not None else min(0.5 * (2 ** attempt), 4)
             time.sleep(delay)
 
@@ -177,7 +177,7 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
     for name, call in providers:
         provider_started = time.monotonic()
         try:
-            answer = _with_retry(call)
+            answer = call()
             if isinstance(answer, str) and answer.strip():
                 logger.info("AI provider success: %s", name)
                 structured = _parse_replies(answer)
@@ -203,7 +203,7 @@ def _gemini(prompt: str, content: Any) -> str:
     import base64
 
     key = os.environ["GEMINI_API_KEY"]
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
     # Interactions API: el prompt y el contenido del usuario
     # se envían como bloques de texto.
@@ -306,7 +306,12 @@ def _openai_compatible(url: str, key: str, model: str, prompt: str, content: Any
         message = first_choice["message"]
     except (KeyError, IndexError, TypeError):
         logging.getLogger(__name__).warning(
-            "AI provider returned an unexpected response structure"
+            "AI provider returned an unexpected response structure "
+            "(top_level_type=%s, top_level_keys=%s, choices_type=%s, choices_count=%s)",
+            type(data).__name__,
+            sorted(str(k) for k in data.keys())[:20] if isinstance(data, dict) else [],
+            type(data.get("choices")).__name__ if isinstance(data, dict) else "unavailable",
+            len(data["choices"]) if isinstance(data, dict) and isinstance(data.get("choices"), list) else "unavailable",
         )
         raise ProviderError("Respuesta inválida del proveedor") from None
 
