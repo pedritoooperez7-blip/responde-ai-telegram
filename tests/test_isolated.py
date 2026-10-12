@@ -290,7 +290,7 @@ class TestVisualAnalysis(unittest.TestCase):
                 self.assertEqual(r.json()['reply'],'Respuesta contextual')
                 self.assertEqual(r.json()['alternative'],'Otra alternativa')
                 self.assertEqual(r.json()['provider'],'gemini')
-                self.assertEqual(r.json()['model'], 'gemini-2.5-flash')
+                self.assertEqual(r.json()['model'], 'gemini-3.8-flash')
                 self.assertGreaterEqual(r.json()['quality_score'], 1)
                 self.assertLessEqual(r.json()['quality_score'], 100)
                 conn=main.db()
