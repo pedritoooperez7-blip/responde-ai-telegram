@@ -120,6 +120,13 @@ def init_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT NOT NULL, action TEXT NOT NULL,
       target TEXT, details TEXT, created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS ai_generation_events(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      analysis_id TEXT, user_id TEXT NOT NULL, module TEXT, mode TEXT,
+      provider TEXT, model TEXT, status TEXT NOT NULL, error_code TEXT,
+      latency_ms INTEGER NOT NULL DEFAULT 0, quality_score INTEGER,
+      retry_number INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+    );
     """)
     for sql in (
         "ALTER TABLE users ADD COLUMN payment_phone TEXT",
@@ -136,6 +143,9 @@ def init_db():
             c.execute(sql)
         except sqlite3.OperationalError:
             pass
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ai_events_created ON ai_generation_events(created_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ai_events_user ON ai_generation_events(user_id, created_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ai_events_provider ON ai_generation_events(provider, status)")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_transaction ON payment_operations(transaction_id) WHERE transaction_id IS NOT NULL AND transaction_id != ''")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_source_sms ON payment_operations(source_sms) WHERE source_sms IS NOT NULL AND source_sms != ''")
     c.commit(); c.close()
@@ -296,7 +306,7 @@ def admin_identity(request: Request):
             raise HTTPException(401, "Sesión administrativa expirada")
         username = str(data.get("username", ""))
         if username == "owner" and data.get("role") == "owner":
-            return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings", "audit"]}
+            return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics"]}
         c = db()
         row = c.execute("SELECT * FROM admin_users WHERE username=? AND is_active=1", (username,)).fetchone()
         c.close()
@@ -371,6 +381,40 @@ def auth_telegram(p:TelegramAuth):
 def api_usage(p:Usage, request:Request):
     uid=current_user(request)
     return usage(uid)
+
+def _ai_model_for(provider: str) -> str:
+    env_names = {"gemini": "GEMINI_MODEL", "groq": "GROQ_MODEL", "openrouter": "OPENROUTER_MODEL", "cohere": "COHERE_MODEL"}
+    defaults = {"gemini": "gemini-2.5-flash", "groq": "llama-3.3-70b-versatile", "openrouter": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "cohere": "command-r7b-12-2024"}
+    return os.getenv(env_names.get(provider, ""), defaults.get(provider, "desconocido"))
+
+
+def _quality_estimate(reply: str, alternative: str, context: str, mode: str) -> int:
+    """Heuristic diagnostic only; it is not a semantic quality guarantee."""
+    a, b = reply.strip(), alternative.strip()
+    score = 45
+    if len(a) >= 12: score += 10
+    if len(b) >= 12: score += 10
+    if len(a) >= 25 and len(b) >= 25: score += 5
+    if a.casefold() != b.casefold(): score += 10
+    if len(set(a.casefold().split()) & set(b.casefold().split())) / max(1, len(set(a.casefold().split()) | set(b.casefold().split()))) < 0.8: score += 8
+    if context.strip(): score += 5
+    if mode in {"gracioso", "coquetear", "enamorar", "provocativo", "salvar"}: score += 5
+    return max(1, min(100, score))
+
+
+def _record_ai_event(analysis_id, user_id, module, mode, provider, model, status, error_code, latency_ms, quality_score, retry_number):
+    # Store operational metadata only: never prompts, OCR, images, replies, API keys or raw provider errors.
+    c = db()
+    try:
+        c.execute("""INSERT INTO ai_generation_events
+        (analysis_id,user_id,module,mode,provider,model,status,error_code,latency_ms,quality_score,retry_number,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (analysis_id, str(user_id), module, mode, (provider or "unknown")[:40], (model or "unknown")[:120],
+         status, (error_code or "")[:80], max(0, int(latency_ms)), quality_score, int(retry_number), now()))
+        c.commit()
+    finally:
+        c.close()
+
 
 @app.post("/api/analyze")
 def analyze(p:Analyze, request:Request):
@@ -490,28 +534,48 @@ def generate(p:Generate, request:Request):
     finally:
         c.close()
 
+    generation_started = time.monotonic()
+    provider = "unknown"
+    model = "unknown"
+    retry_number = 1 if int(attempt["retry_used"] or 0) else 0
     try:
         ai_reply=ai_generate_reply(t,mode,module,image_data_url or None)
         if isinstance(ai_reply,dict):
             reply=ai_reply.get("reply")
             alternative=ai_reply.get("alternative")
             provider=str(ai_reply.get("provider") or "desconocido")
+            model=_ai_model_for(provider)
             if not isinstance(reply,str) or not reply.strip():
                 raise HTTPException(502,"El proveedor de IA no devolvió una respuesta válida. Puedes reintentar.")
             alt=alternative.strip()[:1200] if isinstance(alternative,str) and alternative.strip() else ""
             if not alt or alt.casefold()==reply.strip().casefold():
                 raise HTTPException(502,"La IA no generó dos respuestas diferentes. Puedes reintentar.")
-            result={"success":True,"reply":reply.strip()[:1200],"alternative":alt,"provider":provider}
+            quality_score = _quality_estimate(reply.strip(), alt, t, mode)
+            result={"success":True,"reply":reply.strip()[:1200],"alternative":alt,"provider":provider,"model":model,"quality_score":quality_score}
         elif isinstance(ai_reply,str) and ai_reply.strip():
-            reply=ai_reply.strip()[:1200]
-            result={"success":True,"reply":reply,"alternative":"Otra opción, con un enfoque diferente: "+reply[:900],"provider":"desconocido"}
+            raise HTTPException(502,"El proveedor no devolvió dos respuestas estructuradas y diferentes. Puedes reintentar.")
         else:
             raise HTTPException(503,"La IA no está disponible en este momento. Puedes reintentar.")
-    except HTTPException:
+    except HTTPException as exc:
+        _record_ai_event(p.analysis_id, uid, module, mode, provider, model, "error",
+                         f"http_{exc.status_code}", int((time.monotonic()-generation_started)*1000), None, retry_number)
         raise
     except Exception as exc:
         import logging
-        logging.getLogger(__name__).exception("Error generando respuesta con IA")
+        # Avoid logging exception messages or tracebacks that may contain provider payloads.
+        logging.getLogger(__name__).error("Error generando respuesta con IA (tipo=%s)", type(exc).__name__)
+        failures = getattr(exc, "provider_failures", None)
+        elapsed = int((time.monotonic()-generation_started)*1000)
+        if failures:
+            for failure in failures:
+                failed_provider = str(failure.get("provider") or "unknown")
+                _record_ai_event(p.analysis_id, uid, module, mode, failed_provider,
+                                 _ai_model_for(failed_provider), "error",
+                                 str(failure.get("error_code") or type(exc).__name__),
+                                 int(failure.get("latency_ms") or elapsed), None, retry_number)
+        else:
+            _record_ai_event(p.analysis_id, uid, module, mode, provider, model, "error",
+                             type(exc).__name__, elapsed, None, retry_number)
         raise HTTPException(503,"No se pudo generar la respuesta con la IA. Comprueba la configuración del proveedor e inténtalo de nuevo.") from exc
     finally:
         # Always release the in-flight lock. Failed generations do not consume a generation.
@@ -528,6 +592,8 @@ def generate(p:Generate, request:Request):
             raise
         finally:
             c.close()
+    _record_ai_event(p.analysis_id, uid, module, mode, result.get("provider"), result.get("model"), "success", "",
+                     int((time.monotonic()-generation_started)*1000), result.get("quality_score"), retry_number)
     return result
 
 
@@ -1037,7 +1103,7 @@ def status(p:PaymentId, request:Request):
 @app.post("/api/admin/login")
 def admin_login(p: AdminLogin):
     if not ADMIN_KEY: raise HTTPException(503,"ADMIN_KEY no configurado en Railway")
-    username="owner"; permissions=["users","premium","payments","stats","admins","settings","audit"]
+    username="owner"; permissions=["users","premium","payments","stats","admins","settings","audit","ai_analytics"]
     if p.master_key and hmac.compare_digest(p.master_key, ADMIN_KEY):
         pass
     else:
@@ -1086,7 +1152,7 @@ def admin_list(request:Request):
 def admin_create(p:AdminCreate, request:Request):
     ident=admin(request,"admins"); username=re.sub(r"[^a-zA-Z0-9_.-]","",p.username.strip())
     if len(username)<3 or len(p.password)<10: raise HTTPException(400,"Usuario mínimo 3 caracteres y contraseña mínimo 10")
-    allowed={"users","premium","payments","stats","audit"}; perms=sorted(set(p.permissions)&allowed)
+    allowed={"users","premium","payments","stats","audit","ai_analytics"}; perms=sorted(set(p.permissions)&allowed)
     if not perms: raise HTTPException(400,"Selecciona al menos un permiso")
     salt=os.urandom(16); digest=salt.hex()+":"+hashlib.pbkdf2_hmac("sha256",p.password.encode(),salt,180000).hex(); t=now(); c=db()
     try: c.execute("INSERT INTO admin_users(username,password_hash,permissions,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?)",(username,digest,json.dumps(perms),1,t,t)); c.commit()
@@ -1177,6 +1243,79 @@ def reject_payment(p: PaymentReview, request:Request):
 @app.get("/api/admin/stats")
 def admin_stats(request:Request):
     admin(request,"stats"); c=db(); out={"total_users":c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"],"premium_users":c.execute("SELECT COUNT(*) n FROM users WHERE premium_until>?",(now(),)).fetchone()["n"],"today_usage":c.execute("SELECT COUNT(*) n FROM usage_logs WHERE used_at>=?",(today()+"T00:00:00",)).fetchone()["n"],"pending_payments":c.execute("SELECT COUNT(*) n FROM payment_operations WHERE status IN ('pending','proof_submitted')").fetchone()["n"]}; c.close(); return out
+
+@app.get("/api/admin/ai-monitor")
+def admin_ai_monitor(request: Request):
+    admin(request, "ai_analytics")
+    c = db()
+    try:
+        today_start = today() + "T00:00:00"
+        totals = c.execute("""
+          SELECT COUNT(*) total,
+                 SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) successes,
+                 SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) failures,
+                 COUNT(DISTINCT user_id) users,
+                 AVG(CASE WHEN status='success' THEN latency_ms END) avg_latency,
+                 AVG(CASE WHEN status='success' THEN quality_score END) avg_quality
+          FROM ai_generation_events WHERE created_at >= ?
+        """, (today_start,)).fetchone()
+        provider_rows = c.execute("""
+          SELECT provider, model, COUNT(*) total,
+                 SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) successes,
+                 SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) failures,
+                 AVG(latency_ms) avg_latency,
+                 AVG(quality_score) avg_quality
+          FROM ai_generation_events GROUP BY provider, model ORDER BY total DESC LIMIT 30
+        """).fetchall()
+        user_rows = c.execute("""
+          SELECT u.user_id, COALESCE(NULLIF(u.username,''), NULLIF(TRIM(COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'')),''), 'Usuario') display_name,
+                 u.usage_today, u.premium_until,
+                 COUNT(e.id) total_attempts,
+                 (SELECT COUNT(*) FROM analysis_attempts aa WHERE aa.user_id=u.user_id) total_analyses,
+                 SUM(CASE WHEN e.status='success' THEN 1 ELSE 0 END) successes,
+                 SUM(CASE WHEN e.status='error' THEN 1 ELSE 0 END) failures,
+                 AVG(e.quality_score) avg_quality,
+                 (SELECT e2.model FROM ai_generation_events e2 WHERE e2.user_id=u.user_id ORDER BY e2.id DESC LIMIT 1) last_model,
+                 (SELECT e3.provider FROM ai_generation_events e3 WHERE e3.user_id=u.user_id ORDER BY e3.id DESC LIMIT 1) last_provider
+          FROM users u LEFT JOIN ai_generation_events e ON e.user_id=u.user_id
+          GROUP BY u.user_id ORDER BY total_attempts DESC, u.created_at DESC LIMIT 200
+        """).fetchall()
+        event_rows = c.execute("""
+          SELECT e.created_at, COALESCE(NULLIF(u.username,''), NULLIF(TRIM(COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'')),''), 'Usuario') display_name,
+                 e.provider, e.model, e.status, e.error_code, e.latency_ms, e.quality_score, e.retry_number, e.module, e.mode
+          FROM ai_generation_events e LEFT JOIN users u ON u.user_id=e.user_id
+          ORDER BY e.id DESC LIMIT 100
+        """).fetchall()
+        days = c.execute("""
+          SELECT substr(created_at,1,10) day,
+                 SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) successes,
+                 SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) failures
+          FROM ai_generation_events WHERE created_at >= ? GROUP BY substr(created_at,1,10) ORDER BY day
+        """, ((datetime.utcnow()-timedelta(days=6)).isoformat(),)).fetchall()
+        total=int(totals["total"] or 0); successes=int(totals["successes"] or 0); failures=int(totals["failures"] or 0)
+        return {
+          "summary":{"today_events":total,"successes":successes,"failures":failures,
+                     "success_rate":round(successes*100/total,1) if total else 0,
+                     "unique_users":int(totals["users"] or 0),
+                     "avg_latency_ms":round(totals["avg_latency"] or 0),
+                     "avg_quality":round(totals["avg_quality"] or 0,1)},
+          "providers":[{**dict(r),"total":int(r["total"] or 0),"successes":int(r["successes"] or 0),
+                        "failures":int(r["failures"] or 0),"avg_latency":round(r["avg_latency"] or 0),
+                        "avg_quality":round(r["avg_quality"] or 0,1)} for r in provider_rows],
+          "users":[{**dict(r),"remaining_attempts":max(0, FREE_DAILY_LIMIT-int(r["usage_today"] or 0)),
+                    "successes":int(r["successes"] or 0),"failures":int(r["failures"] or 0),
+                    "total_attempts":int(r["total_attempts"] or 0),
+                    "total_analyses":int(r["total_analyses"] or 0),
+                    "success_rate":round(int(r["successes"] or 0)*100/max(1,int(r["total_attempts"] or 0)),1),
+                    "avg_quality":round(r["avg_quality"] or 0,1),
+                    "premium":bool(r["premium_until"] and r["premium_until"]>now())} for r in user_rows],
+          "events":[dict(r) for r in event_rows],
+          "days":[dict(r) for r in days],
+          "quality_note":"Puntuación heurística estimada (1–100), no evaluación semántica objetiva. No se guardan imágenes, textos de conversación, respuestas ni claves API."
+        }
+    finally:
+        c.close()
+
 
 @app.get("/api/admin/payments")
 def admin_payments(request:Request):
