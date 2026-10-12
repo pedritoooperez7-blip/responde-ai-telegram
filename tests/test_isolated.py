@@ -304,6 +304,74 @@ class TestVisualAnalysis(unittest.TestCase):
                 self.assertEqual(provider.call_args.args[3],image)
 
 
+    def test_visual_provider_failure_falls_back_to_ocr_and_text_provider(self):
+        from unittest.mock import patch
+        uid = 'visual-ocr-fallback'
+        headers = auth(uid)
+        attempt = client.post('/api/analyze', headers=headers, json={
+            'user_id': uid, 'module': 'chat', 'mode': 'coquetear'
+        })
+        self.assertEqual(attempt.status_code, 200, attempt.text)
+        image = 'data:image/jpeg;base64,' + ('a' * 64)
+        fallback = {
+            'reply': 'Podríamos hablar un rato.',
+            'alternative': '¿Qué planes tienes hoy?',
+            'provider': 'groq',
+        }
+        recognized = '¿Quieres salir a cenar?'
+        with patch.object(main, 'ai_generate_reply', side_effect=[
+            main.ProviderError('No hay un proveedor de IA con visión configurado.'),
+            fallback,
+        ]) as provider, patch.object(main, '_decode_ocr_image', return_value='decoded-image') as decoder, patch.object(main, '_ocr_text', return_value=recognized) as ocr:
+            response = client.post('/api/generate-reply', headers=headers, json={
+                'user_id': uid, 'module': 'chat', 'mode': 'coquetear',
+                'text': '', 'image': image, 'analysis_id': attempt.json()['analysis_id'],
+            })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['reply'], fallback['reply'])
+        self.assertEqual(response.json()['provider'], 'groq')
+        self.assertTrue(response.json()['ocr_fallback'])
+        self.assertEqual(response.json()['ocr_text'], recognized)
+        self.assertEqual(provider.call_count, 2)
+        self.assertEqual(provider.call_args_list[0].args[3], image)
+        self.assertEqual(provider.call_args_list[1].args[0], recognized)
+        self.assertIsNone(provider.call_args_list[1].args[3])
+        decoder.assert_called_once()
+        ocr.assert_called_once()
+
+        conn = main.db()
+        event = conn.execute(
+            'SELECT * FROM ai_generation_events WHERE analysis_id=? ORDER BY id DESC LIMIT 1',
+            (attempt.json()['analysis_id'],),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(event['status'], 'success')
+        self.assertEqual(event['provider'], 'groq')
+        self.assertNotIn(recognized, str(dict(event)))
+
+    def test_successful_visual_provider_does_not_run_ocr(self):
+        from unittest.mock import patch
+        uid = 'visual-no-ocr'
+        headers = auth(uid)
+        attempt = client.post('/api/analyze', headers=headers, json={
+            'user_id': uid, 'module': 'chat', 'mode': 'coquetear'
+        })
+        image = 'data:image/jpeg;base64,' + ('a' * 64)
+        with patch.object(main, 'ai_generate_reply', return_value={
+            'reply': 'Respuesta contextual',
+            'alternative': 'Otra respuesta contextual',
+            'provider': 'gemini',
+        }), patch.object(main, '_ocr_text') as ocr:
+            response = client.post('/api/generate-reply', headers=headers, json={
+                'user_id': uid, 'module': 'chat', 'mode': 'coquetear',
+                'image': image, 'analysis_id': attempt.json()['analysis_id'],
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()['ocr_fallback'])
+        self.assertEqual(response.json()['ocr_text'], '')
+        ocr.assert_not_called()
+
     def test_failed_generation_is_logged_without_raw_error_content(self):
         from unittest.mock import patch
         uid='monitor-failed-generation'
