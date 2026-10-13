@@ -1,9 +1,14 @@
 """Isolated regression/security tests. Uses only a temporary SQLite database and dummy secrets."""
 import base64
+from datetime import datetime, timedelta, timezone
+import hashlib
 import io
+import json
 import os
 import tempfile
+import time
 import unittest
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -183,6 +188,50 @@ class TestHardening(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
+class TestAdministrativeSessionDurations(unittest.TestCase):
+    def test_owner_session_is_90_days_and_logout_revokes_it(self):
+        login = client.post('/api/admin/login', json={'master_key': main.ADMIN_KEY})
+        self.assertEqual(login.status_code, 200, login.text)
+        data = login.json()
+        self.assertEqual(data['session_days'], 90)
+        claims = json.loads(main._b64d(data['token'].split('.', 1)[0]).decode())
+        self.assertAlmostEqual(claims['exp'] - time.time(), 90 * 24 * 60 * 60, delta=5)
+        headers = {'Authorization': 'Bearer ' + data['token']}
+        self.assertEqual(client.get('/api/admin/me', headers=headers).status_code, 200)
+        self.assertEqual(client.post('/api/admin/logout', headers=headers, json={}).status_code, 200)
+        self.assertEqual(client.get('/api/admin/me', headers=headers).status_code, 401)
+
+    def test_regular_admin_session_is_7_days(self):
+        username = 'ttl-admin-' + uuid.uuid4().hex[:8]
+        password = 'Test-password-42!'
+        salt = os.urandom(16)
+        digest = salt.hex() + ':' + hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 180000).hex()
+        c = main.db()
+        c.execute('INSERT INTO admin_users(username,password_hash,permissions,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?)',
+                  (username, digest, json.dumps(['users']), 1, main.now(), main.now()))
+        c.commit(); c.close()
+        login = client.post('/api/admin/login', json={'username': username, 'password': password})
+        self.assertEqual(login.status_code, 200, login.text)
+        data = login.json()
+        self.assertEqual(data['session_days'], 7)
+        claims = json.loads(main._b64d(data['token'].split('.', 1)[0]).decode())
+        self.assertAlmostEqual(claims['exp'] - time.time(), 7 * 24 * 60 * 60, delta=5)
+
+
+    def test_admin_premium_extension_preserves_remaining_time(self):
+        login = client.post('/api/admin/login', json={'master_key': main.ADMIN_KEY})
+        self.assertEqual(login.status_code, 200, login.text)
+        headers = {'Authorization': 'Bearer ' + login.json()['token']}
+        uid = 'premium-renewal-' + uuid.uuid4().hex[:8]
+        future = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        main.user(uid, {'premium_until': future})
+        response = client.post('/api/admin/premium', headers=headers, json={
+            'user_id': uid, 'action': 'extend', 'days': 30
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        expiry = main._utc_datetime(response.json()['premium_until'])
+        self.assertAlmostEqual((expiry - datetime.now(timezone.utc)).total_seconds(), 35 * 86400, delta=10)
+
 class TestPremiumAndRetries(unittest.TestCase):
     def test_free_user_cannot_use_premium_mode(self):
         r = client.post('/api/analyze', headers=auth('premium-denied'), json={'user_id':'x','module':'chat','mode':'provocativo'})
@@ -199,7 +248,7 @@ class TestPremiumAndRetries(unittest.TestCase):
         self.assertEqual(main.usage(uid)['remaining'], 999)
         self.assertEqual(main.usage(uid)['used_today'], 0)
 
-    def test_retry_is_reserved_then_released_after_failure(self):
+    def test_retry_is_reserved_and_never_reopened_after_failure(self):
         uid='retry-state'
         headers=auth(uid)
         created=client.post('/api/analyze',headers=headers,json={'user_id':uid,'module':'chat','mode':'coquetear'}).json()
@@ -207,9 +256,12 @@ class TestPremiumAndRetries(unittest.TestCase):
         self.assertEqual(client.post('/api/retry',headers=headers,json=payload).status_code,200)
         c=main.db(); value=c.execute('SELECT retry_used FROM analysis_attempts WHERE id=?',(created['analysis_id'],)).fetchone()[0]; c.close()
         self.assertEqual(value,1)
-        self.assertEqual(client.post('/api/retry/release',headers=headers,json=payload).status_code,200)
+        released=client.post('/api/retry/release',headers=headers,json=payload)
+        self.assertEqual(released.status_code,200)
+        self.assertFalse(released.json()['released'])
         c=main.db(); value=c.execute('SELECT retry_used FROM analysis_attempts WHERE id=?',(created['analysis_id'],)).fetchone()[0]; c.close()
-        self.assertEqual(value,0)
+        self.assertEqual(value,1)
+        self.assertEqual(client.post('/api/retry',headers=headers,json=payload).status_code,409)
 
 
     def test_retry_release_cannot_reset_a_successful_retry(self):
@@ -247,6 +299,41 @@ class TestPremiumAndRetries(unittest.TestCase):
             'analysis_id': aid, 'text': payload['text']
         })
         self.assertEqual(again.status_code, 409, again.text)
+
+    def test_failed_retry_provider_call_cannot_be_repeated_with_new_key(self):
+        from unittest.mock import patch
+        uid = 'retry-provider-failure-once'
+        headers = auth(uid)
+        created = client.post('/api/analyze', headers=headers, json={
+            'user_id': uid, 'module': 'chat', 'mode': 'coquetear'
+        })
+        self.assertEqual(created.status_code, 200, created.text)
+        aid = created.json()['analysis_id']
+        base_payload = {
+            'user_id': uid, 'module': 'chat', 'mode': 'coquetear',
+            'text': 'hola', 'analysis_id': aid, 'idempotency_key': 'initial-generation-key'
+        }
+        with patch.object(main, '_generate_with_ocr_fallback', return_value=({
+            'reply': 'Respuesta original', 'alternative': 'Otra respuesta original', 'provider': 'test-provider'
+        }, '')):
+            first = client.post('/api/generate-reply', headers=headers, json=base_payload)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(client.post('/api/retry', headers=headers, json={
+            'analysis_id': aid, 'text': 'hola'
+        }).status_code, 200)
+        retry_payload = {**base_payload, 'idempotency_key': 'single-retry-attempt-key'}
+        with patch.object(main, '_generate_with_ocr_fallback', side_effect=main.HTTPException(503, 'provider unavailable')):
+            failed = client.post('/api/generate-reply', headers=headers, json=retry_payload)
+        self.assertEqual(failed.status_code, 503)
+        repeated = client.post('/api/generate-reply', headers=headers, json={
+            **base_payload, 'idempotency_key': 'attacker-new-key'
+        })
+        self.assertEqual(repeated.status_code, 409, repeated.text)
+        c = main.db()
+        row = c.execute('SELECT retry_used, retry_call_started FROM analysis_attempts WHERE id=?', (aid,)).fetchone()
+        c.close()
+        self.assertEqual(row['retry_used'], 1)
+        self.assertEqual(row['retry_call_started'], 1)
 
     def test_retry_cannot_be_claimed_twice(self):
         uid='retry-once'
