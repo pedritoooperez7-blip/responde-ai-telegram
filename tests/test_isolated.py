@@ -28,6 +28,14 @@ def auth(uid="test-user"):
     return {"Authorization": "Bearer " + main.session_token(uid)}
 
 
+def valid_image_data_url():
+    """Small real JPEG fixture for image-validation and visual-flow tests."""
+    image = main.Image.new("RGB", (2, 2), (240, 240, 240))
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG")
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
 class TestHardening(unittest.TestCase):
     def test_health(self):
         self.assertEqual(client.get("/health").status_code, 200)
@@ -64,6 +72,9 @@ class TestHardening(unittest.TestCase):
     def test_ocr_requires_auth(self):
         self.assertEqual(client.post("/ocr", content=b"bad-image").status_code, 401)
 
+    def test_ocr_base64_requires_auth(self):
+        self.assertEqual(client.post("/ocr-base64", json={"image": "data:image/png;base64,AAAA"}).status_code, 401)
+
     def test_ocr_rejects_invalid_image_safely(self):
         r = client.post("/ocr", headers=auth("ocr-user"), content=b"not an image")
         self.assertEqual(r.status_code, 400)
@@ -75,7 +86,7 @@ class TestHardening(unittest.TestCase):
 
     def test_base64_ocr_size_limit(self):
         oversized = base64.b64encode(b"x" * (8 * 1024 * 1024 + 1)).decode()
-        r = client.post("/ocr-base64", json={"image":oversized})
+        r = client.post("/ocr-base64", headers=auth("ocr-base64-large"), json={"image":oversized})
         self.assertEqual(r.status_code, 413)
 
     def test_diagnostic_requires_secret(self):
@@ -180,7 +191,7 @@ class TestPremiumAndRetries(unittest.TestCase):
 
     def test_premium_user_can_use_premium_modes_without_free_quota(self):
         uid = 'premium-allowed'
-        main.user(uid, {'premium_until': (main.datetime.utcnow() + main.timedelta(days=2)).isoformat()})
+        main.user(uid, {'premium_until': (main.datetime.now(main.timezone.utc) + main.timedelta(days=2)).isoformat()})
         headers = auth(uid)
         for _ in range(4):
             r = client.post('/api/analyze', headers=headers, json={'user_id':uid,'module':'chat','mode':'provocativo'})
@@ -275,12 +286,29 @@ class TestAIProviderRetries(unittest.TestCase):
             sleep.assert_not_called()
 
 class TestVisualAnalysis(unittest.TestCase):
+    def test_invalid_image_payload_is_rejected_before_provider_call(self):
+        from unittest.mock import patch
+        uid = "visual-invalid-payload"
+        headers = auth(uid)
+        attempt = client.post("/api/analyze", headers=headers, json={
+            "user_id": uid, "module": "chat", "mode": "coquetear"
+        })
+        self.assertEqual(attempt.status_code, 200, attempt.text)
+        with patch.object(main, "ai_generate_reply") as provider:
+            response = client.post("/api/generate-reply", headers=headers, json={
+                "user_id": uid, "module": "chat", "mode": "coquetear",
+                "text": "hola", "image": "data:image/jpeg;base64,not-valid-base64!",
+                "analysis_id": attempt.json()["analysis_id"],
+            })
+        self.assertEqual(response.status_code, 400, response.text)
+        provider.assert_not_called()
+
     def test_chat_and_story_forward_visual_context_to_shared_provider(self):
         from unittest.mock import patch
         uid='visual-premium'
-        main.user(uid, {'premium_until': (main.datetime.utcnow() + main.timedelta(days=2)).isoformat()})
+        main.user(uid, {'premium_until': (main.datetime.now(main.timezone.utc) + main.timedelta(days=2)).isoformat()})
         headers=auth(uid)
-        image='data:image/jpeg;base64,' + ('a' * 64)
+        image=valid_image_data_url()
         for module, mode in [('chat','coquetear'),('story','gracioso')]:
             attempt=client.post('/api/analyze',headers=headers,json={'user_id':uid,'module':module,'mode':mode})
             self.assertEqual(attempt.status_code,200,attempt.text)
@@ -312,7 +340,7 @@ class TestVisualAnalysis(unittest.TestCase):
             'user_id': uid, 'module': 'chat', 'mode': 'coquetear'
         })
         self.assertEqual(attempt.status_code, 200, attempt.text)
-        image = 'data:image/jpeg;base64,' + ('a' * 64)
+        image = valid_image_data_url()
         fallback = {
             'reply': 'Podríamos hablar un rato.',
             'alternative': '¿Qué planes tienes hoy?',
@@ -357,7 +385,7 @@ class TestVisualAnalysis(unittest.TestCase):
         attempt = client.post('/api/analyze', headers=headers, json={
             'user_id': uid, 'module': 'chat', 'mode': 'coquetear'
         })
-        image = 'data:image/jpeg;base64,' + ('a' * 64)
+        image = valid_image_data_url()
         with patch.object(main, 'ai_generate_reply', return_value={
             'reply': 'Respuesta contextual',
             'alternative': 'Otra respuesta contextual',
@@ -445,3 +473,289 @@ class TestAIMonitorSecurity(unittest.TestCase):
         self.assertEqual(login.status_code,200,login.text)
         r=client.get('/api/admin/ai-monitor',headers={'Authorization':'Bearer '+login.json()['token']})
         self.assertEqual(r.status_code,403)
+
+
+class TestCompleteAIFlow(unittest.TestCase):
+    def test_invalid_image_is_rejected_before_daily_quota_is_charged(self):
+        uid = "invalid-image-no-quota"
+        headers = auth(uid)
+        before = main.usage(uid)["used_today"]
+        response = client.post("/api/analyze", headers=headers, json={
+            "user_id": uid, "module": "chat", "mode": "coquetear",
+            "image": "data:image/jpeg;base64,bm90LWEtanBlZw==",
+        })
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(main.usage(uid)["used_today"], before)
+
+    def test_idempotency_replays_saved_response_without_second_provider_call(self):
+        from unittest.mock import patch
+        uid = "idempotent-generation"
+        headers = auth(uid)
+        analysis = client.post("/api/analyze", headers=headers, json={
+            "user_id": uid, "module": "chat", "mode": "coquetear"
+        }).json()
+        payload = {
+            "user_id": uid, "module": "chat", "mode": "coquetear",
+            "analysis_id": analysis["analysis_id"], "text": "¿Qué haces hoy?",
+            "idempotency_key": "stable-test-key-0001",
+        }
+        result = {"reply": "Podemos hablar un rato.", "alternative": "¿Tienes algún plan?", "provider": "test-provider"}
+        with patch.object(main, "ai_generate_reply", return_value=result) as provider:
+            first = client.post("/api/generate-reply", headers=headers, json=payload)
+            second = client.post("/api/generate-reply", headers=headers, json=payload)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(first.json(), second.json())
+        provider.assert_called_once()
+
+    def test_idempotency_key_cannot_be_reused_for_different_payload(self):
+        from unittest.mock import patch
+        uid = "idempotency-payload-mismatch"
+        headers = auth(uid)
+        analysis = client.post("/api/analyze", headers=headers, json={
+            "user_id": uid, "module": "chat", "mode": "coquetear"
+        }).json()
+        payload = {"user_id": uid, "module": "chat", "mode": "coquetear",
+                   "analysis_id": analysis["analysis_id"], "text": "Hola", "idempotency_key": "stable-test-key-0002"}
+        with patch.object(main, "ai_generate_reply", return_value={"reply": "Hola, ¿cómo va?", "alternative": "¿Qué tal?", "provider": "test-provider"}):
+            self.assertEqual(client.post("/api/generate-reply", headers=headers, json=payload).status_code, 200)
+            payload["text"] = "Un contenido diferente"
+            response = client.post("/api/generate-reply", headers=headers, json=payload)
+        self.assertEqual(response.status_code, 409, response.text)
+
+    def test_first_provider_failure_refunds_free_quota(self):
+        from unittest.mock import patch
+        uid = "provider-failure-refund"
+        headers = auth(uid)
+        before = main.usage(uid)["used_today"]
+        analysis = client.post("/api/analyze", headers=headers, json={
+            "user_id": uid, "module": "chat", "mode": "coquetear"
+        }).json()
+        self.assertEqual(main.usage(uid)["used_today"], before + 1)
+        with patch.object(main, "ai_generate_reply", side_effect=main.ProviderError("provider unavailable")):
+            response = client.post("/api/generate-reply", headers=headers, json={
+                "user_id": uid, "module": "chat", "mode": "coquetear",
+                "analysis_id": analysis["analysis_id"], "text": "Hola", "idempotency_key": "failure-refund-0001"
+            })
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(main.usage(uid)["used_today"], before)
+
+    def test_stale_generation_lock_is_recovered(self):
+        from unittest.mock import patch
+        uid = "stale-generation-lock"
+        headers = auth(uid)
+        analysis = client.post("/api/analyze", headers=headers, json={
+            "user_id": uid, "module": "chat", "mode": "coquetear"
+        }).json()
+        c = main.db()
+        c.execute("UPDATE analysis_attempts SET generation_in_progress=1,generation_started_at=? WHERE id=?",
+                  ((main.datetime.now(main.timezone.utc)-main.timedelta(minutes=5)).isoformat(), analysis["analysis_id"]))
+        c.commit(); c.close()
+        with patch.object(main, "ai_generate_reply", return_value={"reply": "Respuesta uno", "alternative": "Respuesta dos", "provider": "test-provider"}):
+            response = client.post("/api/generate-reply", headers=headers, json={
+                "user_id": uid, "module": "chat", "mode": "coquetear",
+                "analysis_id": analysis["analysis_id"], "text": "Hola", "idempotency_key": "stale-lock-0001"
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_event_logging_failure_does_not_break_success_response(self):
+        from unittest.mock import patch
+        import sqlite3
+        uid = "event-log-db-failure"
+        headers = auth(uid)
+        analysis = client.post("/api/analyze", headers=headers, json={
+            "user_id": uid, "module": "chat", "mode": "coquetear"
+        }).json()
+        real_db = main.db
+        calls = {"count": 0}
+        def fail_only_event_db():
+            calls["count"] += 1
+            # reservation and final lock use the first two connections; event logging is third.
+            if calls["count"] == 3:
+                raise sqlite3.OperationalError("test db logging failure")
+            return real_db()
+        with patch.object(main, "ai_generate_reply", return_value={
+            "reply": "Respuesta uno", "alternative": "Respuesta dos", "provider": "test-provider"
+        }), patch.object(main, "db", side_effect=fail_only_event_db):
+            response = client.post("/api/generate-reply", headers=headers, json={
+                "user_id": uid, "module": "chat", "mode": "coquetear",
+                "analysis_id": analysis["analysis_id"], "text": "Hola", "idempotency_key": "event-log-failure-0001"
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["reply"], "Respuesta uno")
+
+
+class TestImageValidationMatrix(unittest.TestCase):
+    def _data_url(self, fmt, mime=None, size=(8, 8)):
+        image = main.Image.new("RGB", size, (235, 235, 235))
+        buffer = io.BytesIO()
+        image.save(buffer, format=fmt)
+        raw = buffer.getvalue()
+        mime = mime or main.Image.MIME.get(fmt)
+        return "data:" + mime + ";base64," + base64.b64encode(raw).decode("ascii"), raw
+
+    def test_every_supported_image_format(self):
+        for fmt in ("PNG", "JPEG", "WEBP", "BMP", "TIFF"):
+            with self.subTest(fmt=fmt):
+                try:
+                    data_url, raw = self._data_url(fmt)
+                    self.assertEqual(main._validate_image_data_url(data_url), raw)
+                except (OSError, ValueError) as exc:
+                    self.skipTest(f"Pillow build cannot encode {fmt}: {exc}")
+
+    def test_mime_matching_is_case_insensitive_and_alias_is_normalized(self):
+        data_url, raw = self._data_url("PNG")
+        header, payload = data_url.split(",", 1)
+        self.assertEqual(main._validate_image_data_url(header.upper() + "," + payload), raw)
+        jpeg, jpeg_raw = self._data_url("JPEG", "image/jpg")
+        self.assertEqual(main._validate_image_data_url(jpeg), jpeg_raw)
+
+    def test_exact_byte_limit_is_accepted_and_one_byte_over_is_rejected(self):
+        data_url, raw = self._data_url("PNG")
+        with unittest.mock.patch.object(main, "MAX_OCR_BYTES", len(raw)):
+            self.assertEqual(main._validate_image_data_url(data_url), raw)
+        with unittest.mock.patch.object(main, "MAX_OCR_BYTES", len(raw) - 1):
+            with self.assertRaises(main.HTTPException) as error:
+                main._validate_image_data_url(data_url)
+        self.assertEqual(error.exception.status_code, 400)
+
+    def test_pixel_limit_is_enforced_at_boundary(self):
+        data_url, _ = self._data_url("PNG", size=(2, 2))
+        with unittest.mock.patch.object(main, "MAX_OCR_PIXELS", 4):
+            main._validate_image_data_url(data_url)
+        with unittest.mock.patch.object(main, "MAX_OCR_PIXELS", 3):
+            with self.assertRaises(main.HTTPException):
+                main._validate_image_data_url(data_url)
+
+    def test_truncated_and_malformed_images_are_rejected(self):
+        data_url, _ = self._data_url("PNG")
+        header, payload = data_url.split(",", 1)
+        damaged = header + "," + payload[:-12]
+        with self.assertRaises(main.HTTPException):
+            main._validate_image_data_url(damaged)
+        with self.assertRaises(main.HTTPException):
+            main._validate_image_data_url("data:image/png;base64,%%%not-base64%%")
+
+
+class TestSameAnalysisConcurrency(unittest.TestCase):
+    def test_only_one_generation_runs_for_same_analysis_at_a_time(self):
+        from unittest.mock import patch
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        uid = "same-analysis-concurrency"
+        headers = auth(uid)
+        analysis = client.post("/api/analyze", headers=headers, json={
+            "user_id": uid, "module": "chat", "mode": "coquetear"
+        }).json()
+        entered = threading.Event()
+        release = threading.Event()
+        def slow_provider(*args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test timeout")
+            return {"reply": "Respuesta uno", "alternative": "Respuesta dos", "provider": "test-provider"}
+        payload = {"user_id": uid, "module": "chat", "mode": "coquetear", "analysis_id": analysis["analysis_id"], "text": "Hola"}
+        with patch.object(main, "ai_generate_reply", side_effect=slow_provider):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(client.post, "/api/generate-reply", headers=headers, json={**payload, "idempotency_key": "concurrent-key-one"})
+                self.assertTrue(entered.wait(3), "provider call did not start")
+                second = client.post("/api/generate-reply", headers=headers, json={**payload, "idempotency_key": "concurrent-key-two"})
+                release.set()
+                first_result = first.result(timeout=8)
+        self.assertEqual(second.status_code, 409, second.text)
+        self.assertEqual(first_result.status_code, 200, first_result.text)
+
+
+class TestSyntheticTelegramScreenshotOCR(unittest.TestCase):
+    def _screenshot_data_url(self):
+        from PIL import ImageDraw, ImageFont
+        canvas = main.Image.new("RGB", (900, 520), (238, 242, 247))
+        draw = ImageDraw.Draw(canvas)
+        font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        try:
+            font = ImageFont.truetype(font_path, 26)
+        except OSError:
+            font = ImageFont.load_default()
+        draw.rounded_rectangle((30, 45, 600, 135), radius=20, fill=(255, 255, 255))
+        draw.text((52, 70), "Hola, que haces hoy?", font=font, fill=(20, 20, 20))
+        draw.rounded_rectangle((270, 175, 860, 275), radius=20, fill=(190, 235, 205))
+        draw.text((292, 205), "Estoy pensando en salir un rato", font=font, fill=(20, 20, 20))
+        draw.rounded_rectangle((30, 315, 660, 405), radius=20, fill=(255, 255, 255))
+        draw.text((52, 340), "Quieres venir conmigo?", font=font, fill=(20, 20, 20))
+        buffer = io.BytesIO()
+        canvas.save(buffer, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    def test_real_tesseract_ocr_reads_synthetic_telegram_style_capture(self):
+        if not __import__("shutil").which("tesseract"):
+            self.skipTest("Tesseract is not installed")
+        image_data_url = self._screenshot_data_url()
+        raw = base64.b64decode(image_data_url.split(",", 1)[1])
+        recognized = main._ocr_text(main._decode_ocr_image(raw)).casefold()
+        self.assertTrue("haces" in recognized or "haces hoy" in recognized, recognized)
+        self.assertTrue("salir" in recognized or "venir" in recognized, recognized)
+
+    def test_real_ocr_fallback_calls_text_provider_after_visual_failure(self):
+        from unittest.mock import patch
+        image_data_url = self._screenshot_data_url()
+        expected = {"reply": "Podrías decirle que te gustaría ir.", "alternative": "Suena bien, ¿a qué hora?", "provider": "test-text"}
+        with patch.object(main, "ai_generate_reply", side_effect=[main.ProviderError("vision down"), expected]) as provider:
+            result, recognized = main._generate_with_ocr_fallback("", "coquetear", "chat", image_data_url)
+        self.assertEqual(result, expected)
+        self.assertTrue(recognized)
+        self.assertEqual(provider.call_count, 2)
+        self.assertIsNone(provider.call_args_list[1].args[3])
+        self.assertTrue(provider.call_args_list[1].args[0])
+
+
+class TestRetentionPolicy(unittest.TestCase):
+    def test_expired_idempotency_and_old_logs_are_purged(self):
+        from unittest.mock import patch
+        uid = "retention-policy"
+        now = main.datetime.now(main.timezone.utc)
+        old_idem = (now - main.timedelta(hours=25)).isoformat()
+        old_event = (now - main.timedelta(days=31)).isoformat()
+        old_audit = (now - main.timedelta(days=91)).isoformat()
+        c = main.db()
+        c.execute("INSERT OR REPLACE INTO ai_idempotency(user_id,idempotency_key,payload_hash,status,result_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                  (uid, "expired-key", "hash", "completed", '{"reply":"private"}', old_idem, old_idem))
+        c.execute("INSERT INTO ai_generation_events(user_id,status,latency_ms,created_at) VALUES(?,?,?,?)", (uid, "success", 1, old_event))
+        c.execute("INSERT INTO admin_audit(actor,action,target,details,created_at) VALUES(?,?,?,?,?)", ("test", "test", uid, "{}", old_audit))
+        c.commit(); c.close()
+        main.purge_expired_records()
+        c = main.db()
+        idem_count = c.execute("SELECT COUNT(*) n FROM ai_idempotency WHERE user_id=? AND idempotency_key='expired-key'", (uid,)).fetchone()["n"]
+        event_count = c.execute("SELECT COUNT(*) n FROM ai_generation_events WHERE user_id=? AND created_at=?", (uid, old_event)).fetchone()["n"]
+        audit_count = c.execute("SELECT COUNT(*) n FROM admin_audit WHERE actor='test' AND created_at=?", (old_audit,)).fetchone()["n"]
+        c.close()
+        self.assertEqual(idem_count, 0)
+        self.assertEqual(event_count, 0)
+        self.assertEqual(audit_count, 0)
+
+
+class TestQuotaRecovery(unittest.TestCase):
+    def test_retrying_same_analysis_after_provider_failure_reserves_quota_again(self):
+        from unittest.mock import patch
+        uid = "quota-re-reserve"
+        headers = auth(uid)
+        before = main.usage(uid)["used_today"]
+        analysis = client.post("/api/analyze", headers=headers, json={"user_id": uid, "module": "chat", "mode": "coquetear"}).json()
+        with patch.object(main, "ai_generate_reply", side_effect=main.ProviderError("provider down")):
+            failed = client.post("/api/generate-reply", headers=headers, json={"user_id": uid, "module": "chat", "mode": "coquetear", "analysis_id": analysis["analysis_id"], "text": "Hola", "idempotency_key": "quota-fail-key"})
+        self.assertEqual(failed.status_code, 503)
+        self.assertEqual(main.usage(uid)["used_today"], before)
+        with patch.object(main, "ai_generate_reply", return_value={"reply": "Respuesta uno", "alternative": "Respuesta dos", "provider": "test-provider"}):
+            success = client.post("/api/generate-reply", headers=headers, json={"user_id": uid, "module": "chat", "mode": "coquetear", "analysis_id": analysis["analysis_id"], "text": "Hola", "idempotency_key": "quota-success-key"})
+        self.assertEqual(success.status_code, 200, success.text)
+        self.assertEqual(main.usage(uid)["used_today"], before + 1)
+
+    def test_client_can_release_quota_if_generation_never_started(self):
+        uid = "quota-release-client"
+        headers = auth(uid)
+        before = main.usage(uid)["used_today"]
+        analysis = client.post("/api/analyze", headers=headers, json={"user_id": uid, "module": "chat", "mode": "coquetear"}).json()
+        self.assertEqual(main.usage(uid)["used_today"], before + 1)
+        released = client.post("/api/analyze/release", headers=headers, json={"analysis_id": analysis["analysis_id"], "text": ""})
+        self.assertEqual(released.status_code, 200, released.text)
+        self.assertTrue(released.json()["released"])
+        self.assertEqual(main.usage(uid)["used_today"], before)

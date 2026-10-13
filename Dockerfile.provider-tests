@@ -1,0 +1,10 @@
+# Dedicated one-shot test runner. Do not use this Dockerfile for the production web service.
+FROM python:3.11-slim
+WORKDIR /app
+COPY backend/requirements.txt backend/requirements.txt
+COPY requirements-test.txt requirements-test.txt
+RUN pip install --no-cache-dir -r requirements-test.txt
+COPY backend/ai_providers.py backend/ai_providers.py
+COPY tests/test_provider_integration.py tests/test_provider_integration.py
+COPY scripts/run_live_provider_tests.py scripts/run_live_provider_tests.py
+CMD ["python", "scripts/run_live_provider_tests.py"]

@@ -1,17 +1,33 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from PIL import Image
-import base64, hashlib, hmac, io, json, os, re, sqlite3, time, uuid
+import asyncio, base64, hashlib, hmac, io, json, os, re, sqlite3, time, uuid
 import pytesseract
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs
 from backend.ai_providers import ProviderError, generate_reply as ai_generate_reply
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-app = FastAPI(title="LiggaCuba API", version="2.1")
+
+
+@asynccontextmanager
+async def app_lifespan(application):
+    cleanup_task = asyncio.create_task(_retention_cleanup_loop())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="LiggaCuba API", version="2.2", lifespan=app_lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 FREE_DAILY_LIMIT = 3
@@ -81,8 +97,18 @@ def db():
     return c
 
 
-def now(): return datetime.utcnow().isoformat()
-def today(): return datetime.utcnow().date().isoformat()
+def _utc_datetime(value: Optional[str] = None) -> datetime:
+    """Parse legacy naive timestamps and normalize all comparisons to UTC."""
+    if value is None:
+        return datetime.now(timezone.utc)
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def now(): return datetime.now(timezone.utc).isoformat()
+def today(): return datetime.now(timezone.utc).date().isoformat()
 
 
 def init_db():
@@ -110,7 +136,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS analysis_attempts(
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL, analysis_date TEXT NOT NULL,
       module TEXT NOT NULL, mode TEXT NOT NULL, retry_used INTEGER NOT NULL DEFAULT 0,
-      generation_count INTEGER NOT NULL DEFAULT 0, generation_in_progress INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+      generation_count INTEGER NOT NULL DEFAULT 0, generation_in_progress INTEGER NOT NULL DEFAULT 0, generation_started_at TEXT, quota_charged INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS admin_users(
       username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, permissions TEXT NOT NULL,
@@ -120,6 +146,12 @@ def init_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT NOT NULL, action TEXT NOT NULL,
       target TEXT, details TEXT, created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS ai_idempotency(
+      user_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_hash TEXT NOT NULL,
+      status TEXT NOT NULL, result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY(user_id, idempotency_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ai_idempotency_created ON ai_idempotency(created_at);
     CREATE TABLE IF NOT EXISTS ai_generation_events(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       analysis_id TEXT, user_id TEXT NOT NULL, module TEXT, mode TEXT,
@@ -138,6 +170,8 @@ def init_db():
         "ALTER TABLE payment_operations ADD COLUMN source_sms TEXT",
         "ALTER TABLE analysis_attempts ADD COLUMN generation_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE analysis_attempts ADD COLUMN generation_in_progress INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE analysis_attempts ADD COLUMN generation_started_at TEXT",
+        "ALTER TABLE analysis_attempts ADD COLUMN quota_charged INTEGER NOT NULL DEFAULT 0",
     ):
         try:
             c.execute(sql)
@@ -150,6 +184,34 @@ def init_db():
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_source_sms ON payment_operations(source_sms) WHERE source_sms IS NOT NULL AND source_sms != ''")
     c.commit(); c.close()
 init_db()
+
+
+def purge_expired_records() -> None:
+    """Apply retention limits to idempotency results and operational/security metadata."""
+    current = datetime.now(timezone.utc)
+    idempotency_cutoff = (current - timedelta(hours=24)).isoformat()
+    ai_events_cutoff = (current - timedelta(days=30)).isoformat()
+    audit_cutoff = (current - timedelta(days=90)).isoformat()
+    c = db()
+    try:
+        c.execute("DELETE FROM ai_idempotency WHERE created_at < ?", (idempotency_cutoff,))
+        c.execute("DELETE FROM ai_generation_events WHERE created_at < ?", (ai_events_cutoff,))
+        c.execute("DELETE FROM admin_audit WHERE created_at < ?", (audit_cutoff,))
+        c.commit()
+    finally:
+        c.close()
+
+
+async def _retention_cleanup_loop() -> None:
+    """Run once at startup and then hourly; failures are logged without stopping the API."""
+    import logging
+    logger = logging.getLogger(__name__)
+    while True:
+        try:
+            await asyncio.to_thread(purge_expired_records)
+        except Exception as exc:
+            logger.error("Retention cleanup failed (type=%s)", type(exc).__name__)
+        await asyncio.sleep(3600)
 
 
 def user(user_id: str, extra: Optional[Dict[str, Any]] = None):
@@ -177,7 +239,7 @@ def reset(uid):
 def premium(uid):
     p=user(uid).get("premium_until")
     if not p: return False
-    try: return datetime.utcnow() < datetime.fromisoformat(p)
+    try: return _utc_datetime() < _utc_datetime(p)
     except ValueError: return False
 
 
@@ -215,7 +277,7 @@ def consume(uid, module, mode):
         else:
             used = int(row["usage_today"] or 0)
         try:
-            is_premium = bool(row["premium_until"] and datetime.utcnow() < datetime.fromisoformat(row["premium_until"]))
+            is_premium = bool(row["premium_until"] and _utc_datetime() < _utc_datetime(row["premium_until"]))
         except (TypeError, ValueError):
             is_premium = False
         if not is_premium and used >= FREE_DAILY_LIMIT:
@@ -244,8 +306,8 @@ def consume(uid, module, mode):
 
 class TelegramAuth(BaseModel): initData:str=""; user_id:Optional[str]=None
 class Usage(BaseModel): user_id:str
-class Analyze(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"
-class Generate(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"; text:str=""; analysis_id:str=""; image:str=""
+class Analyze(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"; image:str=""
+class Generate(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"; text:str=""; analysis_id:str=""; image:str=""; idempotency_key:str=""
 class Retry(BaseModel): analysis_id:str; text:str=""
 class Pending(BaseModel): user_id:str; plan:str="weekly"; language:str="es"; payment_method:str="BANDEC"
 class PaymentPhone(BaseModel): phone:str
@@ -357,7 +419,7 @@ def privacy(): return FileResponse(os.path.join(ROOT,"privacy.html"),media_type=
 @app.get("/terms.html")
 def terms(): return FileResponse(os.path.join(ROOT,"terms.html"),media_type="text/html")
 @app.get("/health")
-def health(): return {"status":"ok","service":"LiggaCuba","version":"2.1"}
+def health(): return {"status":"ok","service":"LiggaCuba","version":"2.2"}
 
 
 @app.post("/api/auth/telegram")
@@ -381,6 +443,42 @@ def auth_telegram(p:TelegramAuth):
 def api_usage(p:Usage, request:Request):
     uid=current_user(request)
     return usage(uid)
+
+def _validate_image_data_url(data_url: str) -> bytes:
+    """Strictly validate data URL, MIME, decoded size, format, dimensions and file integrity."""
+    import warnings
+    from PIL import ImageFile
+
+    header, separator, encoded = (data_url or "").partition(",")
+    if (not separator or not header.lower().startswith("data:image/")
+            or ";base64" not in header.lower() or not encoded
+            or len(encoded) > 11_200_000):
+        raise HTTPException(400, "Imagen inválida o demasiado grande")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+        if not raw or len(raw) > MAX_OCR_BYTES:
+            raise ValueError("size")
+        declared = header[5:].split(";", 1)[0].strip().lower()
+        aliases = {"image/jpg": "image/jpeg", "image/x-png": "image/png"}
+        declared = aliases.get(declared, declared)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw)) as image:
+                actual = (Image.MIME.get(image.format) or "").lower()
+                width, height = image.size
+                if (aliases.get(actual, actual) != declared or image.format not in {"PNG", "JPEG", "WEBP", "BMP", "TIFF"}
+                        or width < 1 or height < 1 or width * height > MAX_OCR_PIXELS):
+                    raise ValueError("format/dimensions")
+                image.verify()
+            # Reopen and fully decode; verify() alone may not detect every truncated stream.
+            with Image.open(io.BytesIO(raw)) as image:
+                image.load()
+    except HTTPException:
+        raise
+    except (ValueError, TypeError, OSError, SyntaxError, Image.DecompressionBombError, Image.DecompressionBombWarning):
+        raise HTTPException(400, "Imagen inválida o dañada") from None
+    return raw
+
 
 def _ai_model_for(provider: str) -> str:
     env_names = {"gemini": "GEMINI_MODEL", "groq": "GROQ_MODEL", "openrouter": "OPENROUTER_MODEL", "cohere": "COHERE_MODEL"}
@@ -432,16 +530,23 @@ def _quality_estimate(reply: str, alternative: str, context: str, mode: str) -> 
 
 def _record_ai_event(analysis_id, user_id, module, mode, provider, model, status, error_code, latency_ms, quality_score, retry_number):
     # Store operational metadata only: never prompts, OCR, images, replies, API keys or raw provider errors.
-    c = db()
+    c = None
     try:
+        c = db()
         c.execute("""INSERT INTO ai_generation_events
         (analysis_id,user_id,module,mode,provider,model,status,error_code,latency_ms,quality_score,retry_number,created_at)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
         (analysis_id, str(user_id), module, mode, (provider or "unknown")[:40], (model or "unknown")[:120],
          status, (error_code or "")[:80], max(0, int(latency_ms)), quality_score, int(retry_number), now()))
         c.commit()
+    except Exception as exc:
+        # Observability is best-effort: database logging outages must not hide a valid AI response.
+        import logging
+        logging.getLogger(__name__).error("AI event logging failed (type=%s)", type(exc).__name__)
     finally:
-        c.close()
+        if c is not None:
+            try: c.close()
+            except Exception: pass
 
 
 @app.post("/api/analyze")
@@ -450,17 +555,66 @@ def analyze(p:Analyze, request:Request):
     module=p.module if p.module in {"chat","story"} else "chat"; mode=p.mode.lower().strip(); free=FREE_CHAT_MODES if module=="chat" else FREE_STORY_MODES; premset=PREMIUM_CHAT_MODES if module=="chat" else PREMIUM_STORY_MODES
     if mode not in free|premset: raise HTTPException(400,"Modo no válido")
     if mode in premset and not premium(uid): raise HTTPException(402,"Este modo requiere Premium")
+    if p.image:
+        _validate_image_data_url(p.image)
     r=consume(uid,module,mode)
     if not r["allowed"]: raise HTTPException(403,"Has alcanzado tus 3 análisis gratuitos de hoy")
     analysis_id=uuid.uuid4().hex
     c=db()
     try:
-        c.execute("INSERT INTO analysis_attempts(id,user_id,analysis_date,module,mode,retry_used,created_at) VALUES(?,?,?,?,?,0,?)",
-                  (analysis_id,uid,today(),module,mode,now()))
+        c.execute("INSERT INTO analysis_attempts(id,user_id,analysis_date,module,mode,retry_used,quota_charged,created_at) VALUES(?,?,?,?,?,0,?,?)",
+                  (analysis_id,uid,today(),module,mode,0 if r.get("premium") else 1,now()))
         c.commit()
+    except Exception:
+        c.rollback()
+        if not r.get("premium"):
+            refund = db()
+            try:
+                refund.execute("UPDATE users SET usage_today=MAX(0,usage_today-1),updated_at=? WHERE user_id=? AND last_reset_date=?", (now(), uid, today()))
+                refund.commit()
+            finally:
+                refund.close()
+        raise HTTPException(503, "No se pudo guardar el análisis. No se consumió el cupo si el reembolso terminó correctamente.") from None
     finally:
         c.close()
     return {**r,"analysis_id":analysis_id}
+
+@app.post("/api/analyze/release")
+def release_analysis_quota(p: Retry, request: Request):
+    """Release quota when the client never got a generation started/completed."""
+    uid = current_user(request)
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?", (p.analysis_id, uid)).fetchone()
+        if row is None:
+            raise HTTPException(404, "No se encontró este análisis")
+        if row["analysis_date"] != today():
+            raise HTTPException(403, "Este análisis ya no está disponible")
+        if int(row["generation_in_progress"] or 0):
+            started = row["generation_started_at"]
+            try: stale = started and (_utc_datetime() - _utc_datetime(started)).total_seconds() > 180
+            except (TypeError, ValueError): stale = False
+            if not stale:
+                c.rollback()
+                return {"success": True, "released": False, "reason": "generation_in_progress"}
+            c.execute("UPDATE analysis_attempts SET generation_in_progress=0,generation_started_at=NULL WHERE id=? AND user_id=?", (p.analysis_id, uid))
+        if int(row["generation_count"] or 0) > 0 or not int(row["quota_charged"] or 0):
+            c.rollback()
+            return {"success": True, "released": False}
+        c.execute("UPDATE users SET usage_today=MAX(0,usage_today-1),updated_at=? WHERE user_id=? AND last_reset_date=?", (now(), uid, today()))
+        c.execute("UPDATE analysis_attempts SET quota_charged=0 WHERE id=? AND user_id=? AND generation_count=0", (p.analysis_id, uid))
+        c.commit()
+        return {"success": True, "released": True}
+    except HTTPException:
+        c.rollback()
+        raise
+    except Exception:
+        c.rollback()
+        raise HTTPException(503, "No se pudo liberar el cupo temporalmente") from None
+    finally:
+        c.close()
+
 
 @app.post("/api/retry")
 def retry_analysis(p: Retry, request: Request):
@@ -535,25 +689,68 @@ def generate(p:Generate, request:Request):
     t=re.sub(r"\s+"," ",(p.text or "")).strip()
     image_data_url=(p.image or "").strip()
     if image_data_url:
-        header, sep, encoded=image_data_url.partition(",")
-        if (not sep or not header.startswith("data:image/") or ";base64" not in header or not encoded or len(encoded)>11_200_000):
-            raise HTTPException(400,"Imagen inválida o demasiado grande")
+        _validate_image_data_url(image_data_url)
     if not t and not image_data_url:
         raise HTTPException(400,"Adjunta una imagen o proporciona el texto que quieres analizar")
+
+    # Persist idempotency by user + client key. A lost HTTP response can then be replayed
+    # without spending a second provider call. The key never stores message/image content.
+    idem_key = (p.idempotency_key or "").strip()[:128]
+    if not idem_key:
+        idem_key = uuid.uuid4().hex
+    payload_hash = hashlib.sha256(json.dumps({
+        "analysis_id": p.analysis_id, "module": module, "mode": mode,
+        "text": t, "image_sha256": hashlib.sha256(image_data_url.encode()).hexdigest() if image_data_url else ""
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     # Reserve one generation atomically. The count is incremented only after a valid AI response.
     c=db()
     try:
         c.execute("BEGIN IMMEDIATE")
+        # Idempotency results may contain generated reply text; retain them for at most 24 hours.
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        c.execute("DELETE FROM ai_idempotency WHERE created_at < ?", (cutoff,))
+        prior = c.execute("SELECT payload_hash,status,result_json,updated_at FROM ai_idempotency WHERE user_id=? AND idempotency_key=?", (uid, idem_key)).fetchone()
+        if prior and prior["payload_hash"] != payload_hash:
+            raise HTTPException(409, "La clave de idempotencia ya se utilizó con otra solicitud")
+        if prior and prior["status"] == "completed" and prior["result_json"]:
+            c.commit()
+            return json.loads(prior["result_json"])
+        if prior and prior["status"] == "processing":
+            try: stale_idempotency = (_utc_datetime() - _utc_datetime(prior["updated_at"])).total_seconds() > 180
+            except (TypeError, ValueError): stale_idempotency = False
+            if not stale_idempotency:
+                raise HTTPException(409, "Esta solicitud ya se está procesando")
+        if prior:
+            c.execute("UPDATE ai_idempotency SET status='processing',result_json=NULL,updated_at=? WHERE user_id=? AND idempotency_key=?", (now(), uid, idem_key))
+        else:
+            c.execute("INSERT INTO ai_idempotency(user_id,idempotency_key,payload_hash,status,created_at,updated_at) VALUES(?,?,?,'processing',?,?)", (uid, idem_key, payload_hash, now(), now()))
         attempt=c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?",(p.analysis_id,uid)).fetchone()
         if attempt is None: raise HTTPException(404,"No se encontró este análisis")
+        if int(attempt["generation_in_progress"] or 0):
+            started = attempt["generation_started_at"]
+            try: stale = started and (_utc_datetime() - _utc_datetime(started)).total_seconds() > 180
+            except (TypeError, ValueError): stale = False
+            if stale:
+                c.execute("UPDATE analysis_attempts SET generation_in_progress=0,generation_started_at=NULL WHERE id=? AND user_id=?", (p.analysis_id, uid))
+                attempt = c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?", (p.analysis_id, uid)).fetchone()
         if attempt["analysis_date"] != today(): raise HTTPException(403,"Este análisis ya no está disponible")
         if attempt["module"] != module or attempt["mode"] != mode: raise HTTPException(400,"El modo no coincide con el análisis original")
         count=int(attempt["generation_count"] or 0)
+        if count == 0 and not int(attempt["quota_charged"] or 0):
+            quota_user = c.execute("SELECT usage_today,last_reset_date,premium_until FROM users WHERE user_id=?", (uid,)).fetchone()
+            is_premium_now = bool(quota_user and quota_user["premium_until"] and _utc_datetime() < _utc_datetime(quota_user["premium_until"]))
+            if not is_premium_now:
+                used_now = int(quota_user["usage_today"] or 0) if quota_user and quota_user["last_reset_date"] == today() else 0
+                if used_now >= FREE_DAILY_LIMIT:
+                    raise HTTPException(403, "Has alcanzado tus 3 análisis gratuitos de hoy")
+                c.execute("UPDATE users SET usage_today=?,last_reset_date=?,updated_at=? WHERE user_id=?", (used_now + 1, today(), now(), uid))
+                c.execute("UPDATE analysis_attempts SET quota_charged=1 WHERE id=? AND user_id=?", (p.analysis_id, uid))
+                attempt = c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?", (p.analysis_id, uid)).fetchone()
         if count >= 1 and not attempt["retry_used"]: raise HTTPException(409,"Debes usar el reintento disponible para generar otra respuesta")
         if count >= 2: raise HTTPException(409,"Este análisis ya utilizó su único reintento")
         if int(attempt["generation_in_progress"] or 0): raise HTTPException(409,"Ya hay una generación en curso para este análisis")
-        updated=c.execute("UPDATE analysis_attempts SET generation_in_progress=1 WHERE id=? AND user_id=? AND generation_in_progress=0",(p.analysis_id,uid))
+        updated=c.execute("UPDATE analysis_attempts SET generation_in_progress=1,generation_started_at=? WHERE id=? AND user_id=? AND generation_in_progress=0",(now(),p.analysis_id,uid))
         if updated.rowcount != 1: raise HTTPException(409,"Ya hay una generación en curso para este análisis")
         c.commit()
     except Exception:
@@ -612,9 +809,19 @@ def generate(p:Generate, request:Request):
         try:
             c.execute("BEGIN IMMEDIATE")
             if 'result' in locals():
-                c.execute("UPDATE analysis_attempts SET generation_count=generation_count+1,generation_in_progress=0 WHERE id=? AND user_id=?",(p.analysis_id,uid))
+                c.execute("UPDATE analysis_attempts SET generation_count=generation_count+1,generation_in_progress=0,generation_started_at=NULL WHERE id=? AND user_id=?",(p.analysis_id,uid))
+                c.execute("UPDATE ai_idempotency SET status='completed',result_json=?,updated_at=? WHERE user_id=? AND idempotency_key=?", (json.dumps(result, ensure_ascii=False, separators=(",", ":")), now(), uid, idem_key))
             else:
-                c.execute("UPDATE analysis_attempts SET generation_in_progress=0 WHERE id=? AND user_id=?",(p.analysis_id,uid))
+                c.execute("UPDATE analysis_attempts SET generation_in_progress=0,generation_started_at=NULL WHERE id=? AND user_id=?",(p.analysis_id,uid))
+                c.execute("UPDATE ai_idempotency SET status='failed',updated_at=? WHERE user_id=? AND idempotency_key=?", (now(), uid, idem_key))
+                # A provider failure on the first attempt refunds the free analysis quota.
+                # Failed retries do not refund the original successful analysis.
+                if retry_number == 0 and int(attempt["generation_count"] or 0) == 0 and int(attempt["quota_charged"] or 0):
+                    c.execute("UPDATE users SET usage_today=MAX(0,usage_today-1),updated_at=? WHERE user_id=? AND last_reset_date=?", (now(), uid, today()))
+                    c.execute("UPDATE analysis_attempts SET quota_charged=0 WHERE id=? AND user_id=?", (p.analysis_id, uid))
+                elif retry_number == 1 and int(attempt["generation_count"] or 0) <= 1:
+                    # Release a retry reservation after a failed call, even if the client disconnects.
+                    c.execute("UPDATE analysis_attempts SET retry_used=0 WHERE id=? AND user_id=? AND generation_count<=1", (p.analysis_id, uid))
             c.commit()
         except Exception:
             c.rollback()
@@ -787,7 +994,8 @@ async def ocr_upload(request: Request):
         raise HTTPException(503, "El servicio OCR no está disponible temporalmente")
 
 @app.post("/ocr-base64")
-def ocr_base64(p: OCR):
+def ocr_base64(p: OCR, request: Request):
+    current_user(request)
     encoded = p.image.split(",", 1)[-1]
     if len(encoded) > ((MAX_OCR_BYTES + 2) // 3) * 4 + 8:
         raise HTTPException(413, "La imagen supera el límite de 8 MB")
@@ -802,7 +1010,7 @@ def ocr_base64(p: OCR):
         raise HTTPException(503, "El servicio OCR no está disponible temporalmente")
 
 @app.post("/ocr-base64-simple")
-def ocr_simple(p:OCR): return ocr_base64(p)
+def ocr_simple(p:OCR, request: Request): return ocr_base64(p, request)
 
 
 @app.post("/api/profile")
@@ -1002,11 +1210,11 @@ def atajo_pago(p: AtajoPayment, request: Request):
             (matched["user_id"],),
         ).fetchone()
         days = 7 if matched["plan"] == "weekly" else 365
-        base_time = datetime.utcnow()
+        base_time = datetime.now(timezone.utc)
         current = user_row["premium_until"] if user_row else None
         if current:
             try:
-                base_time = max(base_time, datetime.fromisoformat(current))
+                base_time = max(base_time, _utc_datetime(current))
             except (ValueError, TypeError):
                 pass
         until = (base_time + timedelta(days=days)).isoformat()
@@ -1157,21 +1365,21 @@ def admin_me(request:Request): return admin_identity(request)
 def admin_users(request:Request, q:str=""):
     ident=admin(request,"users"); c=db(); term=f"%{q.strip()}%"
     rows=c.execute("SELECT user_id,username,first_name,last_name,premium_until,payment_phone,created_at FROM users WHERE user_id LIKE ? OR username LIKE ? OR first_name LIKE ? ORDER BY created_at DESC LIMIT 200",(term,term,term)).fetchall(); c.close()
-    return {"items":[{**dict(r),"premium":bool(r["premium_until"] and r["premium_until"]>now())} for r in rows]}
+    return {"items":[{**dict(r),"premium":bool(r["premium_until"] and _utc_datetime(r["premium_until"]) > _utc_datetime())} for r in rows]}
 
 @app.post("/api/admin/premium")
 def admin_premium(p:PremiumChange, request:Request):
     ident=admin(request,"premium"); uid=str(p.user_id); u=user(uid); t=now()
     if p.action=="revoke": until=None
-    elif p.action=="grant": until=(datetime.utcnow()+timedelta(days=max(1,min(int(p.days),3650)))).isoformat()
+    elif p.action=="grant": until=(datetime.now(timezone.utc)+timedelta(days=max(1,min(int(p.days),3650)))).isoformat()
     elif p.action=="extend":
-        base=datetime.utcnow()
+        base=datetime.now(timezone.utc)
         try:
-            if u.get("premium_until"): base=max(base,datetime.fromisoformat(u["premium_until"]))
+            if u.get("premium_until"): base=max(base,_utc_datetime(u["premium_until"]))
         except ValueError: pass
         until=(base+timedelta(days=max(1,min(int(p.days),3650)))).isoformat()
     else: raise HTTPException(400,"Acción inválida")
-    c=db(); c.execute("UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?",(until,t,uid)); c.commit(); c.close(); audit(ident["username"],"premium_"+p.action,uid,{"days":p.days,"premium_until":until}); return {"success":True,"user_id":uid,"premium_until":until,"premium":bool(until and until>now())}
+    c=db(); c.execute("UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?",(until,t,uid)); c.commit(); c.close(); audit(ident["username"],"premium_"+p.action,uid,{"days":p.days,"premium_until":until}); return {"success":True,"user_id":uid,"premium_until":until,"premium":bool(until and _utc_datetime(until) > _utc_datetime())}
 
 @app.get("/api/admin/admins")
 def admin_list(request:Request):
@@ -1221,9 +1429,9 @@ def verify_payment(p:PaymentId, request:Request):
             raise HTTPException(409,"La operación ya está siendo procesada")
         current_row=c.execute("SELECT premium_until FROM users WHERE user_id=?",(row["user_id"],)).fetchone()
         current=current_row["premium_until"] if current_row else None
-        base=datetime.utcnow()
+        base=datetime.now(timezone.utc)
         if current:
-            try: base=max(base,datetime.fromisoformat(current))
+            try: base=max(base,_utc_datetime(current))
             except ValueError: pass
         days=7 if row["plan"]=="weekly" else 365
         until=(base+timedelta(days=days)).isoformat()
@@ -1320,7 +1528,7 @@ def admin_ai_monitor(request: Request):
                  SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) successes,
                  SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) failures
           FROM ai_generation_events WHERE created_at >= ? GROUP BY substr(created_at,1,10) ORDER BY day
-        """, ((datetime.utcnow()-timedelta(days=6)).isoformat(),)).fetchall()
+        """, ((datetime.now(timezone.utc)-timedelta(days=6)).isoformat(),)).fetchall()
         total=int(totals["total"] or 0); successes=int(totals["successes"] or 0); failures=int(totals["failures"] or 0)
         return {
           "summary":{"today_events":total,"successes":successes,"failures":failures,
@@ -1337,7 +1545,7 @@ def admin_ai_monitor(request: Request):
                     "total_analyses":int(r["total_analyses"] or 0),
                     "success_rate":round(int(r["successes"] or 0)*100/max(1,int(r["total_attempts"] or 0)),1),
                     "avg_quality":round(r["avg_quality"] or 0,1),
-                    "premium":bool(r["premium_until"] and r["premium_until"]>now())} for r in user_rows],
+                    "premium":bool(r["premium_until"] and _utc_datetime(r["premium_until"]) > _utc_datetime())} for r in user_rows],
           "events":[dict(r) for r in event_rows],
           "days":[dict(r) for r in days],
           "quality_note":"Puntuación heurística estimada (1–100), no evaluación semántica objetiva. No se guardan imágenes, textos de conversación, respuestas ni claves API."
