@@ -37,3 +37,8 @@ Se añadió `Dockerfile.provider-tests` y `scripts/run_live_provider_tests.py` p
 6. No conectes este runner a la base de datos de producción. Las pruebas de proveedores no necesitan `DB_PATH`, token del bot ni credenciales de administración.
 
 Este procedimiento prueba las credenciales y los modelos configurados en el runner. No prueba por sí solo el webhook de Telegram, el despliegue del servicio web ni los permisos de producción. Con el acceso actual solo al panel, no se ha ejecutado aquí un despliegue ni se afirma que las cuatro API hayan pasado.
+
+
+### Latencia y failover
+
+Las llamadas HTTP tienen un timeout de 8 segundos por intento. En un flujo interactivo, si un proveedor devuelve un `Retry-After` superior a 2 segundos, el adaptador no espera ese periodo: abandona ese proveedor y prueba el siguiente configurado. Los reintentos cortos esperan como máximo 1 segundo. Así se prioriza la respuesta al usuario frente a esperar mucho por un proveedor temporalmente saturado. La disponibilidad y latencia finales siguen dependiendo de cada proveedor.

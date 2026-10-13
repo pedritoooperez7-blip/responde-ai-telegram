@@ -14,7 +14,7 @@ class ProviderError(Exception):
     def __str__(self): return self.message
 
 
-def _request_json(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float = 12) -> dict[str, Any]:
+def _request_json(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float = 8) -> dict[str, Any]:
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, headers={**headers, "Content-Type": "application/json"}, method="POST")
     try:
@@ -76,12 +76,23 @@ def _request_json(url: str, headers: dict[str, str], body: dict[str, Any], timeo
 
 
 def _with_retry(call):
+    """Retry briefly, but fail over immediately when a provider asks for a long wait.
+
+    This is a user-facing interactive flow: waiting 20-30 seconds for one provider
+    blocks trying the next configured provider. Long Retry-After values therefore
+    trigger immediate failover; short waits are capped at one second.
+    """
     for attempt in range(2):
-        try: return call()
+        try:
+            return call()
         except ProviderError as exc:
-            if not exc.transient or attempt == 1: raise
-            delay = exc.retry_after if exc.retry_after is not None else min(0.5 * (2 ** attempt), 4)
-            time.sleep(delay)
+            if not exc.transient or attempt == 1:
+                raise
+            if exc.retry_after is not None and exc.retry_after > 2.0:
+                # Let generate_reply() move to the next provider instead of sleeping.
+                raise
+            delay = min(exc.retry_after, 1.0) if exc.retry_after is not None else 0.4
+            time.sleep(max(0.0, delay))
 
 
 def _build_prompt(mode: str, module: str) -> str:
@@ -179,7 +190,7 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
         try:
             answer = call()
             if isinstance(answer, str) and answer.strip():
-                logger.info("AI provider success: %s", name)
+                logger.info("AI provider success: %s latency_ms=%s", name, int((time.monotonic()-provider_started)*1000))
                 structured = _parse_replies(answer)
                 if structured:
                     return {**structured, "provider": name}
@@ -190,8 +201,9 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
             logger.warning("AI provider returned an empty response: %s", name)
             provider_failures.append({"provider": name, "error_code": "empty_response", "latency_ms": int((time.monotonic()-provider_started)*1000)})
         except ProviderError as exc:
-            logger.warning("AI provider failed: %s (error_type=%s)", name, type(exc).__name__)
-            provider_failures.append({"provider": name, "error_code": type(exc).__name__, "latency_ms": int((time.monotonic()-provider_started)*1000)})
+            elapsed_ms = int((time.monotonic()-provider_started)*1000)
+            logger.warning("AI provider failed: %s error_type=%s latency_ms=%s", name, type(exc).__name__, elapsed_ms)
+            provider_failures.append({"provider": name, "error_code": type(exc).__name__, "latency_ms": elapsed_ms})
             continue
     logger.warning("AI providers exhausted; refusing local fallback")
     error = ProviderError("No se pudo generar una respuesta con la IA. Comprueba la configuración del proveedor e inténtalo de nuevo.")
