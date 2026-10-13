@@ -7,6 +7,7 @@ from PIL import Image
 import asyncio, base64, hashlib, hmac, io, json, os, re, sqlite3, time, uuid
 import pytesseract
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs
 from backend.ai_providers import ProviderError, generate_reply as ai_generate_reply
@@ -45,6 +46,9 @@ BANDEC_ACCOUNT = os.getenv("BANDEC_ACCOUNT", "9244069990684435")
 BPA_ACCOUNT = os.getenv("BPA_ACCOUNT", "")
 PAYMENT_PHONE = os.getenv("PAYMENT_PHONE", "52677163")
 SESSION_TTL = 86400
+CUBA_TZ = ZoneInfo("America/Havana")
+ADMIN_SESSION_TTL = 7 * 24 * 60 * 60
+OWNER_SESSION_TTL = 90 * 24 * 60 * 60
 
 
 def _b64e(data: bytes) -> str:
@@ -107,8 +111,22 @@ def _utc_datetime(value: Optional[str] = None) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def now(): return datetime.now(timezone.utc).isoformat()
-def today(): return datetime.now(timezone.utc).date().isoformat()
+def now():
+    """Store timestamps in UTC; clients display them in Cuba's local timezone."""
+    return datetime.now(timezone.utc).isoformat()
+
+def cuba_now():
+    """Current wall-clock time in Cuba, including DST rules."""
+    return datetime.now(CUBA_TZ)
+
+def today():
+    """Business date in Cuba, used for daily quotas and daily analysis validity."""
+    return cuba_now().date().isoformat()
+
+def cuba_day_start_utc():
+    """UTC instant corresponding to midnight at the start of Cuba's current day."""
+    local_midnight = datetime.combine(cuba_now().date(), datetime.min.time(), tzinfo=CUBA_TZ)
+    return local_midnight.astimezone(timezone.utc).isoformat()
 
 
 def init_db():
@@ -136,7 +154,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS analysis_attempts(
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL, analysis_date TEXT NOT NULL,
       module TEXT NOT NULL, mode TEXT NOT NULL, retry_used INTEGER NOT NULL DEFAULT 0,
-      generation_count INTEGER NOT NULL DEFAULT 0, generation_in_progress INTEGER NOT NULL DEFAULT 0, generation_started_at TEXT, quota_charged INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+      generation_count INTEGER NOT NULL DEFAULT 0, generation_in_progress INTEGER NOT NULL DEFAULT 0, generation_started_at TEXT, quota_charged INTEGER NOT NULL DEFAULT 0, retry_call_started INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS admin_users(
       username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, permissions TEXT NOT NULL,
@@ -145,6 +163,10 @@ def init_db():
     CREATE TABLE IF NOT EXISTS admin_audit(
       id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT NOT NULL, action TEXT NOT NULL,
       target TEXT, details TEXT, created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS admin_sessions(
+      session_id TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at INTEGER NOT NULL,
+      created_at TEXT NOT NULL, revoked_at TEXT
     );
     CREATE TABLE IF NOT EXISTS ai_idempotency(
       user_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_hash TEXT NOT NULL,
@@ -172,6 +194,7 @@ def init_db():
         "ALTER TABLE analysis_attempts ADD COLUMN generation_in_progress INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE analysis_attempts ADD COLUMN generation_started_at TEXT",
         "ALTER TABLE analysis_attempts ADD COLUMN quota_charged INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE analysis_attempts ADD COLUMN retry_call_started INTEGER NOT NULL DEFAULT 0",
     ):
         try:
             c.execute(sql)
@@ -366,15 +389,29 @@ def admin_identity(request: Request):
         data = json.loads(_b64d(payload).decode())
         if int(data.get("exp", 0)) < int(time.time()):
             raise HTTPException(401, "Sesión administrativa expirada")
+        session_id = str(data.get("jti", ""))
+        if not session_id:
+            raise HTTPException(401, "Sesión administrativa antigua; inicia sesión nuevamente")
+        session_db = db()
+        active_session = session_db.execute(
+            "SELECT username, expires_at, revoked_at FROM admin_sessions WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        session_db.close()
+        if (not active_session or active_session["revoked_at"] is not None
+                or int(active_session["expires_at"]) < int(time.time())):
+            raise HTTPException(401, "Sesión administrativa cerrada o expirada")
         username = str(data.get("username", ""))
+        if active_session["username"] != username:
+            raise HTTPException(401, "Sesión administrativa inválida")
         if username == "owner" and data.get("role") == "owner":
-            return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics"]}
+            return {"username": "owner", "is_owner": True, "permissions": ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics"]}
         c = db()
         row = c.execute("SELECT * FROM admin_users WHERE username=? AND is_active=1", (username,)).fetchone()
         c.close()
         if not row:
             raise HTTPException(401, "Administrador desactivado")
-        return {"username": row["username"], "permissions": json.loads(row["permissions"])}
+        return {"username": row["username"], "is_owner": False, "permissions": json.loads(row["permissions"])}
     except HTTPException: raise
     except Exception: raise HTTPException(401, "Sesión administrativa inválida")
 
@@ -638,39 +675,19 @@ def retry_analysis(p: Retry, request: Request):
 
 @app.post("/api/retry/release")
 def release_retry(p: Retry, request: Request):
-    """Release a retry reservation when generation fails before producing results."""
+    """Compatibility endpoint: a reserved retry is never refunded/reopened."""
     uid = current_user(request)
     c = db()
     try:
-        c.execute("BEGIN IMMEDIATE")
         row = c.execute(
-            "SELECT * FROM analysis_attempts WHERE id=? AND user_id=?",
+            "SELECT id FROM analysis_attempts WHERE id=? AND user_id=?",
             (p.analysis_id, uid),
         ).fetchone()
         if row is None:
             raise HTTPException(404, "No se encontró este análisis")
-        if row["analysis_date"] != today():
-            raise HTTPException(403, "Este análisis ya no está disponible")
-        # Only release a retry after the backend has cleared its in-flight lock.
-        # generation_count records successful provider generations, not failed calls.
-        if not row["retry_used"] or int(row["generation_in_progress"] or 0):
-            c.rollback()
-            return {"success": True, "released": False, "analysis_id": p.analysis_id}
-        updated = c.execute(
-            "UPDATE analysis_attempts SET retry_used=0 WHERE id=? AND user_id=? AND retry_used=1 AND generation_in_progress=0 AND generation_count<=1",
-            (p.analysis_id, uid),
-        )
-        if updated.rowcount != 1:
-            c.rollback()
-            return {"success": True, "released": False, "analysis_id": p.analysis_id}
-        c.commit()
-        return {"success": True, "released": True, "analysis_id": p.analysis_id}
-    except Exception:
-        c.rollback()
-        raise
+        return {"success": True, "released": False, "retry_available": False, "analysis_id": p.analysis_id}
     finally:
         c.close()
-
 
 @app.post("/api/generate-reply")
 def generate(p:Generate, request:Request):
@@ -737,6 +754,14 @@ def generate(p:Generate, request:Request):
         if attempt["analysis_date"] != today(): raise HTTPException(403,"Este análisis ya no está disponible")
         if attempt["module"] != module or attempt["mode"] != mode: raise HTTPException(400,"El modo no coincide con el análisis original")
         count=int(attempt["generation_count"] or 0)
+        # A retry is a single provider-generation attempt, even if that attempt fails.
+        # The DB reservation is atomic, so concurrent requests cannot spend it twice.
+        if int(attempt["retry_used"] or 0) and count >= 1:
+            if int(attempt["retry_call_started"] or 0):
+                raise HTTPException(409, "Este análisis ya utilizó su único intento de regeneración")
+            retry_lock = c.execute("UPDATE analysis_attempts SET retry_call_started=1 WHERE id=? AND user_id=? AND retry_call_started=0", (p.analysis_id, uid))
+            if retry_lock.rowcount != 1:
+                raise HTTPException(409, "Este análisis ya utilizó su único intento de regeneración")
         if count == 0 and not int(attempt["quota_charged"] or 0):
             quota_user = c.execute("SELECT usage_today,last_reset_date,premium_until FROM users WHERE user_id=?", (uid,)).fetchone()
             is_premium_now = bool(quota_user and quota_user["premium_until"] and _utc_datetime() < _utc_datetime(quota_user["premium_until"]))
@@ -819,9 +844,6 @@ def generate(p:Generate, request:Request):
                 if retry_number == 0 and int(attempt["generation_count"] or 0) == 0 and int(attempt["quota_charged"] or 0):
                     c.execute("UPDATE users SET usage_today=MAX(0,usage_today-1),updated_at=? WHERE user_id=? AND last_reset_date=?", (now(), uid, today()))
                     c.execute("UPDATE analysis_attempts SET quota_charged=0 WHERE id=? AND user_id=?", (p.analysis_id, uid))
-                elif retry_number == 1 and int(attempt["generation_count"] or 0) <= 1:
-                    # Release a retry reservation after a failed call, even if the client disconnects.
-                    c.execute("UPDATE analysis_attempts SET retry_used=0 WHERE id=? AND user_id=? AND generation_count<=1", (p.analysis_id, uid))
             c.commit()
         except Exception:
             c.rollback()
@@ -1339,27 +1361,63 @@ def status(p:PaymentId, request:Request):
 
 @app.post("/api/admin/login")
 def admin_login(p: AdminLogin):
-    if not ADMIN_KEY: raise HTTPException(503,"ADMIN_KEY no configurado en Railway")
-    username="owner"; permissions=["users","premium","payments","stats","admins","settings","audit","ai_analytics"]
-    if p.master_key and hmac.compare_digest(p.master_key, ADMIN_KEY):
-        pass
+    if not ADMIN_KEY:
+        raise HTTPException(503, "ADMIN_KEY no configurado en Railway")
+    is_owner = bool(p.master_key and hmac.compare_digest(p.master_key, ADMIN_KEY))
+    if is_owner:
+        username = "owner"
+        permissions = ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics"]
+        ttl = OWNER_SESSION_TTL
     else:
-        c=db(); row=c.execute("SELECT * FROM admin_users WHERE username=? AND is_active=1",(p.username.strip(),)).fetchone(); c.close()
+        username_input = p.username.strip()
+        c = db()
+        row = c.execute("SELECT * FROM admin_users WHERE username=? AND is_active=1", (username_input,)).fetchone()
+        c.close()
         if not row:
-            raise HTTPException(401,"Credenciales incorrectas")
+            raise HTTPException(401, "Credenciales incorrectas")
         salt_hex, stored_hash = row["password_hash"].split(":", 1)
         calculated = hashlib.pbkdf2_hmac("sha256", p.password.encode(), bytes.fromhex(salt_hex), 180000).hex()
         if not hmac.compare_digest(stored_hash, calculated):
-            raise HTTPException(401,"Credenciales incorrectas")
-        username=row["username"]; permissions=json.loads(row["permissions"])
-    claims={"username":username,"exp":int(time.time())+8*3600}
-    if username=="owner": claims["role"]="owner"
-    payload=_b64e(json.dumps(claims,separators=(",",":")).encode())
-    token=payload+"."+_b64e(hmac.new(ADMIN_KEY.encode(),payload.encode(),hashlib.sha256).digest())
-    return {"success":True,"token":token,"username":username,"permissions":permissions}
+            raise HTTPException(401, "Credenciales incorrectas")
+        username = row["username"]
+        permissions = json.loads(row["permissions"])
+        ttl = ADMIN_SESSION_TTL
+    claims = {"username": username, "exp": int(time.time()) + ttl, "jti": uuid.uuid4().hex}
+    if is_owner:
+        claims["role"] = "owner"
+    payload = _b64e(json.dumps(claims, separators=(",", ":")).encode())
+    token = payload + "." + _b64e(hmac.new(ADMIN_KEY.encode(), payload.encode(), hashlib.sha256).digest())
+    session_db = db()
+    try:
+        session_db.execute(
+            "INSERT INTO admin_sessions(session_id, username, expires_at, created_at, revoked_at) VALUES(?,?,?,?,NULL)",
+            (claims["jti"], username, claims["exp"], now()),
+        )
+        session_db.commit()
+    finally:
+        session_db.close()
+    return {"success": True, "token": token, "username": username, "is_owner": is_owner, "permissions": permissions,
+            "expires_at": datetime.fromtimestamp(claims["exp"], timezone.utc).isoformat(),
+            "session_days": 90 if is_owner else 7}
 
 @app.get("/api/admin/me")
 def admin_me(request:Request): return admin_identity(request)
+
+@app.post("/api/admin/logout")
+def admin_logout(request: Request):
+    identity = admin_identity(request)
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    payload = token.rsplit(".", 1)[0]
+    claims = json.loads(_b64d(payload).decode())
+    c = db()
+    try:
+        c.execute("UPDATE admin_sessions SET revoked_at=? WHERE session_id=? AND username=? AND revoked_at IS NULL",
+                  (now(), str(claims.get("jti", "")), identity["username"]))
+        c.commit()
+    finally:
+        c.close()
+    return {"success": True, "logged_out": True}
 
 @app.get("/api/admin/users")
 def admin_users(request:Request, q:str=""):
@@ -1370,14 +1428,17 @@ def admin_users(request:Request, q:str=""):
 @app.post("/api/admin/premium")
 def admin_premium(p:PremiumChange, request:Request):
     ident=admin(request,"premium"); uid=str(p.user_id); u=user(uid); t=now()
-    if p.action=="revoke": until=None
-    elif p.action=="grant": until=(datetime.now(timezone.utc)+timedelta(days=max(1,min(int(p.days),3650)))).isoformat()
-    elif p.action=="extend":
-        base=datetime.now(timezone.utc)
+    if p.action == "revoke":
+        until = None
+    elif p.action in {"grant", "extend"}:
+        # Grants/renewals never discard already-paid time on an active subscription.
+        base = datetime.now(timezone.utc)
         try:
-            if u.get("premium_until"): base=max(base,_utc_datetime(u["premium_until"]))
-        except ValueError: pass
-        until=(base+timedelta(days=max(1,min(int(p.days),3650)))).isoformat()
+            if u.get("premium_until"):
+                base = max(base, _utc_datetime(u["premium_until"]))
+        except (ValueError, TypeError):
+            pass
+        until = (base + timedelta(days=max(1, min(int(p.days), 3650)))).isoformat()
     else: raise HTTPException(400,"Acción inválida")
     c=db(); c.execute("UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?",(until,t,uid)); c.commit(); c.close(); audit(ident["username"],"premium_"+p.action,uid,{"days":p.days,"premium_until":until}); return {"success":True,"user_id":uid,"premium_until":until,"premium":bool(until and _utc_datetime(until) > _utc_datetime())}
 
@@ -1479,7 +1540,7 @@ def reject_payment(p: PaymentReview, request:Request):
 
 @app.get("/api/admin/stats")
 def admin_stats(request:Request):
-    admin(request,"stats"); c=db(); out={"total_users":c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"],"premium_users":c.execute("SELECT COUNT(*) n FROM users WHERE premium_until>?",(now(),)).fetchone()["n"],"today_usage":c.execute("SELECT COUNT(*) n FROM usage_logs WHERE used_at>=?",(today()+"T00:00:00",)).fetchone()["n"],"pending_payments":c.execute("SELECT COUNT(*) n FROM payment_operations WHERE status IN ('pending','proof_submitted')").fetchone()["n"]}; c.close(); return out
+    admin(request,"stats"); c=db(); out={"total_users":c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"],"premium_users":c.execute("SELECT COUNT(*) n FROM users WHERE premium_until>?",(now(),)).fetchone()["n"],"today_usage":c.execute("SELECT COUNT(*) n FROM usage_logs WHERE used_at>=?",(cuba_day_start_utc(),)).fetchone()["n"],"pending_payments":c.execute("SELECT COUNT(*) n FROM payment_operations WHERE status IN ('pending','proof_submitted')").fetchone()["n"]}; c.close(); return out
 
 @app.get("/api/admin/ai-monitor")
 def admin_ai_monitor(request: Request):
