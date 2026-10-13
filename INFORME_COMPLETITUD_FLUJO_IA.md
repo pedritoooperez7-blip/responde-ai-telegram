@@ -21,11 +21,25 @@ Esta versión endurece el flujo desde la selección de imagen hasta la respuesta
 - Pruebas contractuales offline para los adaptadores Gemini, Groq, OpenRouter y Cohere; matriz de formatos de imagen; OCR real con Tesseract sobre una captura sintética tipo Telegram; y fallback visual→OCR→proveedor de texto.
 - Runner, Dockerfile y configuración sin reinicios automáticos separados para ejecutar las llamadas reales a proveedores en Railway sin cambiar el contenedor web de producción.
 
+
+## Corrección adicional por latencia observada en Railway
+
+Tras revisar los logs del despliegue del 13 de octubre de 2026, se identificó que los errores temporales del proveedor podían alargar la generación: el adaptador respetaba `Retry-After` hasta 30 segundos y luego volvía a llamar al mismo proveedor antes de probar el siguiente. El timeout de cada llamada era de 12 segundos. Esto coincide con el HTTP 503 de Gemini y la respuesta de `/api/generate-reply` aproximadamente 40 segundos después.
+
+La versión actualizada aplica estas medidas:
+
+- Timeout HTTP por intento reducido de 12 a 8 segundos.
+- Si el proveedor solicita esperar más de 2 segundos (`Retry-After`), se omite la espera y se pasa inmediatamente al siguiente proveedor configurado.
+- Los reintentos cortos se limitan a un máximo de 1 segundo.
+- Los logs registran `latency_ms` por proveedor, tanto en éxito como en fallo, sin incluir prompts, imágenes, respuestas ni claves.
+
+Estas medidas evitan quedar bloqueados 20–30 segundos en un proveedor que ya informa alta demanda. La latencia real dependerá de la disponibilidad y velocidad de los proveedores configurados. Las pruebas siguen siendo locales; esta corrección todavía debe desplegarse y medirse en Railway.
+
 ## Resultados de validación local
 
 Última ejecución antes del empaquetado:
 
-- `pytest`: 59 aprobadas, 4 omitidas intencionalmente (smoke tests reales), 13 subtests aprobados, 0 fallos.
+- `pytest`: 61 aprobadas, 4 omitidas intencionalmente (smoke tests reales), 13 subtests aprobados, 0 fallos (incluye regresiones de latencia y política Retry-After).
 - `python -m py_compile` para backend y pruebas: aprobado.
 - `node --check app.js`: aprobado.
 - OCR real con Tesseract sobre captura sintética: aprobado.

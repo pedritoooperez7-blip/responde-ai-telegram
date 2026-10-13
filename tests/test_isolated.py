@@ -285,6 +285,34 @@ class TestAIProviderRetries(unittest.TestCase):
             self.assertEqual(call_count[0],1)
             sleep.assert_not_called()
 
+    def test_long_retry_after_fails_over_without_waiting(self):
+        from unittest.mock import patch
+        import ai_providers
+        call_count=[0]
+        def call():
+            call_count[0] += 1
+            raise ai_providers.ProviderError('busy', True, 30)
+        with patch.object(ai_providers.time, 'sleep') as sleep:
+            with self.assertRaises(ai_providers.ProviderError):
+                ai_providers._with_retry(call)
+            self.assertEqual(call_count[0], 1)
+            sleep.assert_not_called()
+
+    def test_short_retry_after_is_capped_at_one_second(self):
+        from unittest.mock import patch
+        import ai_providers
+        outcomes=[ai_providers.ProviderError('busy', True, 5), 'ok']
+        def call():
+            value=outcomes.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        with patch.object(ai_providers.time, 'sleep') as sleep:
+            # A 5-second Retry-After is intentionally treated as failover, not retried.
+            with self.assertRaises(ai_providers.ProviderError):
+                ai_providers._with_retry(call)
+            sleep.assert_not_called()
+
 class TestVisualAnalysis(unittest.TestCase):
     def test_invalid_image_payload_is_rejected_before_provider_call(self):
         from unittest.mock import patch
