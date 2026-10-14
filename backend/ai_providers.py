@@ -5,6 +5,22 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 import re
+from contextvars import ContextVar
+from contextlib import contextmanager
+
+_TIMING_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar("ai_timing_context", default=None)
+
+@contextmanager
+def collect_timings(timings: dict[str, Any]):
+    """Collect per-request provider/retry diagnostics without shared global state."""
+    token = _TIMING_CONTEXT.set(timings)
+    try:
+        yield timings
+    finally:
+        _TIMING_CONTEXT.reset(token)
+
+def _timing_context():
+    return _TIMING_CONTEXT.get()
 
 @dataclass
 class ProviderError(Exception):
@@ -82,17 +98,30 @@ def _with_retry(call):
     blocks trying the next configured provider. Long Retry-After values therefore
     trigger immediate failover; short waits are capped at one second.
     """
+    timings = _timing_context()
     for attempt in range(2):
+        attempt_started = time.monotonic()
         try:
-            return call()
+            result = call()
+            if attempt > 0 and timings is not None:
+                timings["retry_call_ms"] = int(timings.get("retry_call_ms", 0)) + int((time.monotonic() - attempt_started) * 1000)
+            return result
         except ProviderError as exc:
+            if attempt > 0 and timings is not None:
+                timings["retry_call_ms"] = int(timings.get("retry_call_ms", 0)) + int((time.monotonic() - attempt_started) * 1000)
             if not exc.transient or attempt == 1:
                 raise
             if exc.retry_after is not None and exc.retry_after > 2.0:
                 # Let generate_reply() move to the next provider instead of sleeping.
                 raise
             delay = min(exc.retry_after, 1.0) if exc.retry_after is not None else 0.4
-            time.sleep(max(0.0, delay))
+            if timings is not None:
+                timings["retry_count"] = int(timings.get("retry_count", 0)) + 1
+                wait_started = time.monotonic()
+                time.sleep(max(0.0, delay))
+                timings["retry_wait_ms"] = int(timings.get("retry_wait_ms", 0)) + int((time.monotonic() - wait_started) * 1000)
+            else:
+                time.sleep(max(0.0, delay))
 
 
 def _build_prompt(mode: str, module: str) -> str:
@@ -185,24 +214,47 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
         raise ProviderError("No hay proveedores de IA configurados para generar respuestas.")
 
     provider_failures = []
+    timings = _timing_context()
     for name, call in providers:
         provider_started = time.monotonic()
         try:
             answer = call()
             if isinstance(answer, str) and answer.strip():
-                logger.info("AI provider success: %s latency_ms=%s", name, int((time.monotonic()-provider_started)*1000))
                 structured = _parse_replies(answer)
+                provider_elapsed_ms = int((time.monotonic() - provider_started) * 1000)
                 if structured:
+                    logger.info("AI provider success: %s latency_ms=%s", name, provider_elapsed_ms)
+                    if timings is not None:
+                        timings.setdefault("provider_attempts", []).append({
+                            "provider": name,
+                            "status": "success",
+                            "latency_ms": provider_elapsed_ms,
+                        })
                     return {**structured, "provider": name}
                 # Do not silently present malformed model output as a valid two-reply result.
                 logger.warning("AI provider returned unstructured output: %s", name)
-                provider_failures.append({"provider": name, "error_code": "invalid_response", "latency_ms": int((time.monotonic()-provider_started)*1000)})
+                if timings is not None:
+                    timings.setdefault("provider_attempts", []).append({
+                        "provider": name,
+                        "status": "invalid_response",
+                        "latency_ms": provider_elapsed_ms,
+                    })
+                provider_failures.append({"provider": name, "error_code": "invalid_response", "latency_ms": provider_elapsed_ms})
                 continue
+            empty_elapsed_ms = int((time.monotonic() - provider_started) * 1000)
             logger.warning("AI provider returned an empty response: %s", name)
-            provider_failures.append({"provider": name, "error_code": "empty_response", "latency_ms": int((time.monotonic()-provider_started)*1000)})
+            if timings is not None:
+                timings.setdefault("provider_attempts", []).append({
+                    "provider": name,
+                    "status": "empty_response",
+                    "latency_ms": empty_elapsed_ms,
+                })
+            provider_failures.append({"provider": name, "error_code": "empty_response", "latency_ms": empty_elapsed_ms})
         except ProviderError as exc:
             elapsed_ms = int((time.monotonic()-provider_started)*1000)
             logger.warning("AI provider failed: %s error_type=%s latency_ms=%s", name, type(exc).__name__, elapsed_ms)
+            if timings is not None:
+                timings.setdefault("provider_attempts", []).append({"provider": name, "status": "error", "latency_ms": elapsed_ms, "error_type": type(exc).__name__})
             provider_failures.append({"provider": name, "error_code": type(exc).__name__, "latency_ms": elapsed_ms})
             continue
     logger.warning("AI providers exhausted; refusing local fallback")
