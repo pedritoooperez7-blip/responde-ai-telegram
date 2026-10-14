@@ -1,14 +1,24 @@
 """Shared, server-side AI provider adapter with bounded transient retries."""
 from __future__ import annotations
-import json, os, time, urllib.error, urllib.request
+import json, os, time, urllib.error, urllib.request, random, threading, socket
 import logging
 from dataclasses import dataclass
 from typing import Any
 import re
 from contextvars import ContextVar
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from difflib import SequenceMatcher
 
 _TIMING_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar("ai_timing_context", default=None)
+_DEADLINE_CONTEXT: ContextVar[float | None] = ContextVar("ai_deadline_context", default=None)
+_HEALTH_LOCK = threading.Lock()
+_PROVIDER_HEALTH: dict[tuple[str, str], dict[str, Any]] = {}
+
+DEFAULT_GLOBAL_DEADLINE_SECONDS = 12.0
+MAX_REPLY_LENGTH = 1200
+
 
 @contextmanager
 def collect_timings(timings: dict[str, Any]):
@@ -27,101 +37,209 @@ class ProviderError(Exception):
     message: str
     transient: bool = False
     retry_after: float | None = None
+    category: str = "unknown"
+    status_code: int | None = None
     def __str__(self): return self.message
 
 
+@contextmanager
+def provider_deadline(seconds: float = DEFAULT_GLOBAL_DEADLINE_SECONDS):
+    """Set a request-wide monotonic deadline, respecting any tighter outer budget."""
+    now = time.monotonic()
+    proposed = now + max(0.05, float(seconds))
+    existing = _DEADLINE_CONTEXT.get()
+    token = _DEADLINE_CONTEXT.set(min(existing, proposed) if existing is not None else proposed)
+    try:
+        yield _DEADLINE_CONTEXT.get()
+    finally:
+        _DEADLINE_CONTEXT.reset(token)
+
+
+def remaining_provider_budget() -> float | None:
+    deadline = _DEADLINE_CONTEXT.get()
+    return None if deadline is None else max(0.0, deadline - time.monotonic())
+
+
+def classify_provider_error(status_code: int, response_text: str = "", headers: dict[str, str] | None = None) -> ProviderError:
+    """Map provider HTTP failures to safe internal categories; never retain raw bodies."""
+    headers = headers or {}
+    retry_after = _parse_retry_after(headers.get("Retry-After"))
+    lower = (response_text or "").lower()
+    if status_code in (401, 403):
+        category, message, transient = "authentication", "Credenciales o permisos del proveedor rechazados.", False
+        if status_code == 403 and any(word in lower for word in ("quota", "billing", "budget", "credit")):
+            category, message = "quota_exceeded", "La cuota o el crédito del proveedor no está disponible."
+    elif status_code == 429:
+        if any(word in lower for word in ("quota", "billing", "budget", "credit", "resource_exhausted")):
+            category, message, transient = "quota_exceeded", "La cuota o el crédito del proveedor está agotado.", False
+        else:
+            category, message, transient = "rate_limit", "El proveedor limitó temporalmente las solicitudes.", True
+    elif status_code == 408:
+        category, message, transient = "timeout", "El proveedor agotó el tiempo de espera.", True
+    elif status_code in (425, 500, 502, 503, 504) or 500 <= status_code <= 599:
+        category, message, transient = "service_unavailable", "El servicio del proveedor no está disponible temporalmente.", True
+    elif 400 <= status_code <= 499:
+        category, message, transient = "invalid_request", "El proveedor rechazó la solicitud.", False
+    else:
+        category, message, transient = "http_error", "El proveedor devolvió una respuesta HTTP inesperada.", False
+    return ProviderError(message, transient, retry_after, category, status_code)
+
+
+def _parse_retry_after(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+        if seconds >= 0:
+            return min(seconds, 120.0)
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = parsedate_to_datetime(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, min(120.0, (parsed - datetime.now(timezone.utc)).total_seconds()))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def validate_provider_configuration() -> dict[str, dict[str, Any]]:
+    """Report configured providers and model identifiers without exposing secrets."""
+    definitions = {
+        "gemini": ("GEMINI_API_KEY", "GEMINI_MODEL", "gemini-3.8-flash", True),
+        "groq": ("GROQ_API_KEY", "GROQ_MODEL", "openai/gpt-oss-120b", False),
+        "openrouter": ("OPENROUTER_API_KEY", "OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", True),
+        "cohere": ("COHERE_API_KEY", "COHERE_MODEL", "command-r7b-12-2024", False),
+    }
+    return {
+        name: {
+            "configured": bool((os.getenv(key) or "").strip()),
+            "model": (os.getenv(model_env) or default).strip(),
+            "vision_route_candidate": vision,
+            "vision_compatibility_verified": False,
+        }
+        for name, (key, model_env, default, vision) in definitions.items()
+    }
+
+
+def get_provider_health() -> dict[str, dict[str, Any]]:
+    """Return in-process provider/model health metadata; no credentials or user content."""
+    with _HEALTH_LOCK:
+        return {f"{provider}:{model}": dict(state) for (provider, model), state in _PROVIDER_HEALTH.items()}
+
+
+def _set_provider_health(provider: str, model: str, success: bool, category: str = "") -> None:
+    key = (provider, model)
+    now = time.time()
+    with _HEALTH_LOCK:
+        old = _PROVIDER_HEALTH.get(key, {})
+        failures = 0 if success else int(old.get("consecutive_failures", 0)) + 1
+        _PROVIDER_HEALTH[key] = {
+            "status": "healthy" if success else "degraded",
+            "consecutive_failures": failures,
+            "last_success_at": now if success else old.get("last_success_at"),
+            "last_failure_at": None if success else now,
+            "last_error_category": "" if success else (category or "unknown"),
+        }
+
+
+def record_token_usage(provider: str, model: str, input_tokens: int | None = None, output_tokens: int | None = None) -> None:
+    """Record provider-reported token counts only; never invent counts or prices."""
+    if input_tokens is None and output_tokens is None:
+        return
+    def valid(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+    entry = {"provider": provider, "model": model, "input_tokens": valid(input_tokens), "output_tokens": valid(output_tokens), "source": "provider_reported"}
+    timings = _timing_context()
+    if timings is not None:
+        timings.setdefault("token_usage", []).append(entry)
+
+
+def record_provider_metrics(provider: str, model: str, status: str, latency_ms: int, error_category: str = "") -> None:
+    """Append safe, per-request operational metadata to the existing timing context."""
+    timings = _timing_context()
+    if timings is not None:
+        timings.setdefault("provider_metrics", []).append({
+            "provider": provider, "model": model, "status": status,
+            "latency_ms": max(0, int(latency_ms)), "error_category": error_category or None,
+        })
+
+
 def _request_json(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float = 8) -> dict[str, Any]:
-    data = json.dumps(body).encode()
+    """Perform a bounded JSON POST and emit only sanitized operational diagnostics."""
+    remaining = remaining_provider_budget()
+    if remaining is not None:
+        if remaining <= 0:
+            raise ProviderError("Se agotó el presupuesto global de generación.", False, None, "timeout")
+        timeout = min(float(timeout), remaining)
+    data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={**headers, "Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=max(0.05, float(timeout))) as resp:
             parsed = json.loads(resp.read().decode("utf-8"))
-            if not isinstance(parsed, dict): raise ProviderError("Respuesta inválida del proveedor")
+            if not isinstance(parsed, dict):
+                raise ProviderError("Respuesta inválida del proveedor", False, None, "invalid_response")
             return parsed
     except urllib.error.HTTPError as exc:
-        retry_after = None
-        try: retry_after = max(0.0, min(30.0, float(exc.headers.get("Retry-After", ""))))
-        except (TypeError, ValueError): pass
-        transient = exc.code in (408, 425, 429, 500, 502, 503, 504)
-
-        # Extraer solo campos de diagnóstico; nunca registrar el cuerpo completo.
-        provider_status = None
-        provider_code = None
-        provider_message = None
         try:
-            error_data = json.loads(exc.read().decode("utf-8", errors="replace"))
-            if isinstance(error_data, dict):
-                detail = error_data.get("error", error_data)
-                if isinstance(detail, dict):
-                    provider_status = detail.get("status")
-                    provider_code = detail.get("code")
-                    provider_message = detail.get("message")
+            raw_error = exc.read().decode("utf-8", errors="replace")
         except Exception:
-            pass
-
-        # Limitar y sanear el texto para evitar exponer credenciales.
-        if isinstance(provider_message, str):
-            provider_message = provider_message[:300]
-            provider_message = re.sub(
-                r"(?i)(bearer\s+)\S+", r"\1[REDACTED]", provider_message
-            )
-            provider_message = re.sub(
-                r"(?i)(api[_ -]?key\s*[:=]\s*)\S+",
-                r"\1[REDACTED]", provider_message
-            )
-            provider_message = re.sub(
-                r"(?i)(key=)[^&\s]+", r"\1[REDACTED]", provider_message
-            )
-        else:
-            provider_message = None
-
+            raw_error = ""
+        error = classify_provider_error(exc.code, raw_error, dict(exc.headers or {}))
+        # Never log provider error bodies: they can echo prompts, PII, or secrets.
         logging.getLogger(__name__).warning(
-            "AI HTTP request failed: status=%s transient=%s provider_status=%s "
-            "provider_code=%s provider_message=%s",
-            exc.code, transient, provider_status, provider_code, provider_message
+            "AI HTTP request failed: status=%s category=%s transient=%s",
+            exc.code, error.category, error.transient,
         )
-        raise ProviderError(f"Proveedor respondió HTTP {exc.code}", transient, retry_after) from None
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        logging.getLogger(__name__).warning(
-            "AI connection failed: error_type=%s",
-            type(exc).__name__
-        )
-        raise ProviderError("Proveedor temporalmente no disponible", True) from None
+        raise error from None
+    except (TimeoutError, socket.timeout) as exc:
+        logging.getLogger(__name__).warning("AI request timed out: error_type=%s", type(exc).__name__)
+        raise ProviderError("El proveedor agotó el tiempo de espera.", True, None, "timeout") from None
+    except (urllib.error.URLError, OSError) as exc:
+        reason = getattr(exc, "reason", None)
+        category = "timeout" if isinstance(reason, (TimeoutError, socket.timeout)) else "connection_error"
+        logging.getLogger(__name__).warning("AI connection failed: category=%s error_type=%s", category, type(exc).__name__)
+        raise ProviderError("Proveedor temporalmente no disponible.", True, None, category) from None
     except (json.JSONDecodeError, UnicodeDecodeError):
-        raise ProviderError("Respuesta inválida del proveedor") from None
+        raise ProviderError("Respuesta JSON inválida del proveedor.", True, None, "invalid_response") from None
 
 
-def _with_retry(call):
-    """Retry briefly, but fail over immediately when a provider asks for a long wait.
-
-    This is a user-facing interactive flow: waiting 20-30 seconds for one provider
-    blocks trying the next configured provider. Long Retry-After values therefore
-    trigger immediate failover; short waits are capped at one second.
-    """
+def _with_retry(call, max_attempts: int = 3, base_delay: float = 0.4, max_delay: float = 2.0):
+    """Retry transient failures with bounded exponential full jitter and deadline awareness."""
     timings = _timing_context()
-    for attempt in range(2):
+    attempts = max(1, min(int(max_attempts), 4))
+    for attempt in range(attempts):
+        remaining = remaining_provider_budget()
+        if remaining is not None and remaining <= 0:
+            raise ProviderError("Se agotó el presupuesto global de generación.", False, None, "timeout")
         attempt_started = time.monotonic()
         try:
             result = call()
-            if attempt > 0 and timings is not None:
+            if timings is not None and attempt:
                 timings["retry_call_ms"] = int(timings.get("retry_call_ms", 0)) + int((time.monotonic() - attempt_started) * 1000)
             return result
         except ProviderError as exc:
-            if attempt > 0 and timings is not None:
+            if timings is not None and attempt:
                 timings["retry_call_ms"] = int(timings.get("retry_call_ms", 0)) + int((time.monotonic() - attempt_started) * 1000)
-            if not exc.transient or attempt == 1:
+            if not exc.transient or attempt >= attempts - 1:
                 raise
-            if exc.retry_after is not None and exc.retry_after > 2.0:
-                # Let generate_reply() move to the next provider instead of sleeping.
-                raise
-            delay = min(exc.retry_after, 1.0) if exc.retry_after is not None else 0.4
+            # A long Retry-After is not slept through on a user-facing request; failover is safer.
+            if exc.retry_after is not None:
+                delay = max(0.0, exc.retry_after)
+                if delay > 2.0:
+                    raise
+            else:
+                ceiling = min(max_delay, base_delay * (2 ** attempt))
+                delay = random.uniform(0.0, ceiling)
+            remaining = remaining_provider_budget()
+            if remaining is not None and delay >= remaining:
+                raise ProviderError("El reintento excedería el presupuesto global.", False, None, "timeout") from exc
             if timings is not None:
                 timings["retry_count"] = int(timings.get("retry_count", 0)) + 1
-                wait_started = time.monotonic()
-                time.sleep(max(0.0, delay))
+            wait_started = time.monotonic()
+            time.sleep(delay)
+            if timings is not None:
                 timings["retry_wait_ms"] = int(timings.get("retry_wait_ms", 0)) + int((time.monotonic() - wait_started) * 1000)
-            else:
-                time.sleep(max(0.0, delay))
 
 
 def _build_prompt(mode: str, module: str) -> str:
@@ -162,30 +280,56 @@ def _build_prompt(mode: str, module: str) -> str:
     ])
 
 
+def validate_reply_quality(reply: str, alternative: str) -> bool:
+    """Deterministic near-duplicate guard; this is not a semantic quality score."""
+    a, b = reply.casefold().strip(), alternative.casefold().strip()
+    if not a or not b:
+        return False
+    if SequenceMatcher(None, a, b).ratio() >= 0.92:
+        return False
+    tokens_a, tokens_b = set(re.findall(r"[\wáéíóúüñ]+", a)), set(re.findall(r"[\wáéíóúüñ]+", b))
+    if tokens_a and tokens_b and len(tokens_a | tokens_b) >= 4:
+        if len(tokens_a & tokens_b) / len(tokens_a | tokens_b) >= 0.88:
+            return False
+    return True
+
+
+def validate_reply_schema(value: Any) -> dict[str, str]:
+    """Validate the public two-reply schema without coercing non-string values."""
+    if not isinstance(value, dict) or set(value) != {"reply", "alternative"}:
+        raise ValueError("El JSON debe contener únicamente reply y alternative.")
+    reply, alternative = value.get("reply"), value.get("alternative")
+    if not isinstance(reply, str) or not isinstance(alternative, str):
+        raise ValueError("reply y alternative deben ser cadenas de texto.")
+    reply, alternative = reply.strip(), alternative.strip()
+    if not reply or not alternative:
+        raise ValueError("Las respuestas no pueden estar vacías.")
+    if len(reply) > MAX_REPLY_LENGTH or len(alternative) > MAX_REPLY_LENGTH:
+        raise ValueError("Las respuestas superan el límite permitido.")
+    if not validate_reply_quality(reply, alternative):
+        raise ValueError("Las alternativas están vacías o son demasiado similares.")
+    return {"reply": reply, "alternative": alternative}
+
+
 def _parse_replies(answer: str) -> dict[str, str] | None:
-    """Accept structured model output while tolerating fences and provider quirks."""
+    """Parse model JSON and validate strict fields, types, limits and diversity."""
+    if not isinstance(answer, str):
+        return None
     candidate = answer.strip()
     if candidate.startswith("```"):
-        candidate = candidate.strip("`").strip()
+        candidate = candidate[3:].strip()
         if candidate.lower().startswith("json"):
             candidate = candidate[4:].strip()
+        if candidate.endswith("```"):
+            candidate = candidate[:-3].strip()
     try:
         value = json.loads(candidate)
-    except (json.JSONDecodeError, TypeError):
+        return validate_reply_schema(value)
+    except (json.JSONDecodeError, TypeError, ValueError):
         return None
-    if not isinstance(value, dict):
-        return None
-    reply = value.get("reply")
-    alternative = value.get("alternative")
-    if not isinstance(reply, str) or not isinstance(alternative, str):
-        return None
-    reply, alternative = reply.strip(), alternative.strip()
-    if not reply or not alternative or reply.casefold() == alternative.casefold():
-        return None
-    return {"reply": reply[:1200], "alternative": alternative[:1200]}
 
 
-def generate_reply(text: str, mode: str, module: str, image_data_url: str | None = None) -> str | dict[str, str] | None:
+def _generate_reply_impl(text: str, mode: str, module: str, image_data_url: str | None = None) -> str | dict[str, str] | None:
     """Try configured providers in order; return two structured replies when supported."""
     prompt = _build_prompt(mode, module)
     user_content: Any = text.strip() or "Analiza el contexto visual y sugiere una respuesta."
@@ -199,7 +343,7 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
     if os.getenv("GEMINI_API_KEY"):
         providers.append(("gemini", lambda: _gemini(prompt, user_content)))
     if os.getenv("GROQ_API_KEY") and not image_data_url:
-        providers.append(("groq", lambda: _openai_compatible("https://api.groq.com/openai/v1/chat/completions", os.environ["GROQ_API_KEY"], os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"), prompt, user_content)))
+        providers.append(("groq", lambda: _openai_compatible("https://api.groq.com/openai/v1/chat/completions", os.environ["GROQ_API_KEY"], os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"), prompt, user_content)))
     if os.getenv("OPENROUTER_API_KEY"):
         providers.append(("openrouter", lambda: _openai_compatible("https://openrouter.ai/api/v1/chat/completions", os.environ["OPENROUTER_API_KEY"], os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"), prompt, user_content)))
     # Cohere is text-only here; it is a fallback, not a vision provider.
@@ -217,12 +361,15 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
     timings = _timing_context()
     for name, call in providers:
         provider_started = time.monotonic()
+        model = _model_for_provider(name)
         try:
             answer = call()
             if isinstance(answer, str) and answer.strip():
                 structured = _parse_replies(answer)
                 provider_elapsed_ms = int((time.monotonic() - provider_started) * 1000)
                 if structured:
+                    _set_provider_health(name, model, True)
+                    record_provider_metrics(name, model, "success", provider_elapsed_ms)
                     logger.info("AI provider success: %s latency_ms=%s", name, provider_elapsed_ms)
                     if timings is not None:
                         timings.setdefault("provider_attempts", []).append({
@@ -239,6 +386,8 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
                         "status": "invalid_response",
                         "latency_ms": provider_elapsed_ms,
                     })
+                _set_provider_health(name, model, False, "invalid_response")
+                record_provider_metrics(name, model, "error", provider_elapsed_ms, "invalid_response")
                 provider_failures.append({"provider": name, "error_code": "invalid_response", "latency_ms": provider_elapsed_ms})
                 continue
             empty_elapsed_ms = int((time.monotonic() - provider_started) * 1000)
@@ -249,18 +398,58 @@ def generate_reply(text: str, mode: str, module: str, image_data_url: str | None
                     "status": "empty_response",
                     "latency_ms": empty_elapsed_ms,
                 })
+            _set_provider_health(name, model, False, "empty_response")
+            record_provider_metrics(name, model, "error", empty_elapsed_ms, "empty_response")
             provider_failures.append({"provider": name, "error_code": "empty_response", "latency_ms": empty_elapsed_ms})
         except ProviderError as exc:
             elapsed_ms = int((time.monotonic()-provider_started)*1000)
             logger.warning("AI provider failed: %s error_type=%s latency_ms=%s", name, type(exc).__name__, elapsed_ms)
             if timings is not None:
                 timings.setdefault("provider_attempts", []).append({"provider": name, "status": "error", "latency_ms": elapsed_ms, "error_type": type(exc).__name__})
-            provider_failures.append({"provider": name, "error_code": type(exc).__name__, "latency_ms": elapsed_ms})
+            category = exc.category if isinstance(exc, ProviderError) else "unknown"
+            _set_provider_health(name, model, False, category)
+            record_provider_metrics(name, model, "error", elapsed_ms, category)
+            provider_failures.append({"provider": name, "error_code": category or type(exc).__name__, "latency_ms": elapsed_ms})
             continue
     logger.warning("AI providers exhausted; refusing local fallback")
     error = ProviderError("No se pudo generar una respuesta con la IA. Comprueba la configuración del proveedor e inténtalo de nuevo.")
     error.provider_failures = provider_failures
     raise error
+
+
+def _model_for_provider(provider: str) -> str:
+    config = validate_provider_configuration()
+    return str(config.get(provider, {}).get("model", "unknown"))
+
+
+def _record_usage_from_response(provider: str, model: str, data: dict[str, Any]) -> None:
+    """Read token counters only when the provider explicitly returns them."""
+    usage = data.get("usage") if isinstance(data, dict) else None
+    input_tokens = output_tokens = None
+    if isinstance(usage, dict):
+        input_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
+        output_tokens = usage.get("completion_tokens", usage.get("output_tokens"))
+        if provider == "cohere":
+            input_tokens = usage.get("tokens", {}).get("input_tokens") if isinstance(usage.get("tokens"), dict) else input_tokens
+            output_tokens = usage.get("tokens", {}).get("output_tokens") if isinstance(usage.get("tokens"), dict) else output_tokens
+    if provider == "gemini" and isinstance(data.get("usage"), dict):
+        input_tokens = data["usage"].get("total_input_tokens", data["usage"].get("input_tokens", input_tokens))
+        output_tokens = data["usage"].get("total_output_tokens", data["usage"].get("output_tokens", output_tokens))
+    record_token_usage(provider, model, input_tokens, output_tokens)
+
+
+def generate_reply(text: str, mode: str, module: str, image_data_url: str | None = None,
+                   global_deadline: float = DEFAULT_GLOBAL_DEADLINE_SECONDS) -> str | dict[str, str] | None:
+    """Public compatibility wrapper with a request-wide provider deadline."""
+    existing = _DEADLINE_CONTEXT.get()
+    token = None
+    if existing is None:
+        token = _DEADLINE_CONTEXT.set(time.monotonic() + max(0.05, float(global_deadline)))
+    try:
+        return _generate_reply_impl(text, mode, module, image_data_url)
+    finally:
+        if token is not None:
+            _DEADLINE_CONTEXT.reset(token)
 
 
 def _gemini(prompt: str, content: Any) -> str:
@@ -315,6 +504,8 @@ def _gemini(prompt: str, content: Any) -> str:
         },
     ))
 
+    _record_usage_from_response("gemini", model, data)
+
     # La respuesta de Interactions contiene pasos; la respuesta
     # final del modelo aparece en los pasos model_output.
     steps = data.get("steps", [])
@@ -364,6 +555,8 @@ def _openai_compatible(url: str, key: str, model: str, prompt: str, content: Any
         },
     ))
 
+    provider_name = "groq" if "groq.com" in url else "openrouter" if "openrouter.ai" in url else "openai_compatible"
+    _record_usage_from_response(provider_name, model, data)
     try:
         choices = data["choices"]
         first_choice = choices[0]
@@ -404,6 +597,10 @@ def _openai_compatible(url: str, key: str, model: str, prompt: str, content: Any
 
 
 def _cohere(prompt: str, text: str) -> str:
-    data = _with_retry(lambda: _request_json("https://api.cohere.com/v2/chat", {"Authorization":f"Bearer {os.environ['COHERE_API_KEY']}"}, {"model":os.getenv("COHERE_MODEL","command-r7b-12-2024"),"messages":[{"role":"system","content":prompt},{"role":"user","content":text}]}))
-    try: return "".join(x.get("text", "") for x in data["message"]["content"] if x.get("type")=="text")
-    except (KeyError, TypeError): raise ProviderError("Respuesta inválida de Cohere")
+    model = os.getenv("COHERE_MODEL", "command-r7b-12-2024")
+    data = _with_retry(lambda: _request_json("https://api.cohere.com/v2/chat", {"Authorization": f"Bearer {os.environ['COHERE_API_KEY']}"}, {"model": model, "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": text}]}))
+    _record_usage_from_response("cohere", model, data)
+    try:
+        return "".join(x.get("text", "") for x in data["message"]["content"] if x.get("type") == "text")
+    except (KeyError, TypeError):
+        raise ProviderError("Respuesta inválida de Cohere", False, None, "invalid_response") from None

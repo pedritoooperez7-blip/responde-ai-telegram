@@ -10,7 +10,9 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl
-from backend.ai_providers import ProviderError, generate_reply as ai_generate_reply, collect_timings
+from backend.ai_providers import (ProviderError, generate_reply as ai_generate_reply, collect_timings,
+                                  provider_deadline, remaining_provider_budget, get_provider_health,
+                                  validate_provider_configuration)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -583,7 +585,7 @@ def _validate_image_data_url(data_url: str) -> bytes:
 
 def _ai_model_for(provider: str) -> str:
     env_names = {"gemini": "GEMINI_MODEL", "groq": "GROQ_MODEL", "openrouter": "OPENROUTER_MODEL", "cohere": "COHERE_MODEL"}
-    defaults = {"gemini": "gemini-3.8-flash", "groq": "llama-3.3-70b-versatile", "openrouter": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "cohere": "command-r7b-12-2024"}
+    defaults = {"gemini": "gemini-3.8-flash", "groq": "openai/gpt-oss-120b", "openrouter": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "cohere": "command-r7b-12-2024"}
     return os.getenv(env_names.get(provider, ""), defaults.get(provider, "desconocido"))
 
 
@@ -871,7 +873,8 @@ def generate(p:Generate, request:Request):
     retry_number = 1 if int(attempt["retry_used"] or 0) else 0
     ocr_fallback_text = ""
     try:
-        with collect_timings(timing_details):
+        # One monotonic budget covers visual inference, OCR and textual fallback.
+        with collect_timings(timing_details), provider_deadline(12.0):
             ai_reply, ocr_fallback_text = _generate_with_ocr_fallback(t, mode, module, image_data_url or None, timing_details)
         if isinstance(ai_reply,dict):
             reply=ai_reply.get("reply")
@@ -1028,11 +1031,16 @@ def _ocr_text(img: Image.Image):
 
     for variant_index, variant in enumerate(_ocr_variants(img)):
         for psm in (6, 11, 12):
+            remaining = remaining_provider_budget()
+            if remaining is not None and remaining <= 0.1:
+                break
             try:
+                ocr_timeout = min(3.0, remaining) if remaining is not None else 3.0
                 txt = pytesseract.image_to_string(
                     variant,
                     lang="spa+eng",
-                    config=f"--oem 3 --psm {psm}"
+                    config=f"--oem 3 --psm {psm}",
+                    timeout=max(0.1, ocr_timeout),
                 )
             except Exception:
                 continue
@@ -1704,7 +1712,9 @@ def admin_ai_monitor(request: Request):
                     "premium":bool(r["premium_until"] and _utc_datetime(r["premium_until"]) > _utc_datetime())} for r in user_rows],
           "events":[dict(r) for r in event_rows],
           "days":[dict(r) for r in days],
-          "quality_note":"Puntuación heurística estimada (1–100), no evaluación semántica objetiva. No se guardan imágenes, textos de conversación, respuestas ni claves API."
+          "provider_health": get_provider_health(),
+          "provider_configuration": validate_provider_configuration(),
+          "quality_note":"Puntuación heurística estimada (1–100), no evaluación semántica objetiva. La salud en memoria es local al proceso y no sustituye métricas persistentes. No se guardan imágenes, textos de conversación, respuestas ni claves API."
         }
     finally:
         c.close()
