@@ -23,6 +23,22 @@ class TestProviderAdapterContracts(unittest.TestCase):
         self.assertEqual(request.call_args.args[0], "https://generativelanguage.googleapis.com/v1beta/interactions")
         self.assertEqual(request.call_args.args[1]["x-goog-api-key"], "test-secret")
 
+    def test_gemini_inline_image_payload_contract(self):
+        import base64
+        response = {"steps": [{"type": "model_output", "content": [{"type": "text", "text": STRUCTURED}]}]}
+        image_data = base64.b64encode(b"test-image-bytes").decode("ascii")
+        content = [
+            {"type": "text", "text": "Analiza esta captura"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image_data}},
+        ]
+        with patch.object(ai_providers, "_request_json", return_value=response) as request:
+            with patch.dict(os.environ, {"GEMINI_API_KEY": "test-secret", "GEMINI_MODEL": "gemini-3.8-flash"}):
+                answer = ai_providers._gemini("system", content)
+        self.assertEqual(answer, STRUCTURED)
+        payload = request.call_args.args[2]
+        self.assertEqual(payload["input"][1], {"type": "text", "text": "Analiza esta captura"})
+        self.assertEqual(payload["input"][2], {"type": "image", "mime_type": "image/png", "data": image_data})
+
     def test_groq_and_openrouter_openai_compatible_contracts(self):
         response = {"choices": [{"message": {"content": STRUCTURED}}]}
         for provider_url in (
@@ -63,7 +79,9 @@ class TestProviderAdapterContracts(unittest.TestCase):
                 ai_providers._request_json("https://provider.invalid", {"Authorization": "Bearer super-secret-value"}, {})
         joined = " ".join(logs.output)
         self.assertNotIn("super-secret-value", joined)
-        self.assertIn("api_key=[REDACTED]", joined)
+        # Provider bodies are not logged at all: even sanitized text can contain private data.
+        self.assertNotIn("api_key=", joined)
+        self.assertIn("category=authentication", joined)
 
 
 if __name__ == "__main__":

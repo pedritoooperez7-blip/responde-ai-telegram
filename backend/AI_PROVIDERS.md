@@ -5,11 +5,13 @@ La capa común está en `backend/ai_providers.py`. Las claves se configuran úni
 Variables opcionales:
 
 - `GEMINI_API_KEY` y opcionalmente `GEMINI_MODEL` (por defecto `gemini-3.8-flash`): texto e imágenes.
-- `GROQ_API_KEY` y opcionalmente `GROQ_MODEL` (por defecto `llama-3.3-70b-versatile`): texto.
+- `GROQ_API_KEY` y opcionalmente `GROQ_MODEL` (por defecto `openai/gpt-oss-120b`): texto.
 - `OPENROUTER_API_KEY` y opcionalmente `OPENROUTER_MODEL` (por defecto `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`): texto e imágenes si el modelo elegido las admite.
 - `COHERE_API_KEY` y opcionalmente `COHERE_MODEL` (por defecto `command-r7b-12-2024`): texto.
 
-Se intentan solo los proveedores configurados y capaces de atender el tipo de petición. Errores temporales (HTTP 408, 425, 429 y 5xx o problemas de conexión) admiten hasta dos intentos en total (una repetición), con espera progresiva y respeto de `Retry-After` limitado a 30 segundos. Errores permanentes no se reintentan. Si ningún proveedor produce dos respuestas estructuradas y diferentes, la solicitud falla con un error recuperable para que el usuario pueda usar el reintento disponible; no se inventa una segunda respuesta.
+Se intentan solo los proveedores configurados y elegibles para el tipo de petición. Los fallos transitorios usan hasta tres intentos por proveedor, backoff exponencial con jitter y presupuesto global de 12 segundos para la generación; los `Retry-After` válidos se respetan si la espera cabe en el presupuesto, y las esperas largas provocan failover para no bloquear al usuario. Errores permanentes (autenticación, solicitud inválida o cuota/crédito agotado) no se reintentan. El timeout HTTP se limita al presupuesto restante.
+
+El proveedor Groq usa por defecto `openai/gpt-oss-120b`: el modelo anterior `llama-3.3-70b-versatile` aparece en la documentación oficial de Groq como deprecado para planes no Enterprise desde agosto de 2026. El cambio se aplica solo cuando `GROQ_MODEL` no está configurado; la compatibilidad de cuenta y el smoke test real siguen pendientes. El nuevo modelo tiene precio por token, por lo que conviene validar coste y calidad en staging antes de producción.
 
 El análisis visual usa la misma ruta de generación para Chat y Estado/Story. La imagen sigue limitada a 8 MB y a formatos de imagen admitidos por el OCR. No se registra el contenido de la imagen ni las claves. Las capacidades, cuotas y disponibilidad reales dependen de la cuenta, modelo y proveedor configurados.
 
@@ -41,4 +43,4 @@ Este procedimiento prueba las credenciales y los modelos configurados en el runn
 
 ### Latencia y failover
 
-Las llamadas HTTP tienen un timeout de 8 segundos por intento. En un flujo interactivo, si un proveedor devuelve un `Retry-After` superior a 2 segundos, el adaptador no espera ese periodo: abandona ese proveedor y prueba el siguiente configurado. Los reintentos cortos esperan como máximo 1 segundo. Así se prioriza la respuesta al usuario frente a esperar mucho por un proveedor temporalmente saturado. La disponibilidad y latencia finales siguen dependiendo de cada proveedor.
+Las llamadas HTTP tienen un timeout de hasta 8 segundos por intento, reducido al tiempo restante del presupuesto global. Si un proveedor devuelve un `Retry-After` superior a 2 segundos, el adaptador no bloquea esperando: abandona ese proveedor y prueba el siguiente configurado. Los reintentos cortos usan backoff exponencial con jitter. El monitor de IA añade estado de salud por proveedor/modelo y configuración sin claves; ese estado es en memoria por proceso, no persistente ni un circuit breaker distribuido. Los contadores de tokens se guardan solo si el proveedor los devuelve; no se inventan precios ni costes.

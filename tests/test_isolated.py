@@ -697,6 +697,8 @@ class TestAIMonitorSecurity(unittest.TestCase):
         self.assertIn('users',data)
         self.assertIn('events',data)
         self.assertIn('quality_note',data)
+        self.assertIn('provider_health',data)
+        self.assertIn('provider_configuration',data)
         serialized=str(data).lower()
         self.assertNotIn('api_key',serialized)
         self.assertNotIn('texto ocr',serialized)
