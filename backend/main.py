@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl
+from urllib.request import Request as URLRequest, urlopen
+from urllib.error import URLError, HTTPError
 from backend.ai_providers import (ProviderError, generate_reply as ai_generate_reply, collect_timings,
                                   provider_deadline, remaining_provider_budget, get_provider_health,
                                   validate_provider_configuration)
@@ -42,6 +44,10 @@ FREE_STORY_MODES = {"gracioso", "coquetear"}
 PREMIUM_STORY_MODES = {"provocativo", "enamorar"}
 DB_PATH = os.getenv("DB_PATH", os.path.join(ROOT, "liggacuba.db"))
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+TELEGRAM_MINI_APP_URL = (os.getenv("TELEGRAM_MINI_APP_URL") or "https://responde-ai-telegram-production-6cdc.up.railway.app/").strip()
+TELEGRAM_CHANNEL_URL = "https://t.me/LiggaCubaOficial"
+TELEGRAM_COMMUNITY_URL = "https://t.me/+8O32GWhar8VjNjZh"
 SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 ATAJO_KEY = os.getenv("ATAJO_KEY", "")
@@ -352,6 +358,72 @@ def consume(uid, module, mode):
         raise
     finally:
         c.close()
+
+
+class TelegramWebhookUpdate(BaseModel):
+    update_id: Optional[int] = None
+    message: Optional[dict[str, Any]] = None
+
+
+def _telegram_start_message(chat_id: int | str) -> dict[str, Any]:
+    """Build the only bot interaction currently supported: /start welcome + navigation."""
+    return {
+        "chat_id": chat_id,
+        "text": (
+            "🇨🇺 ¡Bienvenido a RESPONDE AI!\n\n"
+            "¡Hola! 👋 Nos alegra tenerte aquí.\n\n"
+            "🚧 La función del bot estará disponible próximamente.\n"
+            "Mientras tanto, puedes utilizar nuestra Mini App desde el botón de abajo "
+            "para disfrutar de las funciones disponibles.\n\n"
+            "¡Gracias por acompañarnos! ❤️"
+        ),
+        "reply_markup": {
+            "inline_keyboard": [
+                [{"text": "📢 Canal oficial", "url": TELEGRAM_CHANNEL_URL}],
+                [{"text": "💬 Chat de la comunidad", "url": TELEGRAM_COMMUNITY_URL}],
+                [{"text": "🚀 Abrir Mini App", "web_app": {"url": TELEGRAM_MINI_APP_URL}}],
+            ]
+        },
+        "disable_web_page_preview": True,
+    }
+
+
+@app.post("/telegram/webhook")
+def telegram_webhook(update: TelegramWebhookUpdate, request: Request):
+    """Respond only to /start; all other bot chat functionality remains disabled."""
+    if not BOT_TOKEN:
+        raise HTTPException(503, "Telegram bot no configurado")
+    if TELEGRAM_WEBHOOK_SECRET:
+        supplied = request.headers.get("x-telegram-bot-api-secret-token", "")
+        if not hmac.compare_digest(supplied, TELEGRAM_WEBHOOK_SECRET):
+            raise HTTPException(401, "Webhook de Telegram no autorizado")
+    message = update.message if isinstance(update.message, dict) else None
+    if not message:
+        return {"ok": True, "ignored": True}
+    chat = message.get("chat")
+    text_value = message.get("text")
+    if not isinstance(chat, dict) or not chat.get("id") or not isinstance(text_value, str):
+        return {"ok": True, "ignored": True}
+    command = text_value.strip().split(maxsplit=1)[0].split("@", 1)[0].lower()
+    if command != "/start":
+        return {"ok": True, "ignored": True}
+    payload = _telegram_start_message(chat["id"])
+    api_request = URLRequest(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(api_request, timeout=5) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        if not isinstance(result, dict) or not result.get("ok"):
+            raise HTTPException(502, "Telegram no confirmó el envío del mensaje")
+    except HTTPException:
+        raise
+    except (URLError, HTTPError, TimeoutError, OSError, ValueError):
+        raise HTTPException(502, "No se pudo enviar el mensaje de bienvenida por Telegram") from None
+    return {"ok": True, "sent": True}
 
 
 class TelegramAuth(BaseModel): initData:str=""; user_id:Optional[str]=None
