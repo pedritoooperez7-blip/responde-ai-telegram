@@ -798,6 +798,38 @@ class TestCompleteAIFlow(unittest.TestCase):
             })
         self.assertEqual(response.status_code, 200, response.text)
 
+    def test_timing_persistence_does_not_add_a_critical_database_write(self):
+        from unittest.mock import patch
+        import sqlite3
+        uid = "latency-update-db-failure"
+        headers = auth(uid)
+        analysis = client.post("/api/analyze", headers=headers, json={
+            "user_id": uid, "module": "chat", "mode": "coquetear"
+        }).json()
+        real_db = main.db
+        calls = {"count": 0}
+        def fail_if_timing_opens_extra_connection():
+            calls["count"] += 1
+            if calls["count"] == 4:
+                raise sqlite3.OperationalError("synthetic extra timing write failure")
+            return real_db()
+        payload = {
+            "user_id": uid, "module": "chat", "mode": "coquetear",
+            "analysis_id": analysis["analysis_id"], "text": "Hola",
+            "idempotency_key": "latency-db-failure-0001"
+        }
+        with patch.object(main, "ai_generate_reply", return_value={
+            "reply": "Respuesta uno", "alternative": "Respuesta dos", "provider": "test-provider"
+        }) as provider:
+            with patch.object(main, "db", side_effect=fail_if_timing_opens_extra_connection):
+                first = client.post("/api/generate-reply", headers=headers, json=payload)
+                self.assertEqual(first.status_code, 200, first.text)
+                self.assertEqual(calls["count"], 3, "la instrumentación no debe abrir una cuarta conexión")
+            replay = client.post("/api/generate-reply", headers=headers, json=payload)
+            self.assertEqual(replay.status_code, 200, replay.text)
+            self.assertEqual(replay.json(), first.json())
+            provider.assert_called_once()
+
     def test_event_logging_failure_does_not_break_success_response(self):
         from unittest.mock import patch
         import sqlite3
@@ -946,6 +978,38 @@ class TestSyntheticTelegramScreenshotOCR(unittest.TestCase):
         self.assertEqual(provider.call_count, 2)
         self.assertIsNone(provider.call_args_list[1].args[3])
         self.assertTrue(provider.call_args_list[1].args[0])
+
+
+class TestLatencyInstrumentation(unittest.TestCase):
+    def test_ocr_fallback_records_visual_ocr_and_alternative_durations(self):
+        from unittest.mock import patch
+        image_data_url = valid_image_data_url()
+        expected = {"reply": "Respuesta uno", "alternative": "Respuesta dos", "provider": "test"}
+        timings = {}
+        with patch.object(main, "ai_generate_reply", side_effect=[main.ProviderError("vision down"), expected]), \
+             patch.object(main, "_ocr_text", return_value="texto reconocido"):
+            result, recognized = main._generate_with_ocr_fallback("", "coquetear", "chat", image_data_url, timings)
+        self.assertEqual(result, expected)
+        self.assertEqual(recognized, "texto reconocido")
+        self.assertGreaterEqual(timings["visual_generation_ms"], 0)
+        self.assertGreaterEqual(timings["ocr_ms"], 0)
+        self.assertGreaterEqual(timings["alternative_generation_ms"], 0)
+
+    def test_retry_instrumentation_counts_retry_and_wait(self):
+        from unittest.mock import patch
+        from backend.ai_providers import collect_timings
+        timings = {}
+        outcomes = [main.ProviderError("busy", True, 0), "ok"]
+        def call():
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        with collect_timings(timings), patch("backend.ai_providers.time.sleep"):
+            from backend.ai_providers import _with_retry
+            self.assertEqual(_with_retry(call), "ok")
+        self.assertEqual(timings.get("retry_count"), 1)
+        self.assertGreaterEqual(timings.get("retry_wait_ms", -1), 0)
 
 
 class TestRetentionPolicy(unittest.TestCase):

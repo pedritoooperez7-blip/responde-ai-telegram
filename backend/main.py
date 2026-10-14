@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl
-from backend.ai_providers import ProviderError, generate_reply as ai_generate_reply
+from backend.ai_providers import ProviderError, generate_reply as ai_generate_reply, collect_timings
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -587,13 +587,21 @@ def _ai_model_for(provider: str) -> str:
     return os.getenv(env_names.get(provider, ""), defaults.get(provider, "desconocido"))
 
 
-def _generate_with_ocr_fallback(text: str, mode: str, module: str, image_data_url: Optional[str]):
-    """Use OCR only after visual AI generation fails, then retry with text-capable providers."""
+def _generate_with_ocr_fallback(text: str, mode: str, module: str, image_data_url: Optional[str], timings: Optional[dict] = None):
+    """Generate visually first and time OCR/text fallback separately when needed."""
+    timings = timings if timings is not None else {}
+    visual_started = time.monotonic()
     try:
-        return ai_generate_reply(text, mode, module, image_data_url), ""
+        result = ai_generate_reply(text, mode, module, image_data_url)
+        timings["visual_generation_ms"] = int((time.monotonic() - visual_started) * 1000) if image_data_url else 0
+        timings["ocr_ms"] = 0
+        timings["alternative_generation_ms"] = 0
+        return result, ""
     except ProviderError as vision_error:
+        timings["visual_generation_ms"] = int((time.monotonic() - visual_started) * 1000) if image_data_url else 0
         if not image_data_url:
             raise
+        ocr_started = time.monotonic()
         try:
             _, separator, encoded = image_data_url.partition(",")
             if not separator:
@@ -601,18 +609,25 @@ def _generate_with_ocr_fallback(text: str, mode: str, module: str, image_data_ur
             image_bytes = base64.b64decode(encoded, validate=True)
             recognized_text = _ocr_text(_decode_ocr_image(image_bytes))
         except Exception:
+            timings["ocr_ms"] = int((time.monotonic() - ocr_started) * 1000)
             # Preserve the original vision-provider failure if local OCR cannot run.
             raise vision_error
 
+        timings["ocr_ms"] = int((time.monotonic() - ocr_started) * 1000)
         recognized_text = re.sub(r"\s+", " ", recognized_text or "").strip()[:12000]
         if not recognized_text:
+            timings["alternative_generation_ms"] = 0
             raise HTTPException(
                 422,
                 "La IA visual no está disponible y el OCR no pudo leer texto. Usa una captura más clara.",
             ) from vision_error
 
         fallback_text = " ".join(part for part in (text.strip(), recognized_text) if part)
-        return ai_generate_reply(fallback_text, mode, module, None), recognized_text
+        fallback_started = time.monotonic()
+        try:
+            return ai_generate_reply(fallback_text, mode, module, None), recognized_text
+        finally:
+            timings["alternative_generation_ms"] = int((time.monotonic() - fallback_started) * 1000)
 
 
 def _quality_estimate(reply: str, alternative: str, context: str, mode: str) -> int:
@@ -849,12 +864,15 @@ def generate(p:Generate, request:Request):
         c.close()
 
     generation_started = time.monotonic()
+    timing_details = {"visual_generation_ms": 0, "retry_count": 0, "retry_wait_ms": 0, "retry_call_ms": 0,
+                      "provider_attempts": [], "ocr_ms": 0, "alternative_generation_ms": 0}
     provider = "unknown"
     model = "unknown"
     retry_number = 1 if int(attempt["retry_used"] or 0) else 0
     ocr_fallback_text = ""
     try:
-        ai_reply, ocr_fallback_text = _generate_with_ocr_fallback(t, mode, module, image_data_url or None)
+        with collect_timings(timing_details):
+            ai_reply, ocr_fallback_text = _generate_with_ocr_fallback(t, mode, module, image_data_url or None, timing_details)
         if isinstance(ai_reply,dict):
             reply=ai_reply.get("reply")
             alternative=ai_reply.get("alternative")
@@ -866,7 +884,7 @@ def generate(p:Generate, request:Request):
             if not alt or alt.casefold()==reply.strip().casefold():
                 raise HTTPException(502,"La IA no generó dos respuestas diferentes. Puedes reintentar.")
             quality_score = _quality_estimate(reply.strip(), alt, t or ocr_fallback_text, mode)
-            result={"success":True,"reply":reply.strip()[:1200],"alternative":alt,"provider":provider,"model":model,"quality_score":quality_score,"ocr_fallback":bool(ocr_fallback_text),"ocr_text":ocr_fallback_text}
+            result={"success":True,"reply":reply.strip()[:1200],"alternative":alt,"provider":provider,"model":model,"quality_score":quality_score,"ocr_fallback":bool(ocr_fallback_text),"ocr_text":ocr_fallback_text,"timings_ms":timing_details}
         elif isinstance(ai_reply,str) and ai_reply.strip():
             raise HTTPException(502,"El proveedor no devolvió dos respuestas estructuradas y diferentes. Puedes reintentar.")
         else:
@@ -898,6 +916,10 @@ def generate(p:Generate, request:Request):
         try:
             c.execute("BEGIN IMMEDIATE")
             if 'result' in locals():
+                # Finalize timings before the existing idempotency transaction so
+                # telemetry cannot introduce a second critical database write.
+                timing_details["total_backend_ms"] = int((time.monotonic() - generation_started) * 1000)
+                result["timings_ms"] = timing_details
                 c.execute("UPDATE analysis_attempts SET generation_count=generation_count+1,generation_in_progress=0,generation_started_at=NULL WHERE id=? AND user_id=?",(p.analysis_id,uid))
                 c.execute("UPDATE ai_idempotency SET status='completed',result_json=?,updated_at=? WHERE user_id=? AND idempotency_key=?", (json.dumps(result, ensure_ascii=False, separators=(",", ":")), now(), uid, idem_key))
             else:
@@ -916,6 +938,15 @@ def generate(p:Generate, request:Request):
             c.close()
     _record_ai_event(p.analysis_id, uid, module, mode, result.get("provider"), result.get("model"), "success", "",
                      int((time.monotonic()-generation_started)*1000), result.get("quality_score"), retry_number)
+    # Telemetry is best-effort: it must never turn a successful generation into an error.
+    try:
+        import logging
+        logging.getLogger(__name__).info(
+            "AI generation timing: %s",
+            json.dumps(timing_details, separators=(",", ":"), sort_keys=True),
+        )
+    except Exception:
+        pass
     return result
 
 
