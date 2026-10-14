@@ -70,6 +70,25 @@ class TestProviderErrorClassification(unittest.TestCase):
         self.assertNotIn("private network detail", str(caught.exception))
 
 
+class TestOpenAICompatibleErrorPayload(unittest.TestCase):
+    def test_http_200_error_object_is_classified_without_leaking_payload(self):
+        payload = {"error": {"message": "private prompt leaked", "code": "rate_limit_exceeded"}}
+        with patch.object(ai, "_with_retry", return_value=payload):
+            with self.assertRaises(ai.ProviderError) as caught:
+                ai._openai_compatible("https://openrouter.ai/api/v1/chat/completions", "key", "model", "prompt", "text")
+        self.assertEqual(caught.exception.category, "rate_limit")
+        self.assertTrue(caught.exception.transient)
+        self.assertNotIn("private prompt", str(caught.exception))
+
+    def test_auth_error_object_is_not_transient(self):
+        payload = {"error": {"message": "secret", "code": "invalid_api_key"}}
+        with patch.object(ai, "_with_retry", return_value=payload):
+            with self.assertRaises(ai.ProviderError) as caught:
+                ai._openai_compatible("https://api.groq.com/openai/v1/chat/completions", "key", "model", "prompt", "text")
+        self.assertEqual(caught.exception.category, "authentication")
+        self.assertFalse(caught.exception.transient)
+
+
 class TestStrictReplySchema(unittest.TestCase):
     def test_rejects_non_string_and_extra_fields(self):
         with self.assertRaises(ValueError):

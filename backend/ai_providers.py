@@ -557,6 +557,30 @@ def _openai_compatible(url: str, key: str, model: str, prompt: str, content: Any
 
     provider_name = "groq" if "groq.com" in url else "openrouter" if "openrouter.ai" in url else "openai_compatible"
     _record_usage_from_response(provider_name, model, data)
+    # Some gateways return HTTP 200 with an OpenAI-style {"error": ...} object.
+    # Classify it as a provider failure instead of misreporting a schema mismatch;
+    # never retain or log the raw error payload because it can contain private data.
+    if isinstance(data, dict) and "error" in data and "choices" not in data:
+        error_value = data.get("error")
+        error_meta = error_value if isinstance(error_value, dict) else {}
+        code = str(error_meta.get("code") or error_meta.get("type") or "").lower()
+        status = error_meta.get("status")
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            status = None
+        if status in (401, 403) or any(term in code for term in ("auth", "api_key", "permission")):
+            category, transient = "authentication", False
+        elif status == 429 or any(term in code for term in ("rate_limit", "quota", "billing", "credit")):
+            category, transient = ("quota_exceeded", False) if any(term in code for term in ("quota", "billing", "credit")) else ("rate_limit", True)
+        elif status is not None and status >= 500 or any(term in code for term in ("overloaded", "unavailable", "server_error", "timeout")):
+            category, transient = "service_unavailable", True
+        else:
+            category, transient = "provider_error", False
+        logging.getLogger(__name__).warning(
+            "AI provider returned an error object: provider=%s category=%s", provider_name, category
+        )
+        raise ProviderError("El proveedor devolvió un error en su respuesta.", transient, None, category, status)
     try:
         choices = data["choices"]
         first_choice = choices[0]
