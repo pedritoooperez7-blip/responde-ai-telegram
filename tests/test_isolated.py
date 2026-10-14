@@ -2,6 +2,7 @@
 import base64
 from datetime import datetime, timedelta, timezone
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -9,12 +10,14 @@ import tempfile
 import time
 import unittest
 import uuid
+from urllib.parse import urlencode
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 TMP = tempfile.TemporaryDirectory(prefix="responde-ai-tests-")
 os.environ["DB_PATH"] = str(Path(TMP.name) / "test.sqlite3")
 os.environ["TELEGRAM_BOT_TOKEN"] = "dummy-telegram-token-for-tests"
+os.environ["SESSION_SECRET"] = "test-session-secret-32-chars-minimum-2026"
 os.environ["ADMIN_KEY"] = "dummy-admin-key-for-tests"
 os.environ["ATAJO_KEY"] = "dummy-atajo-key-for-tests"
 os.environ["BANDEC_ACCOUNT"] = "9244069990684435"
@@ -39,6 +42,128 @@ def valid_image_data_url():
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG")
     return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def signed_telegram_init_data(user_value=None, auth_date=None, extra=None):
+    """Build Telegram Web App initData using Telegram's documented HMAC scheme."""
+    params = {
+        "auth_date": str(int(time.time()) if auth_date is None else auth_date),
+        "user": json.dumps(
+            {"id": 123456789, "first_name": "Test"} if user_value is None else user_value,
+            separators=(",", ":"),
+        ),
+    }
+    if extra:
+        params.update(extra)
+    data_check = "\n".join(f"{key}={params[key]}" for key in sorted(params))
+    secret = hmac.new(b"WebAppData", main.BOT_TOKEN.encode(), hashlib.sha256).digest()
+    params["hash"] = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
+    return urlencode(params)
+
+
+class TestTelegramAuthentication(unittest.TestCase):
+    def test_valid_telegram_init_data(self):
+        self.assertEqual(main.verify_init(signed_telegram_init_data())["id"], 123456789)
+
+    def test_signed_additional_telegram_fields_are_supported(self):
+        data = signed_telegram_init_data(extra={"query_id": "AAExampleQuery", "chat_instance": "12345"})
+        self.assertEqual(main.verify_init(data)["id"], 123456789)
+
+    def test_auth_date_must_be_numeric(self):
+        data = signed_telegram_init_data(extra={"auth_date": "yesterday"})
+        with self.assertRaisesRegex(ValueError, "auth_date inválido"):
+            main.verify_init(data)
+
+    def test_invalid_telegram_hash_rejected(self):
+        data = signed_telegram_init_data().replace("hash=", "hash=0")
+        with self.assertRaisesRegex(ValueError, "Hash de Telegram"):
+            main.verify_init(data)
+
+    def test_missing_telegram_hash_rejected(self):
+        data = signed_telegram_init_data()
+        data_without_hash = "&".join(
+            item for item in data.split("&") if not item.startswith("hash=")
+        )
+        with self.assertRaisesRegex(ValueError, "Hash de Telegram"):
+            main.verify_init(data_without_hash)
+
+    def test_duplicate_init_data_parameters_rejected(self):
+        data = signed_telegram_init_data() + "&auth_date=" + str(int(time.time()))
+        with self.assertRaisesRegex(ValueError, "duplicados"):
+            main.verify_init(data)
+
+    def test_expired_telegram_auth_date_rejected(self):
+        data = signed_telegram_init_data(auth_date=int(time.time()) - 86401)
+        with self.assertRaisesRegex(ValueError, "expirada"):
+            main.verify_init(data)
+
+    def test_far_future_telegram_auth_date_rejected(self):
+        data = signed_telegram_init_data(auth_date=int(time.time()) + 61)
+        with self.assertRaisesRegex(ValueError, "futuro"):
+            main.verify_init(data)
+
+    def test_malformed_user_json_rejected(self):
+        data = signed_telegram_init_data(extra={"user": "not-json"})
+        with self.assertRaisesRegex(ValueError, "inválidos"):
+            main.verify_init(data)
+
+    def test_user_must_be_json_object(self):
+        data = signed_telegram_init_data(user_value=["not", "an", "object"])
+        with self.assertRaisesRegex(ValueError, "deben ser un objeto"):
+            main.verify_init(data)
+
+    def test_telegram_user_id_required_and_valid(self):
+        for value in ({"first_name": "Missing ID"}, {"id": 0}, {"id": "abc"}, {"id": True}):
+            with self.subTest(value=value):
+                data = signed_telegram_init_data(user_value=value)
+                with self.assertRaisesRegex(ValueError, "Identificador"):
+                    main.verify_init(data)
+
+    def test_telegram_endpoint_rejects_mismatched_body_user_id(self):
+        data = signed_telegram_init_data()
+        response = client.post(
+            "/api/auth/telegram",
+            json={"initData": data, "user_id": "999"},
+        )
+        self.assertEqual(response.status_code, 401)
+
+    def test_session_secret_is_required_and_independent(self):
+        original = main.SESSION_SECRET
+        try:
+            main.SESSION_SECRET = ""
+            with self.assertRaises(Exception) as caught:
+                main.session_token("session-secret-test")
+            self.assertEqual(getattr(caught.exception, "status_code", None), 503)
+        finally:
+            main.SESSION_SECRET = original
+
+    def test_session_token_rejects_tampering_and_bad_payloads(self):
+        token = main.session_token("session-valid")
+        payload, sig = token.split(".", 1)
+        with self.assertRaises(Exception):
+            main.verify_session(payload + "x." + sig)
+        with self.assertRaises(Exception):
+            main.verify_session("not-a-token")
+
+    def test_session_expiry_is_enforced(self):
+        payload = main._b64e(json.dumps(
+            {"uid": "expired-user", "exp": int(time.time()) - 1},
+            separators=(",", ":"),
+        ).encode())
+        signature = main._b64e(hmac.new(
+            main.SESSION_SECRET.encode(), payload.encode(), hashlib.sha256
+        ).digest())
+        with self.assertRaisesRegex(Exception, "Sesión expirada"):
+            main.verify_session(payload + "." + signature)
+
+    def test_session_signing_does_not_depend_on_bot_token(self):
+        token = main.session_token("independent-session")
+        original = main.BOT_TOKEN
+        try:
+            main.BOT_TOKEN = "a-different-bot-token"
+            self.assertEqual(main.verify_session(token), "independent-session")
+        finally:
+            main.BOT_TOKEN = original
 
 
 class TestHardening(unittest.TestCase):

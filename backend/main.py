@@ -9,7 +9,7 @@ import pytesseract
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qs
+from urllib.parse import parse_qsl
 from backend.ai_providers import ProviderError, generate_reply as ai_generate_reply
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -40,6 +40,7 @@ FREE_STORY_MODES = {"gracioso", "coquetear"}
 PREMIUM_STORY_MODES = {"provocativo", "enamorar"}
 DB_PATH = os.getenv("DB_PATH", os.path.join(ROOT, "liggacuba.db"))
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 ATAJO_KEY = os.getenv("ATAJO_KEY", "")
 BANDEC_ACCOUNT = os.getenv("BANDEC_ACCOUNT", "9244069990684435")
@@ -59,34 +60,58 @@ def _b64d(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
+def _session_signing_key() -> bytes:
+    """Return the independent session signing secret or fail closed."""
+    secret = SESSION_SECRET
+    if not isinstance(secret, str) or len(secret) < 32:
+        raise HTTPException(
+            503,
+            "SESSION_SECRET no configurado o demasiado corto (mínimo 32 caracteres)",
+        )
+    return secret.encode("utf-8")
+
+
 def session_token(uid: str) -> str:
-    payload = _b64e(json.dumps({"uid": str(uid), "exp": int(time.time()) + SESSION_TTL}, separators=(",", ":")).encode())
-    secret = hmac.new(b"LiggaCubaSession", BOT_TOKEN.encode(), hashlib.sha256).digest()
-    sig = _b64e(hmac.new(secret, payload.encode(), hashlib.sha256).digest())
+    uid = str(uid or "").strip()
+    if not uid:
+        raise HTTPException(400, "Usuario inválido")
+    key = _session_signing_key()
+    payload = _b64e(json.dumps(
+        {"uid": uid, "exp": int(time.time()) + SESSION_TTL},
+        separators=(",", ":"),
+    ).encode())
+    sig = _b64e(hmac.new(key, payload.encode(), hashlib.sha256).digest())
     return payload + "." + sig
 
 
 def verify_session(token: str) -> str:
-    if not token or "." not in token:
+    if not token or not isinstance(token, str) or len(token) > 8192 or "." not in token:
         raise HTTPException(401, "Sesión requerida")
+    key = _session_signing_key()
     payload, sig = token.rsplit(".", 1)
-    secret = hmac.new(b"LiggaCubaSession", BOT_TOKEN.encode(), hashlib.sha256).digest()
-    expected = _b64e(hmac.new(secret, payload.encode(), hashlib.sha256).digest())
+    expected = _b64e(hmac.new(key, payload.encode(), hashlib.sha256).digest())
     if not hmac.compare_digest(sig, expected):
         raise HTTPException(401, "Sesión inválida")
     try:
         data = json.loads(_b64d(payload).decode())
-        if int(data.get("exp", 0)) < int(time.time()):
+        if not isinstance(data, dict):
+            raise ValueError("payload inválido")
+        expiry = data.get("exp")
+        if isinstance(expiry, bool) or not isinstance(expiry, int):
+            raise ValueError("expiración inválida")
+        if expiry <= int(time.time()):
             raise HTTPException(401, "Sesión expirada")
-        uid = str(data.get("uid", ""))
+        raw_uid = data.get("uid")
+        if not isinstance(raw_uid, (str, int)) or isinstance(raw_uid, bool):
+            raise ValueError("usuario inválido")
+        uid = str(raw_uid).strip()
         if not uid:
-            raise HTTPException(401, "Usuario inválido")
+            raise ValueError("usuario inválido")
         return uid
     except HTTPException:
         raise
     except Exception:
         raise HTTPException(401, "Sesión inválida")
-
 
 def current_user(request: Request) -> str:
     auth = request.headers.get("authorization", "")
@@ -354,23 +379,62 @@ class SaveSituation(BaseModel): user_id:str; ocr_text:str=""; reply:str=""
 class OCR(BaseModel): image:str
 
 
-def parse_init(s): return {k:v[0] for k,v in parse_qs(s,keep_blank_values=True).items() if v}
+def parse_init(s: str) -> dict:
+    """Parse Telegram initData while rejecting malformed and duplicate parameters."""
+    if not isinstance(s, str) or not s or len(s) > 16_384:
+        raise ValueError("initData vacío o demasiado grande")
+    try:
+        pairs = parse_qsl(s, keep_blank_values=True, strict_parsing=True, max_num_fields=100)
+    except (ValueError, UnicodeError):
+        raise ValueError("initData malformado")
+    parsed = {}
+    for key, value in pairs:
+        if not key:
+            raise ValueError("Parámetro de Telegram vacío")
+        if key in parsed:
+            raise ValueError("Parámetros de Telegram duplicados")
+        parsed[key] = value
+    return parsed
 
-def verify_init(s):
-    if not s: raise ValueError("initData vacío")
-    p=parse_init(s); received=p.pop("hash","")
+
+def verify_init(s: str) -> dict:
+    if not s:
+        raise ValueError("initData vacío")
+    p = parse_init(s)
+    received = p.pop("hash", "")
     if not BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN no configurado")
-    if not received: raise ValueError("Falta hash de Telegram")
-    try: auth_date=int(p.get("auth_date","0"))
-    except ValueError: raise ValueError("auth_date inválido")
-    if abs(time.time()-auth_date)>86400: raise ValueError("Sesión de Telegram expirada")
-    check="\n".join(f"{k}={p[k]}" for k in sorted(p)); secret=hmac.new(b"WebAppData",BOT_TOKEN.encode(),hashlib.sha256).digest(); calc=hmac.new(secret,check.encode(),hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(calc,received): raise ValueError("Hash de Telegram inválido")
-    u=json.loads(p.get("user","{}"));
-    if not u: raise ValueError("Usuario Telegram ausente")
-    return u
-
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", received):
+        raise ValueError("Hash de Telegram ausente o inválido")
+    raw_auth_date = p.get("auth_date", "")
+    if not raw_auth_date or not raw_auth_date.isascii() or not raw_auth_date.isdigit():
+        raise ValueError("auth_date inválido")
+    auth_date = int(raw_auth_date)
+    current_time = int(time.time())
+    if auth_date > current_time + 60:
+        raise ValueError("auth_date está en el futuro")
+    if current_time - auth_date > 86400:
+        raise ValueError("Sesión de Telegram expirada")
+    check = "\n".join(f"{k}={p[k]}" for k in sorted(p))
+    secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc, received.lower()):
+        raise ValueError("Hash de Telegram inválido")
+    raw_user = p.get("user")
+    if not raw_user:
+        raise ValueError("Usuario Telegram ausente")
+    try:
+        user_data = json.loads(raw_user)
+    except (json.JSONDecodeError, TypeError):
+        raise ValueError("Datos del usuario Telegram inválidos")
+    if not isinstance(user_data, dict):
+        raise ValueError("Los datos del usuario Telegram deben ser un objeto")
+    user_id = user_data.get("id")
+    if (isinstance(user_id, bool) or not isinstance(user_id, (int, str))
+            or not str(user_id).strip().isascii() or not str(user_id).strip().isdigit()
+            or int(user_id) <= 0):
+        raise ValueError("Identificador del usuario Telegram inválido")
+    return user_data
 
 def admin_identity(request: Request):
     if not ADMIN_KEY:
