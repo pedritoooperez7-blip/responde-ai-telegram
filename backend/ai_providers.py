@@ -1,6 +1,6 @@
 """Shared, server-side AI provider adapter with bounded transient retries."""
 from __future__ import annotations
-import json, os, time, urllib.error, urllib.request, random, threading, socket
+import json, os, time, urllib.error, urllib.request, random, threading, socket, sqlite3, base64, hashlib, ipaddress
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -9,6 +9,8 @@ from contextvars import ContextVar
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse
+from cryptography.fernet import Fernet, InvalidToken
 from difflib import SequenceMatcher
 
 _TIMING_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar("ai_timing_context", default=None)
@@ -122,6 +124,99 @@ def validate_provider_configuration() -> dict[str, dict[str, Any]]:
     }
 
 
+def _provider_fernet() -> Fernet:
+    secret = (os.getenv("AI_PROVIDER_ENCRYPTION_KEY") or "").strip()
+    if len(secret) < 32:
+        raise ProviderError("Configura AI_PROVIDER_ENCRYPTION_KEY con al menos 32 caracteres.", False, None, "configuration")
+    key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode("utf-8")).digest())
+    return Fernet(key)
+
+
+def encrypt_provider_key(api_key: str) -> str:
+    if not api_key or len(api_key) > 4096:
+        raise ValueError("La clave API está vacía o supera el límite permitido.")
+    return _provider_fernet().encrypt(api_key.encode("utf-8")).decode("ascii")
+
+
+def decrypt_provider_key(encrypted: str) -> str:
+    try:
+        return _provider_fernet().decrypt(encrypted.encode("ascii")).decode("utf-8")
+    except (InvalidToken, UnicodeDecodeError, ValueError):
+        raise ProviderError("No se pudo descifrar la clave del proveedor; revisa AI_PROVIDER_ENCRYPTION_KEY.", False, None, "configuration") from None
+
+def encrypt_cache_payload(payload: str) -> str:
+    return _provider_fernet().encrypt(payload.encode("utf-8")).decode("ascii")
+
+
+def decrypt_cache_payload(payload: str) -> str:
+    try:
+        return _provider_fernet().decrypt(payload.encode("ascii")).decode("utf-8")
+    except (InvalidToken, UnicodeDecodeError, ValueError):
+        raise ProviderError("No se pudo descifrar una entrada de caché.", False, None, "cache_encryption") from None
+
+
+def _provider_db_path() -> str:
+    return os.getenv("DB_PATH", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "liggacuba.db"))
+
+
+def load_custom_provider_configs() -> list[dict[str, Any]]:
+    """Load enabled custom OpenAI-compatible providers; API keys are decrypted only in memory."""
+    path = _provider_db_path()
+    if not os.path.exists(path) or not (os.getenv("AI_PROVIDER_ENCRYPTION_KEY") or "").strip():
+        return []
+    conn = None
+    try:
+        conn = sqlite3.connect(path, timeout=3)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT provider_id,name,base_url,model,api_key_encrypted,supports_text,supports_image,enabled,priority FROM custom_ai_providers WHERE enabled=1 ORDER BY priority ASC, name ASC").fetchall()
+        configs = []
+        for row in rows:
+            try:
+                key = decrypt_provider_key(row["api_key_encrypted"])
+                configs.append({**dict(row), "api_key": key})
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Custom AI provider skipped: id=%s category=%s", row["provider_id"], getattr(exc, "category", "configuration"))
+        return configs
+    except (sqlite3.Error, OSError):
+        # The built-in environment-configured providers remain usable if custom config is unavailable.
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def normalize_compatible_endpoint(base_url: str) -> str:
+    parsed = urlparse((base_url or "").strip())
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("La URL debe ser HTTPS y no puede incluir credenciales, consulta ni fragmento.")
+    host = parsed.hostname.lower().rstrip(".")
+    if host in {"localhost", "localhost.localdomain"} or host.endswith((".local", ".internal", ".localhost")):
+        raise ValueError("No se permiten destinos locales o internos.")
+    try:
+        ip = ipaddress.ip_address(host)
+        if not ip.is_global:
+            raise ValueError("No se permiten direcciones IP privadas o reservadas.")
+    except ValueError as exc:
+        if "does not appear to be an IPv4 or IPv6 address" not in str(exc) and "is not a valid" not in str(exc):
+            raise
+    path = parsed.path.rstrip("/")
+    if not path:
+        path = "/v1"
+    if not path.endswith("/chat/completions"):
+        path += "/chat/completions"
+    return f"https://{parsed.netloc}{path}"
+
+
+def test_custom_provider(config: dict[str, Any]) -> dict[str, Any]:
+    """Perform a small live request. This can consume provider quota or incur a charge."""
+    endpoint = normalize_compatible_endpoint(str(config.get("base_url", "")))
+    started = time.monotonic()
+    answer = _openai_compatible(endpoint, str(config["api_key"]), str(config["model"]), "Responde únicamente con OK.", "Prueba de conexión. Responde OK.")
+    if not isinstance(answer, str) or not answer.strip():
+        raise ProviderError("El proveedor no devolvió contenido.", False, None, "empty_response")
+    return {"ok": True, "latency_ms": int((time.monotonic() - started) * 1000), "model": str(config["model"])}
+
+
 def get_provider_health() -> dict[str, dict[str, Any]]:
     """Return in-process provider/model health metadata; no credentials or user content."""
     with _HEALTH_LOCK:
@@ -218,7 +313,11 @@ def _with_retry(call, max_attempts: int = 3, base_delay: float = 0.4, max_delay:
             if timings is not None and attempt:
                 timings["retry_call_ms"] = int(timings.get("retry_call_ms", 0)) + int((time.monotonic() - attempt_started) * 1000)
             return result
-        except ProviderError as exc:
+        except Exception as exc:
+            # Permit ProviderError objects imported through an alternate module path,
+            # but never retry arbitrary programming errors.
+            if not isinstance(exc, ProviderError) and not (hasattr(exc, "transient") and hasattr(exc, "retry_after") and hasattr(exc, "category")):
+                raise
             if timings is not None and attempt:
                 timings["retry_call_ms"] = int(timings.get("retry_call_ms", 0)) + int((time.monotonic() - attempt_started) * 1000)
             if not exc.transient or attempt >= attempts - 1:
@@ -341,14 +440,28 @@ def _generate_reply_impl(text: str, mode: str, module: str, image_data_url: str 
         user_content = [{"type":"text", "text":user_content}, {"type":"image_url", "image_url":{"url":image_data_url}}]
     providers = []
     if os.getenv("GEMINI_API_KEY"):
-        providers.append(("gemini", lambda: _gemini(prompt, user_content)))
+        providers.append((int(os.getenv("AI_PRIORITY_GEMINI", "10")), "gemini", os.getenv("GEMINI_MODEL", "gemini-3.8-flash"), lambda: _gemini(prompt, user_content)))
     if os.getenv("GROQ_API_KEY") and not image_data_url:
-        providers.append(("groq", lambda: _openai_compatible("https://api.groq.com/openai/v1/chat/completions", os.environ["GROQ_API_KEY"], os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"), prompt, user_content)))
+        providers.append((int(os.getenv("AI_PRIORITY_GROQ", "20")), "groq", os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"), lambda: _openai_compatible("https://api.groq.com/openai/v1/chat/completions", os.environ["GROQ_API_KEY"], os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"), prompt, user_content)))
     if os.getenv("OPENROUTER_API_KEY"):
-        providers.append(("openrouter", lambda: _openai_compatible("https://openrouter.ai/api/v1/chat/completions", os.environ["OPENROUTER_API_KEY"], os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"), prompt, user_content)))
+        providers.append((int(os.getenv("AI_PRIORITY_OPENROUTER", "30")), "openrouter", os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"), lambda: _openai_compatible("https://openrouter.ai/api/v1/chat/completions", os.environ["OPENROUTER_API_KEY"], os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"), prompt, user_content)))
     # Cohere is text-only here; it is a fallback, not a vision provider.
     if os.getenv("COHERE_API_KEY") and not image_data_url:
-        providers.append(("cohere", lambda: _cohere(prompt, str(user_content))))
+        providers.append((int(os.getenv("AI_PRIORITY_COHERE", "40")), "cohere", os.getenv("COHERE_MODEL", "command-r7b-12-2024"), lambda: _cohere(prompt, str(user_content))))
+    for custom in load_custom_provider_configs():
+        if image_data_url and not bool(custom.get("supports_image")):
+            continue
+        if not image_data_url and not bool(custom.get("supports_text")):
+            continue
+        try:
+            endpoint = normalize_compatible_endpoint(str(custom["base_url"]))
+        except ValueError:
+            logging.getLogger(__name__).warning("Custom AI provider skipped: invalid endpoint id=%s", custom.get("provider_id"))
+            continue
+        name = "custom:" + str(custom["provider_id"])
+        model = str(custom["model"])
+        providers.append((int(custom.get("priority", 50)), name, model, lambda cfg=custom, url=endpoint: _openai_compatible(url, str(cfg["api_key"]), str(cfg["model"]), prompt, user_content)))
+    providers.sort(key=lambda item: (item[0], item[1]))
     logger = logging.getLogger(__name__)
 
     if not providers:
@@ -359,9 +472,8 @@ def _generate_reply_impl(text: str, mode: str, module: str, image_data_url: str 
 
     provider_failures = []
     timings = _timing_context()
-    for name, call in providers:
+    for _priority, name, model, call in providers:
         provider_started = time.monotonic()
-        model = _model_for_provider(name)
         try:
             answer = call()
             if isinstance(answer, str) and answer.strip():
@@ -377,7 +489,7 @@ def _generate_reply_impl(text: str, mode: str, module: str, image_data_url: str 
                             "status": "success",
                             "latency_ms": provider_elapsed_ms,
                         })
-                    return {**structured, "provider": name}
+                    return {**structured, "provider": name, "model": model}
                 # Do not silently present malformed model output as a valid two-reply result.
                 logger.warning("AI provider returned unstructured output: %s", name)
                 if timings is not None:
