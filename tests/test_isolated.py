@@ -971,6 +971,8 @@ class TestSyntheticTelegramScreenshotOCR(unittest.TestCase):
 
     def test_real_ocr_fallback_calls_text_provider_after_visual_failure(self):
         from unittest.mock import patch
+        if not __import__("shutil").which("tesseract"):
+            self.skipTest("Tesseract is not installed")
         image_data_url = self._screenshot_data_url()
         expected = {"reply": "Podrías decirle que te gustaría ir.", "alternative": "Suena bien, ¿a qué hora?", "provider": "test-text"}
         with patch.object(main, "ai_generate_reply", side_effect=[main.ProviderError("vision down"), expected]) as provider:

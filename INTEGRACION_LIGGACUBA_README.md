@@ -82,3 +82,12 @@ Las 2 omitidas son las pruebas de OCR real (`TestSyntheticTelegramScreenshotOCR`
 2. Ejecutar el registro del webhook con el bot **de pruebas**, no el de producción.
 3. Probar un pago real de extremo a extremo con el atajo bancario en el entorno de pruebas.
 4. Si tu repo original tiene el frontend servido por otra CDN o dominio, añádelo a `CORS_ORIGINS`.
+
+## Resultado de la integración (rama `integration/liggacuba-unified`, octubre 2026)
+
+Esta rama reemplaza a `bolt/liggacuba-production` (PR #48, ya fusionado): integra la entrega LiggaCuba directamente en la raíz del repositorio, sin carpeta intermedia.
+
+- Backend unificado en `backend/` (el contenido de `liggacuba-delivery/` ya no existe como copia separada).
+- Historiales de cambios antiguos movidos a `docs/`.
+- Ficheros `.BACKUP_*` eliminados del repositorio.
+- Suite completa: **109 pruebas pasadas, 6 omitidas** (2 OCR por falta de Tesseract en el sandbox de integración; 4 pruebas en vivo de proveedores que se lanzan aparte). Verificado también el arranque real con uvicorn: `/health`, Mini App, recursos estáticos y respuestas 401/503 del webhook sin configurar.
