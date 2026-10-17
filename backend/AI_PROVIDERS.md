@@ -44,3 +44,21 @@ Este procedimiento prueba las credenciales y los modelos configurados en el runn
 ### Latencia y failover
 
 Las llamadas HTTP tienen un timeout de hasta 8 segundos por intento, reducido al tiempo restante del presupuesto global. Si un proveedor devuelve un `Retry-After` superior a 2 segundos, el adaptador no bloquea esperando: abandona ese proveedor y prueba el siguiente configurado. Los reintentos cortos usan backoff exponencial con jitter. El monitor de IA añade estado de salud por proveedor/modelo y configuración sin claves; ese estado es en memoria por proceso, no persistente ni un circuit breaker distribuido. Los contadores de tokens se guardan solo si el proveedor los devuelve; no se inventan precios ni costes.
+
+
+## Proveedores adicionales desde el panel (actualización 2026-10-16)
+
+El panel de administración incorpora **Proveedores IA** para añadir proveedores adicionales que implementen el protocolo OpenAI-compatible (`/chat/completions`). Desde ahí se puede establecer ID, nombre, base URL HTTPS, modelo, capacidades declaradas (texto/imagen), prioridad, activación/desactivación, guardar cambios, probar conexión y eliminar una configuración. Los proveedores se intentan en orden de prioridad ascendente y se continúa con el siguiente si falla el anterior. Las capacidades de visión son una declaración administrativa; deben verificarse con una prueba real porque no todos los modelos aceptan imágenes.
+
+- Las URL deben ser HTTPS y no pueden apuntar a IPs privadas/reservadas, localhost ni hosts internos evidentes.
+- Las claves de proveedores personalizados se cifran con Fernet antes de guardarse en SQLite. La clave maestra deriva de `AI_PROVIDER_ENCRYPTION_KEY`, que debe ser un secreto estable de Railway de al menos 32 caracteres. **Configúrala antes de guardar claves de proveedores** y conserva una copia segura: si se pierde o cambia, las claves ya guardadas no se podrán descifrar y habrá que volver a introducirlas.
+- La API no devuelve el secreto después de guardarlo y el panel muestra únicamente si existe una clave. No se incluyen claves en logs ni en el historial administrativo.
+- La prueba de conexión realiza una llamada real pequeña al modelo; puede consumir cuota o producir un cargo.
+- Los cuatro proveedores integrados siguen usando sus variables de entorno. Su orden se puede ajustar mediante `AI_PRIORITY_GEMINI`, `AI_PRIORITY_GROQ`, `AI_PRIORITY_OPENROUTER` y `AI_PRIORITY_COHERE` (menor número = antes). Los proveedores personalizados usan el valor de prioridad configurado en el panel.
+- Solo se pueden añadir sin código adicional proveedores compatibles con el protocolo OpenAI. Protocolos propios requieren un adaptador implementado una vez.
+
+## Caché global cifrada
+
+Cuando `AI_PROVIDER_ENCRYPTION_KEY` está configurada, el backend puede reutilizar durante seis horas una respuesta solo si coinciden exactamente texto, hash de imagen, módulo, modo, versión de prompt y huella de configuración de proveedores. Se guarda el resultado cifrado; no se guardan en claro el texto original ni la imagen. La caché no cambia la cuota de análisis y es una optimización best-effort: si falla el cifrado/descifrado o la base de datos, se continúa con generación normal. Las entradas caducadas se limpian en el proceso de retención.
+
+La reutilización es global: una persona que envíe exactamente la misma entrada puede recibir la misma respuesta guardada. El backend no añade contexto privado oculto por usuario al prompt actual, pero si se introduce en el futuro contexto de perfil individual, debe incluirse en la clave de caché o deshabilitarse la reutilización para ese flujo. La caché es cifrada en reposo, no debe interpretarse como aislamiento por usuario.
