@@ -10,13 +10,22 @@ from typing import Any, Dict, Optional
 from urllib.parse import parse_qs
 try:
     from .ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
+    from .telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook
 except ImportError:  # Support running uvicorn with backend/ as the working directory.
     from ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
+    from telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook
 ai_generate_reply = _provider_generate_reply
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 app = FastAPI(title="LiggaCuba API", version="2.1")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins or ["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Authorization", "Content-Type", "X-Admin-Key", "X-Atajo-Key"],
+)
 
 FREE_DAILY_LIMIT = 3
 FREE_CHAT_MODES = {"gracioso", "coquetear", "enamorar"}
@@ -27,9 +36,9 @@ DB_PATH = os.getenv("DB_PATH", os.path.join(ROOT, "liggacuba.db"))
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 ATAJO_KEY = os.getenv("ATAJO_KEY", "")
-BANDEC_ACCOUNT = os.getenv("BANDEC_ACCOUNT", "9244069990684435")
+BANDEC_ACCOUNT = os.getenv("BANDEC_ACCOUNT", "")
 BPA_ACCOUNT = os.getenv("BPA_ACCOUNT", "")
-PAYMENT_PHONE = os.getenv("PAYMENT_PHONE", "52677163")
+PAYMENT_PHONE = os.getenv("PAYMENT_PHONE", "")
 SESSION_TTL = 86400
 MAX_OCR_BYTES = 8 * 1024 * 1024
 MAX_OCR_PIXELS = 24_000_000
@@ -499,16 +508,16 @@ def amount(plan,lang):
 
 
 def _telegram_start_message(chat_id):
-    """Build the welcome-only Telegram /start payload; sending is handled by the bot integration."""
-    return {
-        "chat_id": chat_id,
-        "text": "¡Bienvenido a LiggaCuba! La Mini App estará disponible próximamente.",
-        "reply_markup": {"inline_keyboard": [[
-            {"text": "📢 Canal oficial", "url": "https://t.me/LiggaCubaOficial"},
-            {"text": "💬 Chat de la comunidad", "url": "https://t.me/+8O32GWhar8VjNjZh"},
-            {"text": "🚀 Abrir Mini App", "web_app": {"url": "https://responde-ai-telegram-production-6cdc.up.railway.app/"}},
-        ]]},
-    }
+    """Compatibility wrapper: delegates to the real Telegram bot module."""
+    from . import telegram_bot as _tb
+    try:
+        app_url = _tb.mini_app_url()
+    except _tb.TelegramBotError:
+        app_url = ""
+    if not app_url:
+        return {"chat_id": chat_id, "text": "¡Bienvenido a LiggaCuba! La Mini App estará disponible próximamente.", "reply_markup": {"inline_keyboard": [[{"text": "📢 Canal oficial", "url": _tb.official_channel()}]]}}
+    payload = _tb.build_start_payload(chat_id, app_url, _tb.official_channel(), _tb.community_chat())
+    return payload
 
 def purge_expired_records():
     """Apply conservative retention: idempotency results 24h, AI events 30d, admin audit 90d."""
@@ -544,12 +553,60 @@ def admin_telegram_access(p: Usage, request: Request):
 def js(): return FileResponse(os.path.join(ROOT,"app.js"),media_type="application/javascript")
 @app.get("/style.css")
 def css(): return FileResponse(os.path.join(ROOT,"style.css"),media_type="text/css")
+@app.get("/liggacuba-logo.jpg")
+def logo(): return FileResponse(os.path.join(ROOT,"liggacuba-logo.jpg"),media_type="image/jpeg")
 @app.get("/privacy.html")
 def privacy(): return FileResponse(os.path.join(ROOT,"privacy.html"),media_type="text/html")
 @app.get("/terms.html")
 def terms(): return FileResponse(os.path.join(ROOT,"terms.html"),media_type="text/html")
 @app.get("/health")
 def health(): return {"status":"ok","service":"LiggaCuba","version":"2.1"}
+
+
+@app.post("/webhook/telegram")
+async def telegram_webhook(request: Request):
+    """Receive Telegram updates. Authenticated via X-Telegram-Bot-Api-Secret-Token."""
+    try:
+        verify_webhook_secret(request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""))
+    except TelegramBotError:
+        raise HTTPException(503, "Webhook de Telegram no configurado en el servidor")
+    if not verify_webhook_secret(request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")):
+        raise HTTPException(401, "Webhook no autorizado")
+    body = await request.body()
+    if len(body) > 256 * 1024:
+        raise HTTPException(413, "Update demasiado grande")
+    try:
+        update = json.loads(body.decode("utf-8"))
+        if not isinstance(update, dict):
+            raise ValueError("update no es un objeto")
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(400, "Update inválido")
+    try:
+        outcome = handle_update(update)
+        return {"ok": True, **outcome}
+    except TelegramBotError as exc:
+        # 502 makes Telegram retry delivery later; the update id is already
+        # claimed so a redelivery is safely deduplicated.
+        raise HTTPException(502, str(exc))
+
+
+@app.post("/api/admin/telegram-webhook/setup")
+def admin_setup_webhook(request: Request):
+    """Register the production webhook URL. Requires the owner admin key."""
+    admin(request, "settings")
+    public_url = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if not public_url.startswith("https://"):
+        raise HTTPException(503, "PUBLIC_BASE_URL debe ser la URL HTTPS pública de este despliegue")
+    try:
+        result = set_webhook(
+            public_url + "/webhook/telegram",
+            os.getenv("TELEGRAM_WEBHOOK_SECRET", ""),
+            ["message"],
+        )
+    except TelegramBotError as exc:
+        raise HTTPException(502, str(exc))
+    audit("owner", "telegram_webhook_setup", public_url, {})
+    return {"success": True, "webhook_url": public_url + "/webhook/telegram", "telegram_result": result}
 
 
 @app.post("/api/auth/telegram")
@@ -814,143 +871,6 @@ def release_analysis(p: dict, request: Request):
     finally: c.close()
 
 
-def _ocr_variants(img: Image.Image):
-    from PIL import ImageOps, ImageEnhance, ImageFilter
-
-    img = img.convert("RGB")
-    w, h = img.size
-    max_side = max(w, h)
-
-    # Mantener suficiente resolución para texto pequeño, pero evitar imágenes
-    # gigantes que hacen lento el OCR.
-    if max_side > 2600:
-        scale = 2600 / max_side
-        img = img.resize(
-            (max(1, int(w * scale)), max(1, int(h * scale))),
-            Image.Resampling.LANCZOS
-        )
-
-    gray = img.convert("L")
-
-    # El OCR funciona mejor cuando el texto ocupa una cantidad razonable
-    # de píxeles. Ampliamos capturas pequeñas.
-    if max(gray.size) < 1800:
-        factor = min(2.5, 1800 / max(gray.size))
-        gray = gray.resize(
-            (max(1, int(gray.width * factor)),
-             max(1, int(gray.height * factor))),
-            Image.Resampling.LANCZOS
-        )
-
-    gray = ImageOps.autocontrast(gray, cutoff=1)
-    gray = ImageEnhance.Contrast(gray).enhance(1.45)
-    gray = gray.filter(ImageFilter.SHARPEN)
-
-    variants = [gray]
-
-    # Umbral claro para capturas con fondo claro.
-    variants.append(
-        gray.point(lambda px: 255 if px > 165 else 0)
-    )
-
-    # Umbral más bajo para texto tenue/gris.
-    variants.append(
-        gray.point(lambda px: 255 if px > 125 else 0)
-    )
-
-    # Variante invertida para modo oscuro.
-    inv = ImageOps.invert(gray)
-    inv = ImageEnhance.Contrast(inv).enhance(1.25)
-    variants.append(inv)
-
-    # Umbral de la variante invertida.
-    variants.append(
-        inv.point(lambda px: 255 if px > 145 else 0)
-    )
-
-    return variants
-
-
-def _ocr_text(img: Image.Image):
-    candidates = []
-
-    for variant_index, variant in enumerate(_ocr_variants(img)):
-        for psm in (6, 11, 12):
-            try:
-                txt = pytesseract.image_to_string(
-                    variant,
-                    lang="spa+eng",
-                    config=f"--oem 3 --psm {psm}"
-                )
-            except Exception:
-                continue
-
-            txt = re.sub(r"[ \t]+", " ", txt)
-            txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
-
-            if not txt:
-                continue
-
-            lines = [x.strip() for x in txt.splitlines() if x.strip()]
-            alnum = len(re.findall(
-                r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]", txt
-            ))
-            words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]{2,}", txt)
-
-            # Penalizar resultados que parecen ruido de OCR.
-            junk = len(re.findall(r"[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9\s.,!?¿¡:;()'\"@#$%&+\-_/]", txt))
-
-            score = (
-                alnum
-                + min(len(lines), 25) * 8
-                + min(len(words), 80) * 2
-                - junk * 3
-            )
-
-            # Preferir texto suficientemente largo y con palabras reales.
-            if len(words) >= 2:
-                score += 12
-            if len(txt) >= 20:
-                score += 8
-
-            candidates.append((score, txt, variant_index, psm))
-
-    if not candidates:
-        return ""
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1]
-
-
-
-
-
-
-
-def normalize_payment_phone(value: str) -> str:
-    """Normalize Cuban mobile numbers with or without the +53 country prefix."""
-    digits = re.sub(r"\D", "", value or "")
-    if len(digits) == 10 and digits.startswith("53"):
-        return digits[2:]
-    return digits
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 @app.get("/api/ai/providers")
 def ai_provider_status(request: Request):
     current_user(request)
@@ -1169,6 +1089,14 @@ def premium_check(p: Usage, request:Request):
         "premium_until": u.get("premium_until")
     }
 
+def normalize_payment_phone(value: str) -> str:
+    """Normalize Cuban mobile numbers with or without the +53 country prefix."""
+    digits = re.sub(r"\D", "", value or "")
+    if len(digits) == 10 and digits.startswith("53"):
+        return digits[2:]
+    return digits
+
+
 @app.post("/api/payment-phone")
 def payment_phone(p: PaymentPhone, request: Request):
     uid = current_user(request)
@@ -1177,14 +1105,6 @@ def payment_phone(p: PaymentPhone, request: Request):
         raise HTTPException(400, "Número de teléfono inválido")
     user(uid, {"payment_phone": phone})
     return {"success": True, "payment_phone": phone}
-
-
-def normalize_payment_phone(value: str) -> str:
-    """Normalize Cuban mobile numbers with or without the +53 country prefix."""
-    digits = re.sub(r"\D", "", value or "")
-    if len(digits) == 10 and digits.startswith("53"):
-        return digits[2:]
-    return digits
 
 
 @app.post("/api/atajo-pago")
@@ -1726,7 +1646,11 @@ def admin_ai_monitor(request: Request):
 
 @app.get("/api/admin/payments")
 def admin_payments(request:Request):
-    admin(request,"payments"); c=db(); rows=c.execute("SELECT * FROM payment_operations ORDER BY created_at DESC LIMIT 100").fetchall(); c.close(); return {"items":[dict(r) for r in rows]}
+    admin(request,"payments"); c=db()
+    rows=c.execute("""SELECT operation_id,user_id,plan,language,status,amount,proof_text,payment_method,payer_phone,destination_account,transaction_id,transfer_date,created_at,updated_at,verified_at,cancelled_at
+                      FROM payment_operations ORDER BY created_at DESC LIMIT 100""").fetchall()
+    c.close()
+    return {"items":[dict(r) for r in rows]}
 
 @app.post("/api/atajo-diagnostico")
 async def atajo_diagnostico(request: Request):
