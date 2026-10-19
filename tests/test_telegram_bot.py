@@ -80,6 +80,8 @@ class StartPayloadTests(unittest.TestCase):
             "https://liggacuba.example.app/",
         )
         self.assertEqual(len(buttons), 3)
+        self.assertEqual([len(row) for row in payload["reply_markup"]["inline_keyboard"]], [1, 1, 1])
+        self.assertIn("disponible próximamente", payload["text"])
 
 
 class HandleUpdateTests(unittest.TestCase):
@@ -140,24 +142,26 @@ class HandleUpdateTests(unittest.TestCase):
         self.assertEqual(len(buttons), 2)
         self.assertFalse(any("Chat de la comunidad" in b["text"] for b in buttons))
 
-    def test_unknown_command_is_ignored_without_sending(self):
+    def test_unknown_command_gets_availability_notice(self):
         sent = []
         update = start_message(102)
         update["message"]["text"] = "/help"
         with mock.patch.object(tb, "send_message", side_effect=lambda *a, **k: sent.append(a)):
             outcome = tb.handle_update(update)
-        self.assertEqual(outcome["action"], "ignored_unknown_command")
-        self.assertEqual(sent, [])
+        self.assertEqual(outcome["action"], "availability_notice_sent")
+        self.assertEqual(len(sent), 1)
+        self.assertIn("disponible próximamente", sent[0][1])
 
-    def test_plain_text_and_non_text_are_ignored(self):
+    def test_plain_text_and_non_text_get_availability_notice(self):
         sent = []
         plain = start_message(103)
         plain["message"]["text"] = "hola"
         photo = {"update_id": 104, "message": {"message_id": 11, "chat": {"id": 777}, "photo": []}}
         with mock.patch.object(tb, "send_message", side_effect=lambda *a, **k: sent.append(a)):
-            self.assertEqual(tb.handle_update(plain)["action"], "ignored_plain_message")
-            self.assertEqual(tb.handle_update(photo)["action"], "ignored_non_text")
-        self.assertEqual(sent, [])
+            self.assertEqual(tb.handle_update(plain)["action"], "availability_notice_sent")
+            self.assertEqual(tb.handle_update(photo)["action"], "availability_notice_sent")
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(all("disponible próximamente" in item[1] for item in sent))
 
     def test_update_without_id_is_rejected(self):
         with mock.patch.object(tb, "send_message"):
