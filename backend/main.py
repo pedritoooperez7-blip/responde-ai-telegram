@@ -288,6 +288,7 @@ def init_db():
         "ALTER TABLE analysis_attempts ADD COLUMN quota_log_id INTEGER",
         "ALTER TABLE analysis_attempts ADD COLUMN retry_call_started INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE analysis_attempts ADD COLUMN generation_calls INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE analysis_attempts ADD COLUMN updated_at TEXT",
         "ALTER TABLE ai_generation_events ADD COLUMN error_code TEXT",
         "ALTER TABLE ai_generation_events ADD COLUMN quality_score REAL",
         "ALTER TABLE ai_generation_events ADD COLUMN retry_number INTEGER NOT NULL DEFAULT 0",
