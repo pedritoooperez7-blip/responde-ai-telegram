@@ -197,6 +197,26 @@ class ApiCallTests(unittest.TestCase):
         self.assertEqual(captured["body"]["text"], "hola")
         self.assertEqual(result.get("message_id"), 5)
 
+    def test_http_error_includes_safe_telegram_description(self):
+        import io
+        error_body = json.dumps({
+            "ok": False,
+            "error_code": 400,
+            "description": "Bad Request: can't parse entities",
+        }).encode()
+        http_error = tb.urllib.error.HTTPError(
+            url="https://api.telegram.org/botSECRET/sendMessage",
+            code=400,
+            msg="Bad Request",
+            hdrs={},
+            fp=io.BytesIO(error_body),
+        )
+        with mock.patch.dict(os.environ, VALID_ENV):
+            importlib.reload(tb)
+            with mock.patch.object(tb.urllib.request, "urlopen", side_effect=http_error):
+                with self.assertRaisesRegex(tb.TelegramBotError, "can't parse entities"):
+                    tb.send_message(777, "hola")
+
     def test_api_error_raises_telegram_bot_error(self):
         class FakeResponse:
             def __enter__(self):

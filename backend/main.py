@@ -246,7 +246,7 @@ def init_db():
       retry_used INTEGER NOT NULL DEFAULT 0, generation_count INTEGER NOT NULL DEFAULT 0,
       generation_in_progress INTEGER NOT NULL DEFAULT 0, generation_started_at TEXT,
       quota_charged INTEGER NOT NULL DEFAULT 1, quota_log_id INTEGER, retry_call_started INTEGER NOT NULL DEFAULT 0,
-      generation_calls INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      generation_calls INTEGER NOT NULL DEFAULT 0, analysis_date TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS ai_idempotency(
       user_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_hash TEXT NOT NULL,
@@ -288,6 +288,8 @@ def init_db():
         "ALTER TABLE analysis_attempts ADD COLUMN quota_log_id INTEGER",
         "ALTER TABLE analysis_attempts ADD COLUMN retry_call_started INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE analysis_attempts ADD COLUMN generation_calls INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE analysis_attempts ADD COLUMN updated_at TEXT",
+        "ALTER TABLE analysis_attempts ADD COLUMN analysis_date TEXT",
         "ALTER TABLE ai_generation_events ADD COLUMN error_code TEXT",
         "ALTER TABLE ai_generation_events ADD COLUMN quality_score REAL",
         "ALTER TABLE ai_generation_events ADD COLUMN retry_number INTEGER NOT NULL DEFAULT 0",
@@ -659,8 +661,8 @@ def analyze(p: Analyze, request: Request):
     analysis_id = uuid.uuid4().hex
     c = db()
     try:
-        c.execute("INSERT INTO analysis_attempts(id,user_id,module,mode,quota_charged,quota_log_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                  (analysis_id, uid, module, mode, 0 if reservation.get("premium") else 1, reservation.get("usage_log_id"), now(), now()))
+        c.execute("INSERT INTO analysis_attempts(id,user_id,module,mode,quota_charged,quota_log_id,analysis_date,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                  (analysis_id, uid, module, mode, 0 if reservation.get("premium") else 1, reservation.get("usage_log_id"), today(), now(), now()))
         c.commit()
     except Exception:
         c.rollback()

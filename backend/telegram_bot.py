@@ -78,8 +78,21 @@ def bot_api_call(method: str, payload: Dict[str, Any], timeout: float = 8.0) -> 
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        logger.warning("Telegram API %s failed: status=%s", method, exc.code)
-        raise TelegramBotError(f"Telegram Bot API devolvió HTTP {exc.code}") from None
+        # Telegram includes a JSON description in HTTP error responses too.
+        # Read only the response body; never log the URL, token, or request payload.
+        description = None
+        try:
+            error_body = json.loads(exc.read().decode("utf-8", errors="replace"))
+            if isinstance(error_body, dict):
+                description = error_body.get("description")
+        except (ValueError, OSError):
+            pass
+        safe_description = str(description or "Telegram Bot API rechazó la solicitud")[:240]
+        logger.warning(
+            "Telegram API %s failed: status=%s description=%r",
+            method, exc.code, safe_description,
+        )
+        raise TelegramBotError(f"Telegram Bot API devolvió HTTP {exc.code}: {safe_description}") from None
     except (TimeoutError, OSError) as exc:
         logger.warning("Telegram API %s unreachable or timed out: error_type=%s", method, type(exc).__name__)
         raise TelegramBotError("Telegram Bot API no está accesible") from None
