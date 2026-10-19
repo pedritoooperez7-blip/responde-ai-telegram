@@ -269,6 +269,18 @@ def verify_webhook_secret(received: str) -> bool:
     return hmac.compare_digest(received, webhook_secret())
 
 
+def parse_command(text: str) -> str:
+    """Return the lower-case command of a message, or "" when there is none.
+
+    Handles empty/whitespace-only text and texts starting with "@" (which used
+    to raise IndexError), and keeps the Telegram "/start@botname" form working.
+    """
+    parts = (text or "").split()
+    if not parts:
+        return ""
+    return parts[0].split("@", 1)[0].lower()
+
+
 def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
     """Process one verified update; release its claim if processing fails.
 
@@ -296,7 +308,7 @@ def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
             return {"handled": True, "action": "ignored_missing_chat_id"}
 
         text = (message.get("text") or "").strip()
-        command = text.split("@", 1)[0].split()[0].lower() if text else ""
+        command = parse_command(text)
         if command == "/start":
             payload = build_start_payload(
                 chat_id,

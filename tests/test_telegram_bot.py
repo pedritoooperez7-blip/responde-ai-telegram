@@ -168,6 +168,43 @@ class HandleUpdateTests(unittest.TestCase):
             outcome = tb.handle_update({"message": {"text": "/start"}})
         self.assertEqual(outcome["handled"], False)
 
+    def test_parse_command_handles_edge_cases(self):
+        cases = {
+            "": "",
+            "   ": "",
+            "@": "",
+            "@amigo hola": "",
+            "@amigo": "",
+            "hola": "hola",
+            "/start": "/start",
+            "/start@LiggaCubaBot": "/start",
+            "/START": "/start",
+            "  /start   argumento": "/start",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(tb.parse_command(text), expected)
+
+    def test_mentions_and_empty_text_get_notice_without_error(self):
+        sent = []
+        texts = ["@amigo hola", "@", "   ", ""]
+        with mock.patch.object(tb, "send_message", side_effect=lambda *a, **k: sent.append(a)):
+            for offset, text in enumerate(texts):
+                update = start_message(300 + offset)
+                update["message"]["text"] = text
+                outcome = tb.handle_update(update)
+                self.assertEqual(outcome["action"], "availability_notice_sent")
+        self.assertEqual(len(sent), len(texts))
+
+    def test_start_with_bot_suffix_sends_start(self):
+        sent = []
+        update = start_message(310)
+        update["message"]["text"] = "/start@LiggaCubaBot"
+        with mock.patch.object(tb, "send_message", side_effect=lambda *a, **k: sent.append(a)):
+            outcome = tb.handle_update(update)
+        self.assertEqual(outcome["action"], "start_sent")
+        self.assertIn("LiggaCuba", sent[0][1])
+
 
 class ApiCallTests(unittest.TestCase):
     def test_send_message_posts_to_bot_api(self):

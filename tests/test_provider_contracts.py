@@ -74,7 +74,8 @@ class TestProviderAdapterContracts(unittest.TestCase):
             "https://provider.invalid", 401, "Unauthorized", {"Content-Type": "application/json"},
             io.BytesIO(b'{"error":{"message":"api_key=super-secret-value invalid"}}'),
         )
-        with patch.object(ai_providers.urllib.request, "urlopen", side_effect=error), self.assertLogs("ai_providers", level="WARNING") as logs:
+        with patch.object(ai_providers.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 443))]), \
+             patch.object(ai_providers.urllib.request, "urlopen", side_effect=error), self.assertLogs("ai_providers", level="WARNING") as logs:
             with self.assertRaises(ai_providers.ProviderError):
                 ai_providers._request_json("https://provider.invalid", {"Authorization": "Bearer super-secret-value"}, {})
         joined = " ".join(logs.output)
