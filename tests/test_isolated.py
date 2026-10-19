@@ -1040,6 +1040,39 @@ class TestRetentionPolicy(unittest.TestCase):
         self.assertEqual(event_count, 0)
         self.assertEqual(audit_count, 0)
 
+    def test_recent_records_are_kept_and_undefined_retention_data_untouched(self):
+        uid = "retention-keep"
+        recent = main.datetime.now(main.timezone.utc).isoformat()
+        c = main.db()
+        c.execute("INSERT OR REPLACE INTO ai_idempotency(user_id,idempotency_key,payload_hash,status,result_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                  (uid, "fresh-key", "hash", "completed", '{"reply":"ok"}', recent, recent))
+        c.execute("INSERT INTO ai_generation_events(user_id,status,latency_ms,created_at) VALUES(?,?,?,?)", (uid, "success", 1, recent))
+        # Retention for these tables is not defined, so they must never be purged here.
+        c.execute("INSERT INTO usage_logs(user_id,used_at,module,mode) VALUES(?,?,?,?)", (uid, "2000-01-01T00:00:00", "chat", "coquetear"))
+        c.execute("INSERT INTO payment_operations(operation_id,user_id,plan,language,status,amount,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                  ("retention-old-op", uid, "weekly", "es", "cancelled", "2500 CUP", "2000-01-01T00:00:00", "2000-01-01T00:00:00"))
+        c.commit(); c.close()
+        main.purge_expired_records()
+        c = main.db()
+        idem = c.execute("SELECT COUNT(*) n FROM ai_idempotency WHERE user_id=? AND idempotency_key='fresh-key'", (uid,)).fetchone()["n"]
+        events = c.execute("SELECT COUNT(*) n FROM ai_generation_events WHERE user_id=? AND created_at=?", (uid, recent)).fetchone()["n"]
+        usage = c.execute("SELECT COUNT(*) n FROM usage_logs WHERE user_id=?", (uid,)).fetchone()["n"]
+        payment = c.execute("SELECT COUNT(*) n FROM payment_operations WHERE operation_id='retention-old-op'").fetchone()["n"]
+        c.close()
+        self.assertEqual(idem, 1)
+        self.assertEqual(events, 1)
+        self.assertEqual(usage, 1)
+        self.assertEqual(payment, 1)
+
+    def test_background_purge_starts_at_most_once(self):
+        from unittest.mock import patch
+        with patch.object(main, "_background_purge_started", False), \
+             patch.object(main.threading, "Thread") as thread_cls:
+            self.assertTrue(main.start_background_purge())
+            self.assertFalse(main.start_background_purge())
+        thread_cls.assert_called_once()
+        self.assertTrue(thread_cls.call_args.kwargs.get("daemon"))
+
 
 class TestQuotaRecovery(unittest.TestCase):
     def test_retrying_same_analysis_after_provider_failure_reserves_quota_again(self):
@@ -1067,3 +1100,172 @@ class TestQuotaRecovery(unittest.TestCase):
         self.assertEqual(released.status_code, 200, released.text)
         self.assertTrue(released.json()["released"])
         self.assertEqual(main.usage(uid)["used_today"], before)
+
+
+class TestPaymentProofValidation(unittest.TestCase):
+    def _pending_operation(self, uid):
+        headers = auth(uid)
+        pending = client.post("/api/payments/pending", headers=headers, json={
+            "user_id": uid, "plan": "weekly", "language": "es", "payment_method": "BANDEC"
+        })
+        self.assertEqual(pending.status_code, 200, pending.text)
+        return headers, pending.json()["operation_id"]
+
+    def test_valid_proof_is_accepted(self):
+        headers, oid = self._pending_operation("proof-valid")
+        response = client.post("/api/payments/proof", headers=headers, json={
+            "operation_id": oid, "user_id": "ignored", "proof_text": "Transferencia 123", "proof_image": valid_image_data_url()
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "proof_submitted")
+        c = main.db()
+        stored = c.execute("SELECT status, proof_image FROM payment_operations WHERE operation_id=?", (oid,)).fetchone()
+        c.close()
+        self.assertEqual(stored["status"], "proof_submitted")
+        self.assertTrue(stored["proof_image"].startswith("data:image/jpeg;base64,"))
+
+    def test_proof_without_image_is_still_accepted(self):
+        headers, oid = self._pending_operation("proof-text-only")
+        response = client.post("/api/payments/proof", headers=headers, json={"operation_id": oid, "user_id": "x", "proof_text": "Solo texto"})
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_non_image_data_is_rejected_and_status_unchanged(self):
+        headers, oid = self._pending_operation("proof-invalid")
+        invalid_values = [
+            "dGV4dG8gcXVlIG5vIGVzIHVuYSBpbWFnZW4=",
+            "data:text/plain;base64," + base64.b64encode(b"not an image").decode("ascii"),
+            "data:image/png;base64," + base64.b64encode(b"not really a png").decode("ascii"),
+            "data:image/png;base64,%%%notbase64%%%",
+        ]
+        for value in invalid_values:
+            with self.subTest(value=value[:30]):
+                response = client.post("/api/payments/proof", headers=headers, json={"operation_id": oid, "proof_image": value})
+                self.assertEqual(response.status_code, 400, response.text)
+        c = main.db()
+        status = c.execute("SELECT status FROM payment_operations WHERE operation_id=?", (oid,)).fetchone()["status"]
+        c.close()
+        self.assertEqual(status, "pending")
+
+    def test_oversized_proof_is_rejected(self):
+        headers, oid = self._pending_operation("proof-oversized")
+        response = client.post("/api/payments/proof", headers=headers, json={"operation_id": oid, "proof_image": "a" * 3_000_001})
+        self.assertEqual(response.status_code, 400, response.text)
+        too_long = client.post("/api/payments/proof", headers=headers, json={"operation_id": oid, "proof_text": "x" * 4001})
+        self.assertEqual(too_long.status_code, 400, too_long.text)
+
+    def test_closed_operation_rejects_proof(self):
+        headers, oid = self._pending_operation("proof-closed")
+        self.assertEqual(client.post("/api/payments/cancel", headers=headers, json={"operation_id": oid, "user_id": "x"}).status_code, 200)
+        response = client.post("/api/payments/proof", headers=headers, json={"operation_id": oid, "proof_image": valid_image_data_url()})
+        self.assertEqual(response.status_code, 409, response.text)
+
+
+class TestPaymentCancellation(unittest.TestCase):
+    def _operation(self, uid):
+        headers = auth(uid)
+        pending = client.post("/api/payments/pending", headers=headers, json={
+            "user_id": uid, "plan": "weekly", "language": "es", "payment_method": "BPA"
+        })
+        self.assertEqual(pending.status_code, 200, pending.text)
+        return headers, pending.json()["operation_id"]
+
+    def _force_status(self, oid, status):
+        c = main.db()
+        c.execute("UPDATE payment_operations SET status=? WHERE operation_id=?", (status, oid))
+        c.commit(); c.close()
+
+    def _status(self, oid):
+        c = main.db()
+        value = c.execute("SELECT status FROM payment_operations WHERE operation_id=?", (oid,)).fetchone()["status"]
+        c.close()
+        return value
+
+    def test_cancel_pending_operation(self):
+        headers, oid = self._operation("cancel-valid")
+        response = client.post("/api/payments/cancel", headers=headers, json={"operation_id": oid, "user_id": "x"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "cancelled")
+        again = client.post("/api/payments/cancel", headers=headers, json={"operation_id": oid, "user_id": "x"})
+        self.assertEqual(again.status_code, 409, again.text)
+
+    def test_cancel_of_processing_operation_is_refused(self):
+        headers, oid = self._operation("cancel-processing")
+        self._force_status(oid, "processing")
+        response = client.post("/api/payments/cancel", headers=headers, json={"operation_id": oid, "user_id": "x"})
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(self._status(oid), "processing")
+
+    def test_cancel_of_verified_operation_does_not_change_status(self):
+        headers, oid = self._operation("cancel-verified")
+        self._force_status(oid, "verified")
+        response = client.post("/api/payments/cancel", headers=headers, json={"operation_id": oid, "user_id": "x"})
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(self._status(oid), "verified")
+
+    def test_conditional_update_does_not_overwrite_status_after_read(self):
+        from unittest.mock import patch
+        headers, oid = self._operation("cancel-race")
+        original_db = main.db
+
+        class RacingConnection:
+            """Simulates the status changing right before the conditional UPDATE."""
+
+            def __init__(self, conn):
+                self._conn = conn
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+            def execute(self, sql, params=()):
+                if sql.lstrip().upper().startswith("UPDATE PAYMENT_OPERATIONS SET STATUS='CANCELLED'"):
+                    c = original_db()
+                    c.execute("UPDATE payment_operations SET status='processing' WHERE operation_id=?", (oid,))
+                    c.commit(); c.close()
+                return self._conn.execute(sql, params)
+
+        with patch.object(main, "db", lambda: RacingConnection(original_db())):
+            response = client.post("/api/payments/cancel", headers=headers, json={"operation_id": oid, "user_id": "x"})
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(self._status(oid), "processing")
+
+
+class TestAdminLoginHardening(unittest.TestCase):
+    def test_corrupted_password_hash_returns_401(self):
+        username = "corrupt-" + uuid.uuid4().hex[:8]
+        for bad_hash in ("", "no-colon", "zz:<digest>", "abcdef:"):
+            with self.subTest(bad_hash=bad_hash):
+                c = main.db()
+                c.execute("INSERT OR REPLACE INTO admin_users(username,password_hash,permissions,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                          (username, bad_hash, json.dumps(["users"]), 1, main.now(), main.now()))
+                c.commit(); c.close()
+                response = client.post("/api/admin/login", json={"username": username, "password": "whatever-123"})
+                self.assertEqual(response.status_code, 401, response.text)
+
+    def test_owner_master_key_login_still_works(self):
+        response = client.post("/api/admin/login", json={"master_key": main.ADMIN_KEY})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["is_owner"])
+
+
+class TestOperationalConfigWarnings(unittest.TestCase):
+    def test_warnings_are_listed_and_never_raise(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"CORS_ORIGINS": "", "DB_PATH": ""}), \
+             patch.object(main, "ADMIN_KEY", "short"), patch.object(main, "SESSION_SECRET", ""), \
+             patch.object(main, "BANDEC_ACCOUNT", ""), patch.object(main, "BPA_ACCOUNT", ""), \
+             patch.object(main, "_cors_origins", []):
+            warnings = main.check_operational_configuration()
+        self.assertTrue(any(w.startswith("CORS_ORIGINS") for w in warnings), warnings)
+        self.assertTrue(any(w.startswith("ADMIN_KEY") for w in warnings), warnings)
+        self.assertTrue(any(w.startswith("SESSION_SECRET") for w in warnings), warnings)
+        self.assertTrue(any(w.startswith("DB_PATH") for w in warnings), warnings)
+
+    def test_configured_environment_has_no_cors_or_admin_warning(self):
+        from unittest.mock import patch
+        with patch.object(main, "_cors_origins", ["https://liggacuba.example.app"]), \
+             patch.object(main, "ADMIN_KEY", "x" * 40), patch.object(main, "SESSION_SECRET", "y" * 40), \
+             patch.dict(os.environ, {"DB_PATH": "/data/liggacuba.db"}):
+            warnings = main.check_operational_configuration()
+        self.assertFalse(any(w.startswith("CORS_ORIGINS") for w in warnings), warnings)
+        self.assertFalse(any(w.startswith("ADMIN_KEY") for w in warnings), warnings)
+        self.assertFalse(any(w.startswith("DB_PATH") for w in warnings), warnings)

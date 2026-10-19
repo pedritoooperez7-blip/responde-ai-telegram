@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from PIL import Image
-import base64, hashlib, hmac, io, json, logging, os, re, sqlite3, time, uuid
+import base64, hashlib, hmac, io, json, logging, os, re, sqlite3, threading, time, uuid
 import pytesseract
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -542,6 +542,81 @@ def purge_expired_records():
         raise
     finally:
         c.close()
+
+def check_operational_configuration() -> list[str]:
+    """Log-only warnings about operational settings; never aborts startup."""
+    warnings = []
+    if not _cors_origins:
+        warnings.append("CORS_ORIGINS is empty: every origin is allowed by default. Set the Mini App origin explicitly.")
+    if not ADMIN_KEY:
+        warnings.append("ADMIN_KEY is not configured: the admin panel and admin sessions are unavailable.")
+    elif len(ADMIN_KEY) < 32:
+        warnings.append("ADMIN_KEY is shorter than 32 characters; admin tokens are signed with a weak key.")
+    if not SESSION_SECRET or len(SESSION_SECRET) < 32:
+        warnings.append("SESSION_SECRET is missing or shorter than 32 characters: user sessions cannot be issued.")
+    if not os.getenv("DB_PATH", "").strip():
+        warnings.append("DB_PATH is not set: the SQLite file lives inside the container and is lost on redeploy unless a persistent volume is mounted.")
+    if not re.sub(r"\D", "", BANDEC_ACCOUNT or "") and not re.sub(r"\D", "", BPA_ACCOUNT or ""):
+        warnings.append("No BANDEC/BPA destination account is configured: payment operations cannot be created.")
+    return warnings
+
+
+@app.on_event("startup")
+def _log_operational_configuration():
+    for message in check_operational_configuration():
+        logger.warning("Configuration check: %s", message)
+    start_background_purge()
+
+
+PURGE_INTERVAL_SECONDS = 6 * 60 * 60
+PURGE_START_DELAY_SECONDS = 300
+_background_purge_started = False
+_background_purge_lock = threading.Lock()
+
+
+def _run_retention_purge() -> None:
+    """Run the existing retention policy; failures are logged, never raised."""
+    try:
+        from .telegram_bot import purge_processed_updates as _tg_purge
+    except ImportError:
+        from telegram_bot import purge_processed_updates as _tg_purge
+    try:
+        purge_expired_records()
+    except Exception:
+        logger.warning("Retention purge failed; it will be retried on the next cycle", exc_info=True)
+    try:
+        _tg_purge()
+    except Exception:
+        logger.warning("Telegram update retention purge failed; it will be retried on the next cycle", exc_info=True)
+
+
+def start_background_purge() -> bool:
+    """Start one daemon purge loop per process. Never blocks startup.
+
+    With several uvicorn workers each process runs its own loop; the deletes are
+    idempotent, so overlapping runs only duplicate work, never corrupt data.
+    """
+    global _background_purge_started
+    with _background_purge_lock:
+        if _background_purge_started:
+            return False
+        if os.getenv("DISABLE_BACKGROUND_PURGE", "").strip().lower() in {"1", "true", "yes"}:
+            return False
+        if DB_PATH in {"", ":memory:"}:
+            # Every connection would get its own empty in-memory database, so a
+            # background thread could not see (or purge) the app's data.
+            return False
+
+        def loop():
+            time.sleep(PURGE_START_DELAY_SECONDS)
+            while True:
+                _run_retention_purge()
+                time.sleep(PURGE_INTERVAL_SECONDS)
+
+        threading.Thread(target=loop, name="retention-purge", daemon=True).start()
+        _background_purge_started = True
+        return True
+
 
 @app.get("/")
 def root(): return FileResponse(os.path.join(ROOT,"index.html"))
@@ -1371,13 +1446,27 @@ def pending(p: Pending, request: Request):
 @app.post("/api/payments/proof")
 def proof(p:Proof, request:Request):
     uid=current_user(request)
-    c=db(); row=c.execute("SELECT * FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,uid)).fetchone()
-    if not row: c.close(); raise HTTPException(404,"Operación no encontrada")
-    if row["status"] not in {"pending","proof_submitted"}: c.close(); raise HTTPException(409,"La operación ya no admite comprobantes")
-    if len(p.proof_text)>4000: raise HTTPException(400,"Comprobante demasiado largo")
-    image=p.proof_image or ""
-    if len(image)>3_000_000: raise HTTPException(400,"El comprobante de imagen supera 3 MB")
-    t=now(); c.execute("UPDATE payment_operations SET status='proof_submitted',proof_text=?,proof_image=?,updated_at=? WHERE operation_id=?",(p.proof_text,image,t,p.operation_id)); c.commit(); c.close(); return {"success":True,"status":"proof_submitted"}
+    c=db()
+    try:
+        row=c.execute("SELECT * FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,uid)).fetchone()
+        if not row: raise HTTPException(404,"Operación no encontrada")
+        if row["status"] not in {"pending","proof_submitted"}: raise HTTPException(409,"La operación ya no admite comprobantes")
+        if len(p.proof_text)>4000: raise HTTPException(400,"Comprobante demasiado largo")
+        image=p.proof_image or ""
+        if len(image)>3_000_000: raise HTTPException(400,"El comprobante de imagen supera 3 MB")
+        if image:
+            # Only a valid image data URL is stored; the existing size limit is kept (or tightened).
+            try:
+                _validate_image_data_url(image)
+            except HTTPException as exc:
+                raise HTTPException(400, str(exc.detail)) from None
+        t=now(); c.execute("UPDATE payment_operations SET status='proof_submitted',proof_text=?,proof_image=?,updated_at=? WHERE operation_id=? AND user_id=?",(p.proof_text,image,t,p.operation_id,uid)); c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+    return {"success":True,"status":"proof_submitted"}
 
 @app.post("/api/payments/cancel")
 def cancel(p:PaymentId, request:Request):
@@ -1385,8 +1474,10 @@ def cancel(p:PaymentId, request:Request):
     if not uid: raise HTTPException(400,"user_id requerido")
     c=db(); row=c.execute("SELECT * FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,uid)).fetchone()
     if not row: c.close(); raise HTTPException(404,"Operación no encontrada")
-    if row["status"] in {"verified","cancelled"}: c.close(); raise HTTPException(409,"La operación ya está cerrada")
-    t=now(); c.execute("UPDATE payment_operations SET status='cancelled',cancelled_at=?,updated_at=? WHERE operation_id=?",(t,t,p.operation_id)); c.commit(); c.close(); return {"success":True,"status":"cancelled"}
+    if row["status"] in {"verified","cancelled"}: raise HTTPException(409,"La operación ya está cerrada")
+    t=now(); cur=c.execute("UPDATE payment_operations SET status='cancelled',cancelled_at=?,updated_at=? WHERE operation_id=? AND user_id=? AND status IN ('pending','proof_submitted')",(t,t,p.operation_id,uid)); c.commit(); c.close()
+    if cur.rowcount != 1: raise HTTPException(409,"La operación ya está cerrada")
+    return {"success":True,"status":"cancelled"}
 
 @app.post("/api/payments/status")
 def status(p:PaymentId, request:Request):
@@ -1411,8 +1502,16 @@ def admin_login(p: AdminLogin):
         c.close()
         if not row:
             raise HTTPException(401, "Credenciales incorrectas")
-        salt_hex, stored_hash = row["password_hash"].split(":", 1)
-        calculated = hashlib.pbkdf2_hmac("sha256", p.password.encode(), bytes.fromhex(salt_hex), 180000).hex()
+        try:
+            salt_hex, stored_hash = row["password_hash"].split(":", 1)
+            salt = bytes.fromhex(salt_hex)
+            if not salt or not stored_hash:
+                raise ValueError("hash incompleto")
+        except (ValueError, TypeError):
+            # A corrupted stored hash must never turn into a 500 or a login.
+            logger.error("Admin login rejected: malformed password hash for username=%s", row["username"])
+            raise HTTPException(401, "Credenciales incorrectas")
+        calculated = hashlib.pbkdf2_hmac("sha256", p.password.encode(), salt, 180000).hex()
         if not hmac.compare_digest(stored_hash, calculated):
             raise HTTPException(401, "Credenciales incorrectas")
         username = row["username"]

@@ -185,6 +185,65 @@ def load_custom_provider_configs() -> list[dict[str, Any]]:
             conn.close()
 
 
+def _is_public_ip(value: str) -> bool:
+    """True only for globally routable addresses (no private, loopback, link-local...)."""
+    try:
+        ip = ipaddress.ip_address(value.split("%", 1)[0])
+    except ValueError:
+        return False
+    return ip.is_global and not (ip.version == 6 and ip.ipv4_mapped is not None and not ip.ipv4_mapped.is_global)
+
+
+def _resolve_public_host(host: str, port: int | None = None) -> list[tuple]:
+    """Resolve a hostname and refuse it when any resolved address is not public.
+
+    This blocks DNS names that point to private/loopback/link-local networks. It
+    does not pin the connection to the validated address, so a DNS-rebinding
+    attacker controlling the name could still switch after validation; that
+    residual risk is documented in backend/AI_PROVIDERS.md.
+    """
+    try:
+        infos = socket.getaddrinfo(host, port or 443, type=socket.SOCK_STREAM)
+    except (socket.gaierror, UnicodeError, OSError):
+        raise ValueError("No se pudo resolver el host del proveedor.") from None
+    addresses = {info[4][0] for info in infos if info and len(info) > 4 and info[4]}
+    if not addresses:
+        raise ValueError("No se pudo resolver el host del proveedor.")
+    for address in addresses:
+        if not _is_public_ip(address):
+            raise ValueError("El host del proveedor resuelve a una dirección privada o reservada.")
+    return infos
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: a public URL could redirect to a private target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ProviderError("El proveedor intentó redirigir la petición; las redirecciones no están permitidas.", False, code, "redirect_not_allowed")
+
+
+def _public_url_opener():
+    return urllib.request.build_opener(_NoRedirectHandler)
+
+
+def validate_provider_target(url: str) -> str:
+    """Validate scheme/host and DNS of an endpoint right before connecting."""
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("El destino del proveedor no es una URL HTTPS válida.")
+    host = parsed.hostname.lower().rstrip(".")
+    if host in {"localhost", "localhost.localdomain"} or host.endswith((".local", ".internal", ".localhost")):
+        raise ValueError("No se permiten destinos locales o internos.")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        _resolve_public_host(host, parsed.port)
+        return host
+    if not _is_public_ip(str(ip)):
+        raise ValueError("No se permiten direcciones IP privadas o reservadas.")
+    return host
+
+
 def normalize_compatible_endpoint(base_url: str) -> str:
     parsed = urlparse((base_url or "").strip())
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
@@ -194,11 +253,13 @@ def normalize_compatible_endpoint(base_url: str) -> str:
         raise ValueError("No se permiten destinos locales o internos.")
     try:
         ip = ipaddress.ip_address(host)
-        if not ip.is_global:
+    except ValueError:
+        # Blocking only names is insufficient: a public-looking name can resolve
+        # to a private address, so the DNS answer is validated as well.
+        _resolve_public_host(host, parsed.port)
+    else:
+        if not _is_public_ip(str(ip)):
             raise ValueError("No se permiten direcciones IP privadas o reservadas.")
-    except ValueError as exc:
-        if "does not appear to be an IPv4 or IPv6 address" not in str(exc) and "is not a valid" not in str(exc):
-            raise
     path = parsed.path.rstrip("/")
     if not path:
         path = "/v1"
@@ -262,6 +323,23 @@ def record_provider_metrics(provider: str, model: str, status: str, latency_ms: 
 
 def _request_json(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float = 8) -> dict[str, Any]:
     """Perform a bounded JSON POST and emit only sanitized operational diagnostics."""
+    # Re-validate the target (including DNS) immediately before connecting.
+    try:
+        validate_provider_target(url)
+    except ValueError as exc:
+        raise ProviderError(str(exc), False, None, "blocked_destination") from None
+    # Redirects are refused: a public endpoint could otherwise redirect to a
+    # private address. urllib.request.urlopen remains the final transport.
+    opener = _public_url_opener()
+    try:
+        return _request_json_impl(url, headers, body, timeout)
+    finally:
+        close = getattr(opener, "close", None)
+        if close is not None:
+            close()
+
+
+def _request_json_impl(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float = 8) -> dict[str, Any]:
     remaining = remaining_provider_budget()
     if remaining is not None:
         if remaining <= 0:

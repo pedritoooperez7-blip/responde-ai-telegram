@@ -51,19 +51,23 @@ class TestProviderErrorClassification(unittest.TestCase):
                 "https://provider.invalid", status, "error", {"Content-Type": "application/json"},
                 io.BytesIO(b'{"error":{"message":"private conversation text"}}'),
             )
-            with self.subTest(status=status), patch.object(ai.urllib.request, "urlopen", side_effect=response):
+            with self.subTest(status=status), \
+                 patch.object(ai.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 443))]), \
+                 patch.object(ai.urllib.request, "urlopen", side_effect=response):
                 with self.assertRaises(ai.ProviderError) as caught:
                     ai._request_json("https://provider.invalid", {}, {})
                 self.assertEqual(caught.exception.category, category)
                 self.assertNotIn("private conversation", str(caught.exception))
 
     def test_timeout_and_connection_failures_have_safe_categories(self):
-        with patch.object(ai.urllib.request, "urlopen", side_effect=TimeoutError("secret timeout detail")):
+        with patch.object(ai.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 443))]), \
+             patch.object(ai.urllib.request, "urlopen", side_effect=TimeoutError("secret timeout detail")):
             with self.assertRaises(ai.ProviderError) as caught:
                 ai._request_json("https://provider.invalid", {}, {})
         self.assertEqual(caught.exception.category, "timeout")
         self.assertNotIn("secret timeout detail", str(caught.exception))
-        with patch.object(ai.urllib.request, "urlopen", side_effect=urllib.error.URLError("private network detail")):
+        with patch.object(ai.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 443))]), \
+             patch.object(ai.urllib.request, "urlopen", side_effect=urllib.error.URLError("private network detail")):
             with self.assertRaises(ai.ProviderError) as caught:
                 ai._request_json("https://provider.invalid", {}, {})
         self.assertEqual(caught.exception.category, "connection_error")
@@ -158,6 +162,83 @@ class TestRetryDeadlineAndTelemetry(unittest.TestCase):
         self.assertNotIn("do-not-return-this", str(result))
         self.assertEqual(result["groq"]["model"], "test-model")
         self.assertFalse(result["groq"]["vision_compatibility_verified"])
+
+
+PUBLIC_DNS = [(2, 1, 6, "", ("93.184.216.34", 443))]
+PRIVATE_DNS = [(2, 1, 6, "", ("10.0.0.5", 443))]
+
+
+
+class TestProviderDestinationValidation(unittest.TestCase):
+    def test_public_dns_name_is_accepted(self):
+        with patch.object(ai.socket, "getaddrinfo", return_value=PUBLIC_DNS) as resolver:
+            endpoint = ai.normalize_compatible_endpoint("https://api.example.com/v1")
+        self.assertEqual(endpoint, "https://api.example.com/v1/chat/completions")
+        self.assertTrue(resolver.called)
+
+    def test_name_resolving_to_private_address_is_rejected(self):
+        with patch.object(ai.socket, "getaddrinfo", return_value=PRIVATE_DNS):
+            with self.assertRaisesRegex(ValueError, "privada"):
+                ai.normalize_compatible_endpoint("https://looks-public.example.com/v1")
+
+    def test_private_and_loopback_literals_are_rejected(self):
+        for url in ("https://127.0.0.1/v1", "https://10.1.2.3/v1", "https://localhost/v1",
+                    "https://[::1]/v1", "https://169.254.169.254/v1", "http://api.example.com/v1"):
+            with self.subTest(url=url):
+                with self.assertRaises(ValueError):
+                    ai.normalize_compatible_endpoint(url)
+
+    def test_unresolvable_host_is_rejected_without_network(self):
+        with patch.object(ai.socket, "getaddrinfo", side_effect=ai.socket.gaierror("nx")):
+            with self.assertRaises(ValueError):
+                ai.normalize_compatible_endpoint("https://missing.example.com/v1")
+
+    def test_ipv4_mapped_private_ipv6_is_rejected(self):
+        with self.assertRaises(ValueError):
+            ai.normalize_compatible_endpoint("https://[::ffff:10.0.0.1]/v1")
+
+    def test_redirect_request_is_refused(self):
+        handler = ai._NoRedirectHandler()
+        with self.assertRaises(ai.ProviderError) as raised:
+            handler.redirect_request(None, None, 302, "Found", {}, "https://127.0.0.1/internal")
+        self.assertEqual(raised.exception.category, "redirect_not_allowed")
+
+    def test_request_json_validates_target_before_connecting(self):
+        opened = []
+        with patch.object(ai.socket, "getaddrinfo", return_value=PRIVATE_DNS), \
+             patch.object(ai.urllib.request, "urlopen", side_effect=lambda *a, **k: opened.append(a)):
+            with self.assertRaises(ai.ProviderError) as raised:
+                ai._request_json("https://looks-public.example.com/v1/chat/completions", {}, {})
+        self.assertEqual(raised.exception.category, "blocked_destination")
+        self.assertEqual(opened, [])
+
+    def test_request_json_still_posts_to_public_provider(self):
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"ok": true}'
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            return FakeResponse()
+
+        with patch.object(ai.socket, "getaddrinfo", return_value=PUBLIC_DNS), \
+             patch.object(ai.urllib.request, "urlopen", side_effect=fake_urlopen):
+            result = ai._request_json("https://api.example.com/v1/chat/completions", {}, {})
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(captured["url"], "https://api.example.com/v1/chat/completions")
+
+    def test_redirect_handler_is_installed_for_requests(self):
+        opener = ai._public_url_opener()
+        types = [type(handler) for handler in opener.handlers]
+        self.assertIn(ai._NoRedirectHandler, types)
 
 
 if __name__ == "__main__":
