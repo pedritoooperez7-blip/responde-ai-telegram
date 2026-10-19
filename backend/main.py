@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from PIL import Image
-import base64, hashlib, hmac, io, json, os, re, sqlite3, time, uuid
+import base64, hashlib, hmac, io, json, logging, os, re, sqlite3, time, uuid
 import pytesseract
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -14,6 +14,8 @@ try:
 except ImportError:  # Support running uvicorn with backend/ as the working directory.
     from ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
     from telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook
+logger = logging.getLogger(__name__)
+
 ai_generate_reply = _provider_generate_reply
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -567,10 +569,11 @@ def health(): return {"status":"ok","service":"LiggaCuba","version":"2.1"}
 async def telegram_webhook(request: Request):
     """Receive Telegram updates. Authenticated via X-Telegram-Bot-Api-Secret-Token."""
     try:
-        verify_webhook_secret(request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""))
+        secret_valid = verify_webhook_secret(request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""))
     except TelegramBotError:
+        logger.error("Telegram webhook unavailable: secret configuration invalid")
         raise HTTPException(503, "Webhook de Telegram no configurado en el servidor")
-    if not verify_webhook_secret(request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")):
+    if not secret_valid:
         raise HTTPException(401, "Webhook no autorizado")
     body = await request.body()
     if len(body) > 256 * 1024:
@@ -585,8 +588,12 @@ async def telegram_webhook(request: Request):
         outcome = handle_update(update)
         return {"ok": True, **outcome}
     except TelegramBotError as exc:
-        # 502 makes Telegram retry delivery later; the update id is already
-        # claimed so a redelivery is safely deduplicated.
+        # handle_update releases its claim on failure, so Telegram's retry can
+        # attempt processing again. Never log tokens or request payloads.
+        logger.warning(
+            "Telegram webhook processing failed update_id=%s error_type=%s reason=%s",
+            update.get("update_id"), type(exc).__name__, str(exc)[:240],
+        )
         raise HTTPException(502, str(exc))
 
 

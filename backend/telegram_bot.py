@@ -19,6 +19,7 @@ import sqlite3
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -84,8 +85,11 @@ def bot_api_call(method: str, payload: Dict[str, Any], timeout: float = 8.0) -> 
         raise TelegramBotError("Telegram Bot API no está accesible") from None
     if not isinstance(body, dict) or body.get("ok") is not True:
         description = body.get("description") if isinstance(body, dict) else None
-        logger.warning("Telegram API %s rejected: ok=false", method)
-        raise TelegramBotError(description or "Telegram Bot API rechazó la solicitud")
+        # Telegram's description is useful for diagnosing 502s (e.g. invalid
+        # inline button URL). Do not log request payloads or credentials.
+        safe_description = str(description or "Telegram Bot API rechazó la solicitud")[:240]
+        logger.warning("Telegram API %s rejected: description=%r", method, safe_description)
+        raise TelegramBotError(safe_description)
     logger.info("Telegram API %s ok latency_ms=%s", method, int((time.monotonic() - started) * 1000))
     result = body.get("result")
     return result if isinstance(result, dict) else {}
@@ -119,13 +123,34 @@ def delete_webhook() -> Dict[str, Any]:
     return bot_api_call("deleteWebhook", {"drop_pending_updates": False})
 
 
+def _is_http_url(value: str) -> bool:
+    try:
+        parsed = urlparse((value or "").strip())
+        return parsed.scheme in {"https", "http"} and bool(parsed.netloc)
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_https_url(value: str) -> bool:
+    try:
+        parsed = urlparse((value or "").strip())
+        return parsed.scheme == "https" and bool(parsed.netloc)
+    except (TypeError, ValueError):
+        return False
+
+
 def build_start_payload(chat_id: int | str, app_url: str, channel_url: str, community_url: str) -> Dict[str, Any]:
     """Welcome-only /start payload. Sending is handled by send_message()."""
-    buttons: list[Dict[str, Any]] = [
-        {"text": "\U0001F4E2 Canal oficial", "url": channel_url},
-        {"text": "\U0001F4AC Chat de la comunidad", "url": community_url},
-        {"text": "\U0001F680 Abrir Mini App", "web_app": {"url": app_url}},
-    ]
+    # Telegram rejects inline URL buttons whose URL is empty or malformed.
+    # Treat the community link as optional so a bad/missing value cannot make
+    # the whole /start message fail. Keep the Mini App and official channel.
+    buttons: list[Dict[str, Any]] = []
+    if _is_http_url(channel_url):
+        buttons.append({"text": "\U0001F4E2 Canal oficial", "url": channel_url})
+    if _is_http_url(community_url):
+        buttons.append({"text": "\U0001F4AC Chat de la comunidad", "url": community_url})
+    if _is_https_url(app_url):
+        buttons.append({"text": "\U0001F680 Abrir Mini App", "web_app": {"url": app_url}})
     return {
         "chat_id": chat_id,
         "text": (
@@ -193,6 +218,18 @@ def claim_update(update_id: int) -> bool:
         conn.close()
 
 
+def release_update(update_id: int) -> None:
+    """Allow Telegram to retry an update when its processing failed."""
+    conn = sqlite3.connect(_processed_db_path(), timeout=5)
+    try:
+        conn.execute("DELETE FROM telegram_processed_updates WHERE update_id=?", (update_id,))
+        conn.commit()
+    except sqlite3.Error:
+        logger.exception("Telegram update claim release failed update_id=%s", update_id)
+    finally:
+        conn.close()
+
+
 def purge_processed_updates() -> None:
     cutoff_days = PROCESSING_TTL_DAYS
     conn = sqlite3.connect(_processed_db_path())
@@ -215,7 +252,12 @@ def verify_webhook_secret(received: str) -> bool:
 
 
 def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
-    """Process one verified update. Idempotent per update_id."""
+    """Process one verified update; release its claim if processing fails.
+
+    A network timeout can be ambiguous (Telegram may have accepted a message
+    before the response was lost), so retries can theoretically duplicate a
+    message. This is preferable to permanently discarding every failed send.
+    """
     init_processed_updates()
     update_id = update.get("update_id")
     if not isinstance(update_id, int):
@@ -224,25 +266,32 @@ def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
     if not claim_update(update_id):
         return {"handled": False, "reason": "duplicate_update"}
 
-    message = extract_text_message(update)
-    if message is None:
-        return {"handled": True, "action": "ignored_non_text"}
+    try:
+        message = extract_text_message(update)
+        if message is None:
+            return {"handled": True, "action": "ignored_non_text"}
 
-    text = (message.get("text") or "").strip()
-    chat_id = message["chat"].get("id")
-    if not text.startswith("/") or not isinstance(chat_id, (int, str)):
-        return {"handled": True, "action": "ignored_plain_message"}
+        text = (message.get("text") or "").strip()
+        chat_id = message["chat"].get("id")
+        if not text.startswith("/") or not isinstance(chat_id, (int, str)):
+            return {"handled": True, "action": "ignored_plain_message"}
 
-    command = text.split("@", 1)[0].split()[0].lower()
-    if command != "/start":
-        return {"handled": True, "action": "ignored_unknown_command", "command": command}
+        command = text.split("@", 1)[0].split()[0].lower()
+        if command != "/start":
+            return {"handled": True, "action": "ignored_unknown_command", "command": command}
 
-    payload = build_start_payload(
-        chat_id,
-        mini_app_url(),
-        official_channel(),
-        community_chat(),
-    )
-    payload.pop("parse_mode", None)
-    send_message(payload["chat_id"], payload["text"], payload.get("reply_markup"))
-    return {"handled": True, "action": "start_sent", "chat_id": chat_id}
+        payload = build_start_payload(
+            chat_id,
+            mini_app_url(),
+            official_channel(),
+            community_chat(),
+        )
+        send_message(payload["chat_id"], payload["text"], payload.get("reply_markup"))
+        return {"handled": True, "action": "start_sent", "chat_id": chat_id}
+    except Exception:
+        # A failed send/config lookup must not leave the update permanently
+        # marked as processed. Log the update id only; the endpoint logs the
+        # safe exception detail separately.
+        release_update(update_id)
+        raise
+

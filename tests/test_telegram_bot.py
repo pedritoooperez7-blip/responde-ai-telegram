@@ -111,6 +111,35 @@ class HandleUpdateTests(unittest.TestCase):
             self.assertEqual(outcome2.get("reason"), "duplicate_update")
             self.assertEqual(len(sent), 1)
 
+    def test_failed_start_send_releases_update_for_retry(self):
+        attempts = []
+
+        def fail_then_succeed(chat_id, text, reply_markup=None):
+            attempts.append(chat_id)
+            if len(attempts) == 1:
+                raise tb.TelegramBotError("simulated Telegram rejection")
+            return {"message_id": 2}
+
+        update = start_message(105)
+        with mock.patch.object(tb, "send_message", side_effect=fail_then_succeed):
+            with self.assertRaises(tb.TelegramBotError):
+                tb.handle_update(update)
+            retry = tb.handle_update(update)
+
+        self.assertEqual(retry["action"], "start_sent")
+        self.assertEqual(attempts, [777, 777])
+
+    def test_missing_community_url_does_not_create_invalid_button(self):
+        payload = tb.build_start_payload(
+            777,
+            "https://liggacuba.example.app/",
+            "https://t.me/LiggaCubaOficial",
+            "",
+        )
+        buttons = [b for row in payload["reply_markup"]["inline_keyboard"] for b in row]
+        self.assertEqual(len(buttons), 2)
+        self.assertFalse(any("Chat de la comunidad" in b["text"] for b in buttons))
+
     def test_unknown_command_is_ignored_without_sending(self):
         sent = []
         update = start_message(102)
@@ -178,7 +207,7 @@ class ApiCallTests(unittest.TestCase):
         with mock.patch.dict(os.environ, VALID_ENV):
             importlib.reload(tb)
             with mock.patch.object(tb.urllib.request, "urlopen", return_value=FakeResponse()):
-                with self.assertRaises(tb.TelegramBotError):
+                with self.assertRaisesRegex(tb.TelegramBotError, "chat not found"):
                     tb.send_message(777, "hola")
 
 
