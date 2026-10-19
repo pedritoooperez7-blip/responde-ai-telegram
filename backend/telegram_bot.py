@@ -154,11 +154,16 @@ def build_start_payload(chat_id: int | str, app_url: str, channel_url: str, comm
     return {
         "chat_id": chat_id,
         "text": (
-            "¡Bienvenido a <b>LiggaCuba</b>! \U0001F49C\n\n"
-            "Tu asistente para conversaciones ya está aquí.\n"
-            "Abre la Mini App para empezar a usarla."
+            "🇨🇺 ¡Bienvenido a <b>LiggaCuba</b>! 💜\n\n"
+            "¡Hola! 👋 Nos alegra tenerte aquí.\n\n"
+            "🤖 <b>¡Tu asistente inteligente está en camino!</b>\n\n"
+            "La función de análisis y conversación con nuestro bot estará disponible próximamente. "
+            "Estamos trabajando para ofrecerte una experiencia cada vez mejor.\n\n"
+            "🚀 Mientras tanto, puedes utilizar nuestra Mini App para disfrutar de las funciones disponibles.\n\n"
+            "¡Gracias por acompañarnos! ❤️"
         ),
-        "reply_markup": {"inline_keyboard": [buttons]},
+        # One button per row produces the requested vertical mobile layout.
+        "reply_markup": {"inline_keyboard": [[button] for button in buttons]},
     }
 
 
@@ -267,27 +272,34 @@ def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
         return {"handled": False, "reason": "duplicate_update"}
 
     try:
-        message = extract_text_message(update)
-        if message is None:
-            return {"handled": True, "action": "ignored_non_text"}
+        # Text messages are supported by the current bot. Other message types
+        # still receive a brief availability notice instead of being silently ignored.
+        message = update.get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("chat"), dict):
+            return {"handled": True, "action": "ignored_non_message"}
+
+        chat_id = message["chat"].get("id")
+        if not isinstance(chat_id, (int, str)):
+            return {"handled": True, "action": "ignored_missing_chat_id"}
 
         text = (message.get("text") or "").strip()
-        chat_id = message["chat"].get("id")
-        if not text.startswith("/") or not isinstance(chat_id, (int, str)):
-            return {"handled": True, "action": "ignored_plain_message"}
+        command = text.split("@", 1)[0].split()[0].lower() if text else ""
+        if command == "/start":
+            payload = build_start_payload(
+                chat_id,
+                mini_app_url(),
+                official_channel(),
+                community_chat(),
+            )
+            send_message(payload["chat_id"], payload["text"], payload.get("reply_markup"))
+            return {"handled": True, "action": "start_sent", "chat_id": chat_id}
 
-        command = text.split("@", 1)[0].split()[0].lower()
-        if command != "/start":
-            return {"handled": True, "action": "ignored_unknown_command", "command": command}
-
-        payload = build_start_payload(
+        send_message(
             chat_id,
-            mini_app_url(),
-            official_channel(),
-            community_chat(),
+            "💜 Gracias por escribir a LiggaCuba. La función de análisis y conversación con el bot estará disponible próximamente. "
+            "Mientras tanto, puedes utilizar nuestra Mini App desde el botón Abrir.",
         )
-        send_message(payload["chat_id"], payload["text"], payload.get("reply_markup"))
-        return {"handled": True, "action": "start_sent", "chat_id": chat_id}
+        return {"handled": True, "action": "availability_notice_sent", "chat_id": chat_id}
     except Exception:
         # A failed send/config lookup must not leave the update permanently
         # marked as processed. Log the update id only; the endpoint logs the

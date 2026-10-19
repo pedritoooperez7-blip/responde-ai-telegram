@@ -33,6 +33,8 @@ class TestTelegramWelcome(unittest.TestCase):
             "https://liggacuba.example.app/",
         )
         self.assertEqual(len(buttons), 3)
+        self.assertEqual([len(row) for row in payload["reply_markup"]["inline_keyboard"]], [1, 1, 1])
+        self.assertIn("disponible próximamente", payload["text"])
         self.assertNotIn("up.railway.app", payload["text"])
 
 
