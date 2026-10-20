@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from PIL import Image
 import base64, hashlib, hmac, io, json, logging, os, re, sqlite3, threading, time, uuid
@@ -8,10 +8,13 @@ import pytesseract
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs
+from starlette.concurrency import run_in_threadpool
 try:
+    from . import db as _db, limits as _limits, payments as _payments
     from .ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
     from .telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook
 except ImportError:  # Support running uvicorn with backend/ as the working directory.
+    import db as _db, limits as _limits, payments as _payments
     from ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
     from telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook
 logger = logging.getLogger(__name__)
@@ -47,6 +50,49 @@ MAX_OCR_PIXELS = 24_000_000
 OWNER_SESSION_TTL = 90 * 86400
 ADMIN_SESSION_TTL = 7 * 86400
 SESSION_SECRET = os.getenv("SESSION_SECRET", "")
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int((os.getenv(name) or "").strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+# In-process abuse controls. Limits are per process; see docs/OPERACIONES_V1.md.
+OCR_RATE_LIMITER = _limits.SlidingWindowLimiter(_env_int("OCR_RATE_LIMIT_PER_MINUTE", 10), 60)
+OCR_DAILY_COUNTER = _limits.DailyCounter(_env_int("OCR_DAILY_LIMIT", 50))
+OCR_GATE = _limits.ConcurrencyGate(_env_int("OCR_MAX_CONCURRENT", 2))
+ANALYZE_RATE_LIMITER = _limits.SlidingWindowLimiter(_env_int("ANALYZE_RATE_LIMIT_PER_MINUTE", 20), 60)
+GENERATION_RATE_LIMITER = _limits.SlidingWindowLimiter(_env_int("GENERATION_RATE_LIMIT_PER_HOUR", 40), 3600)
+ADMIN_LOGIN_IP_LIMITER = _limits.SlidingWindowLimiter(
+    _env_int("ADMIN_LOGIN_MAX_ATTEMPTS", 10), _env_int("ADMIN_LOGIN_WINDOW_SECONDS", 900)
+)
+ADMIN_LOGIN_USER_LIMITER = _limits.SlidingWindowLimiter(
+    _env_int("ADMIN_LOGIN_MAX_ATTEMPTS_PER_USER", 30), _env_int("ADMIN_LOGIN_WINDOW_SECONDS", 900)
+)
+
+
+def _retry_after_header(retry_after: float) -> dict:
+    return {"Retry-After": str(max(1, int(retry_after + 0.999)))}
+
+
+def _enforce_rate_limit(limiter, key: str, message: str) -> None:
+    allowed, retry_after = limiter.check(key)
+    if not allowed:
+        raise HTTPException(429, message, headers=_retry_after_header(retry_after))
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP for throttling. Behind a proxy the header is used.
+
+    X-Forwarded-For can be spoofed, so it is only a throttling hint; the
+    per-username limiter below does not depend on it.
+    """
+    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if forwarded and len(forwarded) <= 45:
+        return forwarded
+    return request.client.host if request.client else "unknown"
 
 
 def _b64e(data: bytes) -> str:
@@ -96,13 +142,21 @@ def current_user(request: Request) -> str:
 
 
 def db():
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    return c
+    return _db.connect(DB_PATH)
 
 
 def now(): return datetime.utcnow().isoformat()
 def today(): return datetime.utcnow().date().isoformat()
+
+
+def _quota_charge_is_from_today(connection, log_id, uid: str) -> bool:
+    """Only refund a charge made today; yesterday's charge must not undo today's."""
+    if not log_id:
+        return True  # legacy attempt without a usage log id: keep the old behaviour
+    row = connection.execute("SELECT used_at FROM usage_logs WHERE id=? AND user_id=?", (log_id, uid)).fetchone()
+    if not row:
+        return False
+    return str(row["used_at"] or "")[:10] == today()
 
 def _utc_datetime(value=None):
     """Parse a timestamp as an aware UTC datetime; naive legacy values are treated as UTC."""
@@ -278,6 +332,8 @@ def init_db():
         "ALTER TABLE payment_operations ADD COLUMN transaction_id TEXT",
         "ALTER TABLE payment_operations ADD COLUMN transfer_date TEXT",
         "ALTER TABLE payment_operations ADD COLUMN source_sms TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN amount_value REAL",
+        "ALTER TABLE payment_operations ADD COLUMN amount_currency TEXT",
     ):
         try:
             c.execute(sql)
@@ -507,8 +563,8 @@ def audit(actor, action, target=None, details=None):
 
 
 def amount(plan,lang):
-    if lang=="en": return "8.99 USD" if plan=="weekly" else "29.99 USD"
-    return "2500 CUP" if plan=="weekly" else "15500 CUP"
+    """Localized display amount; currency comes from payments configuration."""
+    return _payments.amount(plan, lang)
 
 
 def _telegram_start_message(chat_id):
@@ -639,7 +695,32 @@ def privacy(): return FileResponse(os.path.join(ROOT,"privacy.html"),media_type=
 @app.get("/terms.html")
 def terms(): return FileResponse(os.path.join(ROOT,"terms.html"),media_type="text/html")
 @app.get("/health")
-def health(): return {"status":"ok","service":"LiggaCuba","version":"2.1"}
+def health():
+    """Liveness/readiness probe: reports database availability without internals."""
+    try:
+        _db.check_connection(DB_PATH)
+    except Exception:
+        logger.warning("Health check failed: database unavailable")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "degraded", "service": "LiggaCuba", "version": "2.1", "database": "unavailable"},
+        )
+    return {"status": "ok", "service": "LiggaCuba", "version": "2.1", "database": "ok"}
+
+
+@app.exception_handler(sqlite3.OperationalError)
+async def _sqlite_operational_error_handler(request: Request, exc: sqlite3.OperationalError):
+    """Turn lock contention into a retryable 503 instead of an opaque 500."""
+    if _db.is_locked_error(exc):
+        logger.warning("SQLite contention while handling a request; returning 503")
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Servicio temporalmente no disponible. Inténtalo de nuevo."},
+            headers={"Retry-After": "2"},
+        )
+    # Never log the raw SQL or its parameters: they can contain user data.
+    logger.error("SQLite operational error: error_type=%s", type(exc).__name__)
+    return JSONResponse(status_code=500, content={"detail": "Error interno del servidor"})
 
 
 @app.post("/webhook/telegram")
@@ -718,6 +799,7 @@ def api_usage(p:Usage, request:Request):
 @app.post("/api/analyze")
 def analyze(p: Analyze, request: Request):
     uid = current_user(request)
+    _enforce_rate_limit(ANALYZE_RATE_LIMITER, f"analyze:{uid}", "Demasiadas solicitudes. Espera un minuto.")
     module = p.module if p.module in {"chat", "story"} else "chat"
     mode = (p.mode or "coquetear").lower().strip()
     free = FREE_CHAT_MODES if module == "chat" else FREE_STORY_MODES
@@ -788,6 +870,7 @@ def _generate_with_ocr_fallback(text: str, mode: str, module: str, image_data_ur
 @app.post("/api/generate-reply")
 def generate(p: Generate, request: Request):
     uid = current_user(request)
+    _enforce_rate_limit(GENERATION_RATE_LIMITER, f"generate:{uid}", "Demasiadas generaciones. Espera unos minutos.")
     if str(p.user_id) != uid:
         raise HTTPException(403, "El usuario no coincide con la sesión")
     module = p.module if p.module in {"chat", "story"} else "chat"
@@ -898,11 +981,12 @@ def generate(p: Generate, request: Request):
             failed_attempt = c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?", (aid, uid)).fetchone()
             # Refund exactly once only when the very first generation failed before any success.
             if failed_attempt and int(failed_attempt["generation_count"] or 0) == 0 and int(failed_attempt["quota_charged"] or 0) == 1 and not premium(uid):
-                c.execute("UPDATE users SET usage_today=MAX(0,usage_today-1),updated_at=? WHERE user_id=?", (now(), uid))
                 log_id = failed_attempt["quota_log_id"] if "quota_log_id" in failed_attempt.keys() else None
-                if log_id:
-                    c.execute("DELETE FROM usage_logs WHERE id=? AND user_id=?", (log_id, uid))
-                c.execute("UPDATE analysis_attempts SET quota_charged=0,quota_log_id=NULL WHERE id=? AND user_id=?", (aid, uid))
+                if _quota_charge_is_from_today(c, log_id, uid):
+                    c.execute("UPDATE users SET usage_today=MAX(0,usage_today-1),updated_at=? WHERE user_id=?", (now(), uid))
+                    if log_id:
+                        c.execute("DELETE FROM usage_logs WHERE id=? AND user_id=?", (log_id, uid))
+                    c.execute("UPDATE analysis_attempts SET quota_charged=0,quota_log_id=NULL WHERE id=? AND user_id=?", (aid, uid))
             c.execute("UPDATE analysis_attempts SET generation_in_progress=0,generation_started_at=NULL,updated_at=? WHERE id=? AND user_id=?", (now(), aid, uid))
             c.execute("UPDATE ai_idempotency SET status='failed',updated_at=? WHERE user_id=? AND idempotency_key=?", (now(), uid, key))
             failed_attempt = c.execute("SELECT retry_used,module,mode FROM analysis_attempts WHERE id=? AND user_id=?", (aid, uid)).fetchone()
@@ -945,11 +1029,12 @@ def release_analysis(p: dict, request: Request):
         if not row: raise HTTPException(404,"Análisis no encontrado")
         released=False
         if not int(row["generation_count"] or 0) and not int(row["generation_in_progress"] or 0) and int(row["quota_charged"] or 0) and not premium(uid):
-            c.execute("UPDATE users SET usage_today=MAX(0,usage_today-1) WHERE user_id=?",(uid,))
             quota_log_id = row["quota_log_id"] if "quota_log_id" in row.keys() else None
-            if quota_log_id:
-                c.execute("DELETE FROM usage_logs WHERE id=? AND user_id=?", (quota_log_id, uid))
-            c.execute("UPDATE analysis_attempts SET quota_charged=0,quota_log_id=NULL,updated_at=? WHERE id=?",(now(),aid)); released=True
+            if _quota_charge_is_from_today(c, quota_log_id, uid):
+                c.execute("UPDATE users SET usage_today=MAX(0,usage_today-1) WHERE user_id=?",(uid,))
+                if quota_log_id:
+                    c.execute("DELETE FROM usage_logs WHERE id=? AND user_id=?", (quota_log_id, uid))
+                c.execute("UPDATE analysis_attempts SET quota_charged=0,quota_log_id=NULL,updated_at=? WHERE id=?",(now(),aid)); released=True
         c.commit(); return {"released":released}
     except HTTPException: c.rollback(); raise
     finally: c.close()
@@ -1109,10 +1194,32 @@ def _decode_ocr_image(raw: bytes) -> Image.Image:
         raise HTTPException(400, "Imagen inválida o dañada")
 
 
+def _enforce_ocr_limits(uid: str) -> None:
+    """Per-user burst/daily limits plus a process-wide concurrency cap."""
+    _enforce_rate_limit(OCR_RATE_LIMITER, f"ocr:{uid}", "Demasiadas solicitudes de OCR. Espera un minuto.")
+    if not OCR_GATE.acquire(timeout=2.0):
+        raise HTTPException(429, "El servicio OCR está ocupado. Inténtalo de nuevo.", headers={"Retry-After": "2"})
+    if not OCR_DAILY_COUNTER.take(uid):
+        OCR_GATE.release()
+        raise HTTPException(429, "Has alcanzado el límite diario de OCR. Inténtalo de nuevo mañana.")
+
+
+def _run_ocr_with_limits(img: Image.Image, uid: str) -> str:
+    _enforce_ocr_limits(uid)
+    try:
+        return _ocr_text(img)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(503, "El servicio OCR no está disponible temporalmente")
+    finally:
+        OCR_GATE.release()
+
+
 @app.post("/ocr")
 async def ocr_upload(request: Request):
     # OCR is expensive; only authenticated Telegram WebApp sessions may invoke it.
-    current_user(request)
+    uid = current_user(request)
     chunks = []
     size = 0
     async for chunk in request.stream():
@@ -1121,14 +1228,13 @@ async def ocr_upload(request: Request):
             raise HTTPException(413, "La imagen supera el límite de 8 MB")
         chunks.append(chunk)
     img = _decode_ocr_image(b"".join(chunks))
-    try:
-        return {"ok": True, "text": _ocr_text(img)}
-    except Exception:
-        raise HTTPException(503, "El servicio OCR no está disponible temporalmente")
+    # Tesseract is blocking and CPU-bound: run it outside the event loop.
+    text = await run_in_threadpool(_run_ocr_with_limits, img, uid)
+    return {"ok": True, "text": text}
 
 @app.post("/ocr-base64")
 def ocr_base64(p: OCR, request: Request):
-    current_user(request)
+    uid = current_user(request)
     encoded = p.image.split(",", 1)[-1]
     if len(encoded) > ((MAX_OCR_BYTES + 2) // 3) * 4 + 8:
         raise HTTPException(413, "La imagen supera el límite de 8 MB")
@@ -1137,10 +1243,7 @@ def ocr_base64(p: OCR, request: Request):
     except Exception:
         raise HTTPException(400, "Imagen Base64 inválida")
     img = _decode_ocr_image(raw)
-    try:
-        return {"success": True, "text": _ocr_text(img)}
-    except Exception:
-        raise HTTPException(503, "El servicio OCR no está disponible temporalmente")
+    return {"success": True, "text": _run_ocr_with_limits(img, uid)}
 
 @app.post("/ocr-base64-simple")
 def ocr_simple(p:OCR, request: Request): return ocr_base64(p, request)
@@ -1304,7 +1407,10 @@ def atajo_pago(p: AtajoPayment, request: Request):
             else:
                 if row_method != "SALDO_MOVIL":
                     continue
-            expected_amount = float(re.sub(r"[^0-9.]", "", row["amount"] or "0") or 0)
+            expected_amount, expected_currency = _payments.expected_values(row)
+            if expected_currency != _payments.payment_currency():
+                # Never compare an amount expressed in another currency.
+                continue
             if round(expected_amount, 2) != amount_value:
                 continue
             registered = row["payment_phone"] or row["payer_phone"] or ""
@@ -1391,11 +1497,14 @@ def pending(p: Pending, request: Request):
         if existing:
             # No permitir cambiar método/plan en mitad de una operación.
             c.commit()
+            existing_amount, existing_currency = _payments.expected_values(existing)
             return {
                 "success": True,
                 "operation_id": existing["operation_id"],
                 "status": existing["status"],
                 "amount": existing["amount"],
+                "amount_value": existing_amount,
+                "amount_currency": existing_currency,
                 "payment_method": existing["payment_method"],
                 "destination_account": existing["destination_account"] or "",
                 "payment_phone": existing["payer_phone"] or registered_user.get("payment_phone") or "",
@@ -1408,6 +1517,8 @@ def pending(p: Pending, request: Request):
         oid = uuid.uuid4().hex[:12].upper()
         t = now()
         a = amount(p.plan, p.language)
+        verification_value = _payments.verification_amount(p.plan)
+        currency = _payments.payment_currency()
         if method == "BANDEC":
             destination = BANDEC_ACCOUNT
             if not re.sub(r"\D", "", destination or ""):
@@ -1422,9 +1533,9 @@ def pending(p: Pending, request: Request):
         c.execute(
             """INSERT INTO payment_operations(
                operation_id,user_id,plan,language,status,amount,payment_method,
-               payer_phone,destination_account,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-            (oid, uid, p.plan, p.language, "pending", a, method, phone, destination, t, t),
+               payer_phone,destination_account,amount_value,amount_currency,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (oid, uid, p.plan, p.language, "pending", a, method, phone, destination, verification_value, currency, t, t),
         )
         c.commit()
         return {
@@ -1432,6 +1543,8 @@ def pending(p: Pending, request: Request):
             "operation_id": oid,
             "status": "pending",
             "amount": a,
+            "amount_value": verification_value,
+            "amount_currency": currency,
             "payment_method": method,
             "destination_account": destination,
             "payment_phone": phone,
@@ -1487,20 +1600,30 @@ def status(p:PaymentId, request:Request):
     return dict(row)
 
 @app.post("/api/admin/login")
-def admin_login(p: AdminLogin):
+def admin_login(p: AdminLogin, request: Request):
     if not ADMIN_KEY:
-        raise HTTPException(503, "ADMIN_KEY no configurado en Railway")
+        raise HTTPException(503, "ADMIN_KEY no configurado")
+    ip_key = "ip:" + _client_ip(request)
     is_owner = bool(p.master_key and hmac.compare_digest(p.master_key, ADMIN_KEY))
+    user_key = ""
     if is_owner:
+        # A valid master key is never throttled, so the legitimate owner cannot
+        # be locked out by failed attempts from a shared or spoofed address.
+        ADMIN_LOGIN_IP_LIMITER.reset(ip_key)
         username = "owner"
         permissions = ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics"]
         ttl = OWNER_SESSION_TTL
     else:
         username_input = p.username.strip()
+        user_key = "user:" + username_input.lower()[:64]
+        _enforce_rate_limit(ADMIN_LOGIN_IP_LIMITER, ip_key, "Demasiados intentos de acceso. Espera unos minutos.")
+        _enforce_rate_limit(ADMIN_LOGIN_USER_LIMITER, user_key, "Demasiados intentos para este usuario. Espera unos minutos.")
         c = db()
         row = c.execute("SELECT * FROM admin_users WHERE username=? AND is_active=1", (username_input,)).fetchone()
         c.close()
         if not row:
+            # Equalise timing with a dummy PBKDF2 so usernames cannot be enumerated.
+            hashlib.pbkdf2_hmac("sha256", p.password.encode(), b"\x00" * 16, 180000)
             raise HTTPException(401, "Credenciales incorrectas")
         try:
             salt_hex, stored_hash = row["password_hash"].split(":", 1)
@@ -1509,7 +1632,7 @@ def admin_login(p: AdminLogin):
                 raise ValueError("hash incompleto")
         except (ValueError, TypeError):
             # A corrupted stored hash must never turn into a 500 or a login.
-            logger.error("Admin login rejected: malformed password hash for username=%s", row["username"])
+            logger.error("Admin login rejected: malformed stored password hash")
             raise HTTPException(401, "Credenciales incorrectas")
         calculated = hashlib.pbkdf2_hmac("sha256", p.password.encode(), salt, 180000).hex()
         if not hmac.compare_digest(stored_hash, calculated):
@@ -1517,6 +1640,8 @@ def admin_login(p: AdminLogin):
         username = row["username"]
         permissions = json.loads(row["permissions"])
         ttl = ADMIN_SESSION_TTL
+        ADMIN_LOGIN_IP_LIMITER.reset(ip_key)
+        ADMIN_LOGIN_USER_LIMITER.reset(user_key)
     claims = {"username": username, "exp": int(time.time()) + ttl, "jti": uuid.uuid4().hex}
     if is_owner:
         claims["role"] = "owner"

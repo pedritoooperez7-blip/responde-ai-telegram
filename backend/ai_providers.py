@@ -506,6 +506,25 @@ def _parse_replies(answer: str) -> dict[str, str] | None:
         return None
 
 
+def _priority(env_name: str, default: int) -> int:
+    """Read a provider priority; a malformed value must not break the chain."""
+    raw = (os.getenv(env_name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning("Invalid %s value; using default priority %s", env_name, default)
+        return default
+
+
+def _coerce_priority(value: Any, default: int = 50) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _generate_reply_impl(text: str, mode: str, module: str, image_data_url: str | None = None) -> str | dict[str, str] | None:
     """Try configured providers in order; return two structured replies when supported."""
     prompt = _build_prompt(mode, module)
@@ -518,14 +537,14 @@ def _generate_reply_impl(text: str, mode: str, module: str, image_data_url: str 
         user_content = [{"type":"text", "text":user_content}, {"type":"image_url", "image_url":{"url":image_data_url}}]
     providers = []
     if os.getenv("GEMINI_API_KEY"):
-        providers.append((int(os.getenv("AI_PRIORITY_GEMINI", "10")), "gemini", os.getenv("GEMINI_MODEL", "gemini-3.8-flash"), lambda: _gemini(prompt, user_content)))
+        providers.append((_priority("AI_PRIORITY_GEMINI", 10), "gemini", os.getenv("GEMINI_MODEL", "gemini-3.8-flash"), lambda: _gemini(prompt, user_content)))
     if os.getenv("GROQ_API_KEY") and not image_data_url:
-        providers.append((int(os.getenv("AI_PRIORITY_GROQ", "20")), "groq", os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"), lambda: _openai_compatible("https://api.groq.com/openai/v1/chat/completions", os.environ["GROQ_API_KEY"], os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"), prompt, user_content)))
+        providers.append((_priority("AI_PRIORITY_GROQ", 20), "groq", os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"), lambda: _openai_compatible("https://api.groq.com/openai/v1/chat/completions", os.environ["GROQ_API_KEY"], os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"), prompt, user_content)))
     if os.getenv("OPENROUTER_API_KEY"):
-        providers.append((int(os.getenv("AI_PRIORITY_OPENROUTER", "30")), "openrouter", os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"), lambda: _openai_compatible("https://openrouter.ai/api/v1/chat/completions", os.environ["OPENROUTER_API_KEY"], os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"), prompt, user_content)))
+        providers.append((_priority("AI_PRIORITY_OPENROUTER", 30), "openrouter", os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"), lambda: _openai_compatible("https://openrouter.ai/api/v1/chat/completions", os.environ["OPENROUTER_API_KEY"], os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"), prompt, user_content)))
     # Cohere is text-only here; it is a fallback, not a vision provider.
     if os.getenv("COHERE_API_KEY") and not image_data_url:
-        providers.append((int(os.getenv("AI_PRIORITY_COHERE", "40")), "cohere", os.getenv("COHERE_MODEL", "command-r7b-12-2024"), lambda: _cohere(prompt, str(user_content))))
+        providers.append((_priority("AI_PRIORITY_COHERE", 40), "cohere", os.getenv("COHERE_MODEL", "command-r7b-12-2024"), lambda: _cohere(prompt, str(user_content))))
     for custom in load_custom_provider_configs():
         if image_data_url and not bool(custom.get("supports_image")):
             continue
@@ -538,7 +557,7 @@ def _generate_reply_impl(text: str, mode: str, module: str, image_data_url: str 
             continue
         name = "custom:" + str(custom["provider_id"])
         model = str(custom["model"])
-        providers.append((int(custom.get("priority", 50)), name, model, lambda cfg=custom, url=endpoint: _openai_compatible(url, str(cfg["api_key"]), str(cfg["model"]), prompt, user_content)))
+        providers.append((_coerce_priority(custom.get("priority", 50)), name, model, lambda cfg=custom, url=endpoint: _openai_compatible(url, str(cfg["api_key"]), str(cfg["model"]), prompt, user_content)))
     providers.sort(key=lambda item: (item[0], item[1]))
     logger = logging.getLogger(__name__)
 
@@ -600,6 +619,17 @@ def _generate_reply_impl(text: str, mode: str, module: str, image_data_url: str 
             _set_provider_health(name, model, False, category)
             record_provider_metrics(name, model, "error", elapsed_ms, category)
             provider_failures.append({"provider": name, "error_code": category or type(exc).__name__, "latency_ms": elapsed_ms})
+            continue
+        except Exception as exc:
+            # A broken adapter (parsing bug, unexpected shape) must not abort the
+            # whole chain: record it and let the next provider answer.
+            elapsed_ms = int((time.monotonic() - provider_started) * 1000)
+            logger.warning("AI provider crashed: %s error_type=%s latency_ms=%s", name, type(exc).__name__, elapsed_ms)
+            if timings is not None:
+                timings.setdefault("provider_attempts", []).append({"provider": name, "status": "error", "latency_ms": elapsed_ms, "error_type": type(exc).__name__})
+            _set_provider_health(name, model, False, "unexpected_error")
+            record_provider_metrics(name, model, "error", elapsed_ms, "unexpected_error")
+            provider_failures.append({"provider": name, "error_code": "unexpected_error", "latency_ms": elapsed_ms})
             continue
     logger.warning("AI providers exhausted; refusing local fallback")
     error = ProviderError("No se pudo generar una respuesta con la IA. Comprueba la configuración del proveedor e inténtalo de nuevo.")

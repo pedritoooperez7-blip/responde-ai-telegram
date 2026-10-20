@@ -9,7 +9,8 @@ WORKDIR /app
 COPY backend/requirements.txt backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
-COPY . .
+COPY backend/ backend/
+COPY index.html admin.html app.js style.css liggacuba-logo.jpg privacy.html terms.html ./
 
 RUN rm -rf backend/__pycache__
 

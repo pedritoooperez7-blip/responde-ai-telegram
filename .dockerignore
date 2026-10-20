@@ -1,0 +1,33 @@
+# Version control and local tooling
+.git
+.gitignore
+.cline-home
+.idea
+.vscode
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local databases, journals and backups
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.backup
+backups/
+
+# Caches and build artefacts
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+node_modules/
+
+# Documentation and one-off artefacts are not needed at runtime
+docs/

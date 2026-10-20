@@ -1269,3 +1269,190 @@ class TestOperationalConfigWarnings(unittest.TestCase):
         self.assertFalse(any(w.startswith("CORS_ORIGINS") for w in warnings), warnings)
         self.assertFalse(any(w.startswith("ADMIN_KEY") for w in warnings), warnings)
         self.assertFalse(any(w.startswith("DB_PATH") for w in warnings), warnings)
+
+
+class TestOcrRuntime(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        self.image = valid_image_data_url()
+        self.patches = [
+            patch.object(main, "OCR_RATE_LIMITER", main._limits.SlidingWindowLimiter(3, 60)),
+            patch.object(main, "OCR_DAILY_COUNTER", main._limits.DailyCounter(10)),
+            patch.object(main, "OCR_GATE", main._limits.ConcurrencyGate(2)),
+            patch.object(main, "_ocr_text", return_value="texto reconocido"),
+        ]
+        for patcher in self.patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _ocr(self, headers):
+        return client.post("/ocr-base64", headers=headers, json={"image": self.image})
+
+    def test_ocr_work_is_dispatched_outside_the_event_loop(self):
+        import inspect
+        self.assertTrue(inspect.iscoroutinefunction(main.ocr_upload))
+        self.assertFalse(inspect.iscoroutinefunction(main._run_ocr_with_limits))
+        self.assertIn("run_in_threadpool", inspect.getsource(main.ocr_upload))
+
+    def test_ocr_rate_limit_returns_429_with_retry_after(self):
+        headers = auth("ocr-rate")
+        for _ in range(3):
+            self.assertEqual(self._ocr(headers).status_code, 200)
+        blocked = self._ocr(headers)
+        self.assertEqual(blocked.status_code, 429, blocked.text)
+        self.assertIn("Retry-After", blocked.headers)
+
+    def test_ocr_daily_limit_blocks_after_configured_uses(self):
+        from unittest.mock import patch
+        headers = auth("ocr-daily")
+        with patch.object(main, "OCR_DAILY_COUNTER", main._limits.DailyCounter(1)):
+            self.assertEqual(self._ocr(headers).status_code, 200)
+            blocked = self._ocr(headers)
+        self.assertEqual(blocked.status_code, 429, blocked.text)
+        self.assertIn("límite diario", blocked.json()["detail"])
+
+    def test_ocr_gate_rejects_when_all_slots_are_busy(self):
+        from unittest.mock import patch
+        headers = auth("ocr-busy")
+        with patch.object(main.OCR_GATE, "acquire", return_value=False):
+            blocked = self._ocr(headers)
+        self.assertEqual(blocked.status_code, 429, blocked.text)
+        self.assertIn("ocupado", blocked.json()["detail"])
+
+    def test_ocr_errors_are_preserved(self):
+        from unittest.mock import patch
+        headers = auth("ocr-error")
+        with patch.object(main, "_ocr_text", side_effect=RuntimeError("tesseract failed")):
+            response = self._ocr(headers)
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertIn("OCR", response.json()["detail"])
+
+
+class TestHealthEndpoint(unittest.TestCase):
+    def test_health_reports_database_ok(self):
+        response = client.get("/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["database"], "ok")
+
+    def test_health_returns_503_when_database_is_unavailable(self):
+        from unittest.mock import patch
+        with patch.object(main._db, "check_connection", side_effect=main.sqlite3.OperationalError("unable to open database file")):
+            response = client.get("/health")
+        self.assertEqual(response.status_code, 503, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "degraded")
+        self.assertEqual(body["database"], "unavailable")
+        self.assertNotIn("unable to open", str(body))
+
+
+class TestAdminLoginThrottling(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        self.patches = [
+            patch.object(main, "ADMIN_LOGIN_IP_LIMITER", main._limits.SlidingWindowLimiter(2, 900)),
+            patch.object(main, "ADMIN_LOGIN_USER_LIMITER", main._limits.SlidingWindowLimiter(2, 900)),
+        ]
+        for patcher in self.patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _failed_attempt(self, username="nobody"):
+        return client.post("/api/admin/login", json={"username": username, "password": "wrong-password"})
+
+    def test_repeated_failures_are_throttled(self):
+        self.assertEqual(self._failed_attempt().status_code, 401)
+        self.assertEqual(self._failed_attempt().status_code, 401)
+        blocked = self._failed_attempt()
+        self.assertEqual(blocked.status_code, 429, blocked.text)
+        self.assertIn("Retry-After", blocked.headers)
+
+    def test_valid_master_key_is_never_locked_out(self):
+        self.assertEqual(self._failed_attempt().status_code, 401)
+        self.assertEqual(self._failed_attempt().status_code, 401)
+        owner = client.post("/api/admin/login", json={"master_key": main.ADMIN_KEY})
+        self.assertEqual(owner.status_code, 200, owner.text)
+        self.assertTrue(owner.json()["is_owner"])
+
+    def test_successful_login_restores_the_budget(self):
+        username = "throttle-" + uuid.uuid4().hex[:8]
+        password = "Test-password-42!"
+        salt = os.urandom(16)
+        digest = salt.hex() + ":" + hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 180000).hex()
+        c = main.db()
+        c.execute("INSERT INTO admin_users(username,password_hash,permissions,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                  (username, digest, json.dumps(["users"]), 1, main.now(), main.now()))
+        c.commit(); c.close()
+        self.assertEqual(self._failed_attempt(username).status_code, 401)
+        login = client.post("/api/admin/login", json={"username": username, "password": password})
+        self.assertEqual(login.status_code, 200, login.text)
+        # The successful login cleared the counters, so a new failure is a 401, not a 429.
+        self.assertEqual(self._failed_attempt(username).status_code, 401)
+
+
+class TestPaymentCurrencySeparation(unittest.TestCase):
+    def _pending(self, uid, language="es"):
+        headers = auth(uid)
+        response = client.post("/api/payments/pending", headers=headers, json={
+            "user_id": uid, "plan": "weekly", "language": language, "payment_method": "BANDEC"
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        return headers, response.json()
+
+    def test_english_payment_uses_the_configured_currency(self):
+        _, data = self._pending("currency-en-" + uuid.uuid4().hex[:6], language="en")
+        self.assertEqual(data["amount_currency"], "CUP")
+        self.assertEqual(data["amount_value"], 2500.0)
+        self.assertEqual(data["amount"], "2500 CUP")
+
+    def test_legacy_usd_operation_never_matches_a_cup_transfer(self):
+        uid = "currency-legacy-" + uuid.uuid4().hex[:6]
+        headers = auth(uid)
+        client.post("/api/payment-phone", headers=headers, json={"phone": "52677888"})
+        c = main.db()
+        c.execute(
+            """INSERT INTO payment_operations(operation_id,user_id,plan,language,status,amount,payment_method,
+               payer_phone,destination_account,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            ("LEGACYUSD" + uuid.uuid4().hex[:5].upper(), uid, "weekly", "en", "pending", "8.99 USD",
+             "BANDEC", "52677888", os.environ["BANDEC_ACCOUNT"], main.now(), main.now()),
+        )
+        c.commit(); c.close()
+        result = client.post("/api/atajo-pago", headers={"x-atajo-key": os.environ["ATAJO_KEY"]}, json={
+            "metodo_pago": "BANDEC", "telefono_origen": "52677888",
+            "cuenta_destino": os.environ["BANDEC_ACCOUNT"], "monto_recibido": 8.99,
+            "transaccion": "LEGACY-TX-" + uuid.uuid4().hex[:8], "fecha": "2026-10-19",
+        })
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json().get("status"), "unmatched", result.json())
+        c = main.db()
+        status = c.execute("SELECT status FROM payment_operations WHERE user_id=?", (uid,)).fetchone()["status"]
+        c.close()
+        self.assertEqual(status, "pending")
+
+
+class TestRefundDateGuard(unittest.TestCase):
+    def test_charge_from_a_previous_day_is_not_refunded(self):
+        from unittest.mock import patch
+        uid = "refund-date-" + uuid.uuid4().hex[:6]
+        headers = auth(uid)
+        analysis = client.post("/api/analyze", headers=headers, json={
+            "user_id": uid, "module": "chat", "mode": "coquetear"
+        })
+        self.assertEqual(analysis.status_code, 200, analysis.text)
+        attempt_id = analysis.json()["analysis_id"]
+        c = main.db()
+        row = c.execute("SELECT quota_log_id FROM analysis_attempts WHERE id=?", (attempt_id,)).fetchone()
+        c.execute("UPDATE usage_logs SET used_at='2000-01-01T00:00:00' WHERE id=?", (row["quota_log_id"],))
+        c.commit(); c.close()
+        before = main.usage(uid)["used_today"]
+        with patch.object(main, "ai_generate_reply", side_effect=main.ProviderError("provider down")):
+            failed = client.post("/api/generate-reply", headers=headers, json={
+                "user_id": uid, "module": "chat", "mode": "coquetear",
+                "analysis_id": attempt_id, "text": "Hola", "idempotency_key": "refund-date-key",
+            })
+        self.assertEqual(failed.status_code, 503, failed.text)
+        self.assertEqual(main.usage(uid)["used_today"], before)
+        c = main.db()
+        charged = c.execute("SELECT quota_charged FROM analysis_attempts WHERE id=?", (attempt_id,)).fetchone()["quota_charged"]
+        c.close()
+        self.assertEqual(charged, 1)

@@ -9,7 +9,7 @@ Aplicación completa: bot de Telegram + Mini App + backend FastAPI con IA multi-
    - `/start` funcional: envía el mensaje de bienvenida con los 3 botones (Canal, Comunidad, Abrir Mini App) mediante una llamada real a `sendMessage` de la Bot API.
    - Anti-duplicados: cada `update_id` se reclama atómicamente en la base de datos antes de procesarse; si Telegram reenvía una actualización, se responde OK sin ejecutar la acción dos veces.
    - Endpoint admin `POST /api/admin/telegram-webhook/setup` y script `scripts/setup_telegram_webhook.py` para registrar el webhook.
-2. **Seguridad.** CORS restringido a los métodos y cabeceras usados (configurable con `CORS_ORIGINS`); eliminadas las credenciales bancarias y de contacto incrustadas como valores por defecto en el código (la cuenta BANDEC y el teléfono de pago ahora solo vienen de variables de entorno); `GET /api/admin/payments` ya no devuelve la imagen del comprobante en base64; métodos HTTP de la API limitados a GET/POST/DELETE.
+2. **Seguridad.** CORS limitado a los métodos y cabeceras usados; los orígenes se configuran con `CORS_ORIGINS` y, si está vacío, se permite cualquiera (se registra un aviso al arrancar). Añadidos límites de frecuencia para OCR/análisis/generación y para el login de administrador, `/.dockerignore`, y validación de que `/health` comprueba la base de datos. Eliminadas las credenciales bancarias y de contacto incrustadas como valores por defecto en el código (la cuenta BANDEC y el teléfono de pago ahora solo vienen de variables de entorno); `GET /api/admin/payments` ya no devuelve la imagen del comprobante en base64; métodos HTTP de la API limitados a GET/POST/DELETE.
 3. **Código muerto eliminado.** Había tres funciones definidas por duplicado (`_ocr_variants`, `_ocr_text`, `normalize_payment_phone`); se conservó la versión correcta de cada una. En la Mini App se retiró `submitProof()` (llamaba a campos de formulario que no existen) y una variable global sin uso.
 4. **Mini App.** Añadida la ruta del logo `/liggacuba-logo.jpg` al backend (antes la imagen del splash no se servía). El resto del diseño, i18n, recortador y flujos se conservan intactos.
 5. **Despliegue.** `requirements.txt` con versiones fijadas; `railway.json` con healthcheck en `/health`; Dockerfile conservado y verificado.
@@ -22,7 +22,7 @@ backend/
   ai_providers.py   Adaptadores IA (Gemini, Groq, OpenRouter, Cohere + proveedores propios)
   telegram_bot.py   Bot: webhook, /start, anti-duplicados, Bot API
   requirements.txt
-tests/              111 pruebas (109 offline)
+tests/              199 pruebas (195 offline; 4 en vivo de proveedores)
 index.html / app.js / style.css / admin.html / privacy.html / terms.html
 liggacuba-logo.jpg
 Dockerfile / railway.json
@@ -47,15 +47,25 @@ Ninguna tiene valor por defecto inseguro; todo se configura en Railway (o el hos
 | `ATAJO_KEY` | Para el atajo iOS | Autentica las notificaciones de pago automáticas. |
 | `ADMIN_TELEGRAM_IDS` | Opcional | IDs de Telegram con acceso al panel. |
 | `CORS_ORIGINS` | Opcional | Orígenes adicionales permitidos, separados por comas. |
-| `DB_PATH` | Opcional | Ruta del SQLite (por defecto `liggacuba.db` en el raíz). |
+| `DB_PATH` | Opcional | Ruta del SQLite. Por defecto `liggacuba.db` en la raíz del contenedor, que **no es persistente**: en producción debe apuntar a un volumen. |
 | `GEMINI_MODEL` etc. | Opcional | Modelos específicos por proveedor. |
+| `SQLITE_BUSY_TIMEOUT_MS` | Opcional | Espera ante bloqueos de escritura (defecto 15000). |
+| `PAYMENT_CURRENCY` / `PAYMENT_PRICE_WEEKLY` / `PAYMENT_PRICE_ANNUAL` | Opcional | Moneda real de las operaciones y precios numéricos (defecto `CUP`, 2500, 15500). |
+| `OCR_RATE_LIMIT_PER_MINUTE` / `OCR_DAILY_LIMIT` / `OCR_MAX_CONCURRENT` | Opcional | Límites de OCR (defecto 10/min, 50/día, 2 simultáneos por proceso). |
+| `ANALYZE_RATE_LIMIT_PER_MINUTE` / `GENERATION_RATE_LIMIT_PER_HOUR` | Opcional | Límites de análisis (20/min) y generación (40/h) por usuario. |
+| `ADMIN_LOGIN_MAX_ATTEMPTS` / `ADMIN_LOGIN_WINDOW_SECONDS` | Opcional | Protección del login admin (defecto 10 intentos / 900 s). |
+| `DISABLE_BACKGROUND_PURGE` | Opcional | `1` desactiva la purga periódica (para investigar incidentes). |
+
+Detalle operativo, límites y decisiones pendientes: [`docs/OPERACIONES_V1.md`](docs/OPERACIONES_V1.md). Copias de seguridad: [`docs/BACKUP_RESTORE.md`](docs/BACKUP_RESTORE.md).
 
 ## Despliegue en Railway
 
 1. Despliega este directorio (Railway detecta `railway.json` + Dockerfile; Tesseract y los idiomas spa/eng se instalan en la imagen).
 2. Configura las variables de entorno de la tabla anterior.
 3. Registra el webhook del bot: `python scripts/setup_telegram_webhook.py` (una vez, con las variables en el entorno), o llama al endpoint admin `POST /api/admin/telegram-webhook/setup` con la cabecera `X-Admin-Key`.
-4. Verifica: `GET /health` debe responder `{"status":"ok"}`; escribe `/start` al bot y comprueba que llega el mensaje con los 3 botones.
+4. Verifica: `GET /health` debe responder `200` con `{"status":"ok","database":"ok"}`; escribe `/start` al bot y comprueba que llega el mensaje con los 3 botones.
+5. Antes de producción, confirma que `DB_PATH` apunta a almacenamiento persistente y que los datos sobreviven a un reinicio (ver `docs/OPERACIONES_V1.md`).
+6. Programa una copia de seguridad (`python scripts/backup_sqlite.py --out-dir <volumen>/backups`).
 
 ## Pruebas
 
@@ -64,8 +74,20 @@ pip install -r backend/requirements.txt -r requirements-test.txt
 python -m pytest tests/ -q --ignore=tests/test_provider_integration.py
 ```
 
-Resultado real de la última ejecución en este entorno: **109 pasadas, 2 omitidas**.
-Las 2 omitidas son las pruebas de OCR real (`TestSyntheticTelegramScreenshotOCR`): requieren el binario `tesseract`, que este entorno de desarrollo no puede instalar (sin permisos de administrador). Sí se instalan en la imagen Docker, donde esas pruebas corren sin omisión. `tests/test_provider_integration.py` no se ejecuta por defecto: hace llamadas reales a los proveedores de IA y consume cuota (se lanza deliberadamente con `scripts/run_live_provider_tests.py` en un servicio de pruebas).
+Resultado real en el entorno de esta rama (sin `fastapi`, `pydantic`, `PIL`, `httpx`,
+`cryptography` ni `pytest` instalados, y sin instalar nada):
+
+* **87 pruebas ejecutadas y correctas** con `unittest`: `test_telegram_bot`,
+  `test_provider_contracts`, `test_provider_resilience`, `test_limits`,
+  `test_db_config`, `test_payments_config` y `test_backup_sqlite`. Para
+  `ai_providers` se usó un doble temporal de `cryptography.fernet` **fuera del
+  repositorio** (`/tmp`), porque el módulo real no está instalado.
+* **No ejecutadas:** `test_isolated.py` y `test_telegram_welcome.py` (requieren
+  FastAPI, Pydantic, Pillow y HTTPX) y `test_provider_integration.py` (llamadas
+  reales de pago). No se declaran aprobadas.
+
+En un entorno con las dependencias declaradas, el comando es el de arriba. No hay
+CI configurada todavía.
 
 ## Límites verificados y no verificados
 
@@ -90,4 +112,4 @@ Esta rama reemplaza a `bolt/liggacuba-production` (PR #48, ya fusionado): integr
 - Backend unificado en `backend/` (el contenido de `liggacuba-delivery/` ya no existe como copia separada).
 - Historiales de cambios antiguos movidos a `docs/`.
 - Ficheros `.BACKUP_*` eliminados del repositorio.
-- Suite completa: **109 pruebas pasadas, 6 omitidas** (2 OCR por falta de Tesseract en el sandbox de integración; 4 pruebas en vivo de proveedores que se lanzan aparte). Verificado también el arranque real con uvicorn: `/health`, Mini App, recursos estáticos y respuestas 401/503 del webhook sin configurar.
+- Suite: **199 pruebas declaradas** (195 offline + 4 en vivo). En el entorno de esta rama se ejecutaron 87 offline con resultado correcto; el resto requiere las dependencias del proyecto (ver la sección «Pruebas»).
