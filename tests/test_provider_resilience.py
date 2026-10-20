@@ -241,5 +241,76 @@ class TestProviderDestinationValidation(unittest.TestCase):
         self.assertIn(ai._NoRedirectHandler, types)
 
 
+STRUCTURED_REPLY = '{"reply":"Hola, ¿cómo estás?","alternative":"¿Qué tal tu día?"}'
+
+
+class TestProviderFallbackChain(unittest.TestCase):
+    def _config(self, provider_id: str, priority: int, model: str) -> dict:
+        return {
+            "provider_id": provider_id,
+            "base_url": "https://api.example.com/v1",
+            "model": model,
+            "api_key": "test-key",
+            "supports_text": 1,
+            "supports_image": 0,
+            "priority": priority,
+        }
+
+    def test_invalid_priority_configuration_uses_default(self):
+        with patch.dict(os.environ, {"AI_PRIORITY_GEMINI": "not-a-number"}):
+            self.assertEqual(ai._priority("AI_PRIORITY_GEMINI", 10), 10)
+        self.assertEqual(ai._priority("AI_PRIORITY_MISSING", 20), 20)
+        self.assertEqual(ai._coerce_priority("bad", 50), 50)
+        self.assertEqual(ai._coerce_priority(None, 50), 50)
+
+    def test_unexpected_adapter_error_falls_through_to_the_next_provider(self):
+        configs = [
+            self._config("broken", 10, "broken-model"),
+            self._config("good", 20, "good-model"),
+        ]
+
+        def fake_openai(url, key, model, prompt, content):
+            if model == "broken-model":
+                raise RuntimeError("unexpected adapter failure")
+            return STRUCTURED_REPLY
+
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(ai, "load_custom_provider_configs", return_value=configs), \
+             patch.object(ai.socket, "getaddrinfo", return_value=PUBLIC_DNS), \
+             patch.object(ai, "_openai_compatible", side_effect=fake_openai):
+            result = ai._generate_reply_impl("hola", "coquetear", "chat")
+
+        self.assertEqual(result["provider"], "custom:good")
+        self.assertEqual(result["reply"], "Hola, ¿cómo estás?")
+
+    def test_empty_response_falls_through_to_the_next_provider(self):
+        configs = [
+            self._config("empty", 10, "empty-model"),
+            self._config("good", 20, "good-model"),
+        ]
+
+        def fake_openai(url, key, model, prompt, content):
+            return "" if model == "empty-model" else STRUCTURED_REPLY
+
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(ai, "load_custom_provider_configs", return_value=configs), \
+             patch.object(ai.socket, "getaddrinfo", return_value=PUBLIC_DNS), \
+             patch.object(ai, "_openai_compatible", side_effect=fake_openai):
+            result = ai._generate_reply_impl("hola", "gracioso", "chat")
+
+        self.assertEqual(result["provider"], "custom:good")
+
+    def test_all_providers_failing_raises_provider_error_without_secrets(self):
+        configs = [self._config("only", 10, "only-model")]
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(ai, "load_custom_provider_configs", return_value=configs), \
+             patch.object(ai.socket, "getaddrinfo", return_value=PUBLIC_DNS), \
+             patch.object(ai, "_openai_compatible", side_effect=ai.ProviderError("secret-free failure")):
+            with self.assertRaises(ai.ProviderError) as raised:
+                ai._generate_reply_impl("hola", "coquetear", "chat")
+        self.assertNotIn("test-key", str(raised.exception))
+        self.assertEqual(raised.exception.provider_failures[0]["provider"], "custom:only")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
