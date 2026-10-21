@@ -12,11 +12,11 @@ from starlette.concurrency import run_in_threadpool
 try:
     from . import db as _db, limits as _limits, payments as _payments
     from .ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
-    from .telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook
+    from .telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo
 except ImportError:  # Support running uvicorn with backend/ as the working directory.
     import db as _db, limits as _limits, payments as _payments
     from ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
-    from telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook
+    from telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo
 logger = logging.getLogger(__name__)
 
 ai_generate_reply = _provider_generate_reply
@@ -323,6 +323,14 @@ def init_db():
       cache_key TEXT PRIMARY KEY, encrypted_payload TEXT NOT NULL, prompt_version TEXT NOT NULL,
       created_at TEXT NOT NULL, expires_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS payment_proof_archive_queue(
+      operation_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, proof_text TEXT, proof_image TEXT,
+      status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL, last_error TEXT, created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL, processing_started_at TEXT, archive_message_id TEXT,
+      FOREIGN KEY(operation_id) REFERENCES payment_operations(operation_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_proof_archive_due ON payment_proof_archive_queue(status,next_attempt_at);
     """)
     for sql in (
         "ALTER TABLE users ADD COLUMN payment_phone TEXT",
@@ -334,6 +342,13 @@ def init_db():
         "ALTER TABLE payment_operations ADD COLUMN source_sms TEXT",
         "ALTER TABLE payment_operations ADD COLUMN amount_value REAL",
         "ALTER TABLE payment_operations ADD COLUMN amount_currency TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN archive_chat_id TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN archive_message_id TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN archive_status TEXT NOT NULL DEFAULT 'not_configured'",
+        "ALTER TABLE payment_operations ADD COLUMN archive_attempts INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE payment_operations ADD COLUMN archive_next_attempt_at TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN archive_last_error TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN archived_at TEXT",
     ):
         try:
             c.execute(sql)
@@ -472,7 +487,7 @@ class AdminCreate(BaseModel): username:str; password:str; permissions:list[str]=
 class AdminStatus(BaseModel): username:str; is_active:bool=True
 class PremiumChange(BaseModel): user_id:str; action:str; days:int=7
 class PaymentReview(BaseModel): operation_id:str; action:str; reason:str=""
-class Proof(BaseModel): operation_id:str; user_id:str; proof_text:str=""; proof_image:str=""
+class Proof(BaseModel): operation_id:str; user_id:str=""; proof_text:str=""; proof_image:str=""
 class SaveSituation(BaseModel): user_id:str; ocr_text:str=""; reply:str=""
 class OCR(BaseModel): image:str
 
@@ -614,6 +629,8 @@ def check_operational_configuration() -> list[str]:
         warnings.append("DB_PATH is not set: the SQLite file lives inside the container and is lost on redeploy unless a persistent volume is mounted.")
     if not re.sub(r"\D", "", BANDEC_ACCOUNT or "") and not re.sub(r"\D", "", BPA_ACCOUNT or ""):
         warnings.append("No BANDEC/BPA destination account is configured: payment operations cannot be created.")
+    if not (os.getenv("PAYMENT_ARCHIVE_CHAT_ID") or "").strip():
+        warnings.append("PAYMENT_ARCHIVE_CHAT_ID is missing: proof archiving is disabled; proofs remain in SQLite.")
     return warnings
 
 
@@ -622,6 +639,7 @@ def _log_operational_configuration():
     for message in check_operational_configuration():
         logger.warning("Configuration check: %s", message)
     start_background_purge()
+    start_payment_archive_worker()
 
 
 PURGE_INTERVAL_SECONDS = 6 * 60 * 60
@@ -671,6 +689,128 @@ def start_background_purge() -> bool:
 
         threading.Thread(target=loop, name="retention-purge", daemon=True).start()
         _background_purge_started = True
+        return True
+
+
+ARCHIVE_WORKER_INTERVAL_SECONDS = 20
+ARCHIVE_RETRY_BASE_SECONDS = 30
+ARCHIVE_RETRY_MAX_SECONDS = 6 * 60 * 60
+_archive_worker_started = False
+_archive_worker_lock = threading.Lock()
+
+
+def process_one_payment_archive() -> bool:
+    """Process one due archive job; keep original proof until Telegram confirms success."""
+    c = db()
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute(
+            """SELECT * FROM payment_proof_archive_queue
+               WHERE (status='pending' AND next_attempt_at<=?)
+                  OR (status='processing' AND processing_started_at<=?)
+               ORDER BY created_at LIMIT 1""",
+            (now_iso, (now_dt - timedelta(minutes=5)).isoformat()),
+        ).fetchone()
+        if not row:
+            c.commit()
+            return False
+        operation_id = row['operation_id']
+        c.execute("UPDATE payment_proof_archive_queue SET status='processing',processing_started_at=?,updated_at=? WHERE operation_id=?",
+                  (now_iso, now_iso, operation_id))
+        c.commit()
+        job = dict(row)
+    except Exception:
+        c.rollback()
+        logger.warning("Could not claim payment proof archive job", exc_info=True)
+        return False
+    finally:
+        c.close()
+
+    try:
+        from html import escape
+        caption = (f"<b>Comprobante de pago</b>\nOperación: <code>{escape(str(operation_id))}</code>\n"
+                   f"Usuario: <code>{escape(str(_archive_user_for_operation(operation_id)))}</code>\n"
+                   f"Texto: {escape((job.get('proof_text') or '')[:700])}")
+        image = job.get('proof_image') or ''
+        if image:
+            raw = _validate_image_data_url(image)
+            result = send_photo(job['chat_id'], raw, "comprobante.jpg", caption)
+        else:
+            result = send_message(job['chat_id'], caption)
+        message_id = str(result.get('message_id') or '').strip()
+        if not message_id:
+            raise TelegramBotError("Telegram no devolvió message_id; se conserva el comprobante")
+        c = db()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("""UPDATE payment_operations SET proof_text='',proof_image='',archive_chat_id=?,
+                       archive_message_id=?,archive_status='sent',archive_attempts=?,archive_next_attempt_at=NULL,
+                       archive_last_error=NULL,archived_at=?,updated_at=? WHERE operation_id=?""",
+                      (str(job['chat_id']), message_id, int(job['attempts']) + 1, now(), now(), operation_id))
+            c.execute("""UPDATE payment_proof_archive_queue SET status='sent',proof_text=NULL,proof_image=NULL,
+                       attempts=attempts+1,last_error=NULL,archive_message_id=?,processing_started_at=NULL,updated_at=?
+                       WHERE operation_id=?""", (message_id, now(), operation_id))
+            c.commit()
+        except Exception:
+            c.rollback()
+            # Telegram may have accepted the message; retain the queued proof and retry safely.
+            raise
+        finally:
+            c.close()
+        logger.info("Payment proof archived operation_id=%s message_id=%s", operation_id, message_id)
+        return True
+    except Exception as exc:
+        attempts = int(job.get('attempts') or 0) + 1
+        delay = min(ARCHIVE_RETRY_MAX_SECONDS, ARCHIVE_RETRY_BASE_SECONDS * (2 ** min(attempts - 1, 10)))
+        next_time = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+        error = (str(exc) or type(exc).__name__)[:240]
+        c = db()
+        try:
+            c.execute("""UPDATE payment_proof_archive_queue SET status='pending',attempts=?,next_attempt_at=?,
+                       last_error=?,processing_started_at=NULL,updated_at=? WHERE operation_id=?""",
+                      (attempts, next_time, error, now(), job['operation_id']))
+            c.execute("""UPDATE payment_operations SET archive_status='retrying',archive_attempts=?,
+                       archive_next_attempt_at=?,archive_last_error=?,updated_at=? WHERE operation_id=?""",
+                      (attempts, next_time, error, now(), job['operation_id']))
+            c.commit()
+        except Exception:
+            c.rollback()
+            logger.error("Failed to persist payment archive retry operation_id=%s", job['operation_id'], exc_info=True)
+        finally:
+            c.close()
+        logger.warning("Payment proof archive failed; retry scheduled operation_id=%s attempt=%s delay_seconds=%s error=%s",
+                       job['operation_id'], attempts, delay, error)
+        return False
+
+
+def _archive_user_for_operation(operation_id: str) -> str:
+    c = db()
+    try:
+        row = c.execute("SELECT user_id FROM payment_operations WHERE operation_id=?", (operation_id,)).fetchone()
+        return str(row['user_id']) if row else 'desconocido'
+    finally:
+        c.close()
+
+
+def start_payment_archive_worker() -> bool:
+    """Start a single per-process polling worker; DB claims coordinate multiple workers."""
+    global _archive_worker_started
+    with _archive_worker_lock:
+        if _archive_worker_started or os.getenv('DISABLE_PAYMENT_ARCHIVE_WORKER','').strip().lower() in {'1','true','yes'}:
+            return False
+        if DB_PATH in {'', ':memory:'}:
+            return False
+        def loop():
+            while True:
+                try:
+                    process_one_payment_archive()
+                except Exception:
+                    logger.error("Unexpected payment archive worker failure", exc_info=True)
+                time.sleep(ARCHIVE_WORKER_INTERVAL_SECONDS)
+        threading.Thread(target=loop, name='payment-proof-archive', daemon=True).start()
+        _archive_worker_started = True
         return True
 
 
@@ -766,7 +906,7 @@ def admin_setup_webhook(request: Request):
         result = set_webhook(
             public_url + "/webhook/telegram",
             os.getenv("TELEGRAM_WEBHOOK_SECRET", ""),
-            ["message"],
+            ["message", "callback_query"],
         )
     except TelegramBotError as exc:
         raise HTTPException(502, str(exc))
@@ -1568,18 +1708,39 @@ def proof(p:Proof, request:Request):
         image=p.proof_image or ""
         if len(image)>3_000_000: raise HTTPException(400,"El comprobante de imagen supera 3 MB")
         if image:
-            # Only a valid image data URL is stored; the existing size limit is kept (or tightened).
             try:
                 _validate_image_data_url(image)
             except HTTPException as exc:
                 raise HTTPException(400, str(exc.detail)) from None
-        t=now(); c.execute("UPDATE payment_operations SET status='proof_submitted',proof_text=?,proof_image=?,updated_at=? WHERE operation_id=? AND user_id=?",(p.proof_text,image,t,p.operation_id,uid)); c.commit()
+        t=now()
+        archive_chat=(os.getenv("PAYMENT_ARCHIVE_CHAT_ID") or "").strip()
+        if archive_chat:
+            # Keep the original proof in payment_operations until the durable queue
+            # confirms Telegram delivery and records its message_id.
+            c.execute("""INSERT INTO payment_proof_archive_queue(operation_id,chat_id,proof_text,proof_image,status,attempts,next_attempt_at,created_at,updated_at)
+                       VALUES(?,?,?,?,'pending',0,?,?,?)
+                       ON CONFLICT(operation_id) DO UPDATE SET chat_id=excluded.chat_id,proof_text=excluded.proof_text,
+                       proof_image=excluded.proof_image,status='pending',next_attempt_at=excluded.next_attempt_at,
+                       last_error=NULL,processing_started_at=NULL,attempts=0,archive_message_id=NULL,updated_at=excluded.updated_at""",
+                      (p.operation_id,archive_chat,p.proof_text,image,t,t,t))
+            c.execute("""UPDATE payment_operations SET status='proof_submitted',proof_text=?,proof_image=?,
+                       archive_status='queued',archive_chat_id=NULL,archive_message_id=NULL,archive_last_error=NULL,archive_next_attempt_at=?,updated_at=?
+                       WHERE operation_id=? AND user_id=?""",
+                      (p.proof_text,image,t,t,p.operation_id,uid))
+            archive_status='queued'
+        else:
+            c.execute("""UPDATE payment_operations SET status='proof_submitted',proof_text=?,proof_image=?,
+                       archive_status='not_configured',archive_chat_id=NULL,archive_message_id=NULL,updated_at=?
+                       WHERE operation_id=? AND user_id=?""",(p.proof_text,image,t,p.operation_id,uid))
+            archive_status='not_configured'
+        c.commit()
     except Exception:
         c.rollback()
         raise
     finally:
         c.close()
-    return {"success":True,"status":"proof_submitted"}
+    return {"success":True,"status":"proof_submitted","archive_status":archive_status,
+            "message":"Comprobante recibido; el archivo se procesa en segundo plano." if archive_status=='queued' else "Comprobante guardado. El archivo de Telegram no está configurado."}
 
 @app.post("/api/payments/cancel")
 def cancel(p:PaymentId, request:Request):
@@ -1880,7 +2041,7 @@ def admin_ai_monitor(request: Request):
 @app.get("/api/admin/payments")
 def admin_payments(request:Request):
     admin(request,"payments"); c=db()
-    rows=c.execute("""SELECT operation_id,user_id,plan,language,status,amount,proof_text,payment_method,payer_phone,destination_account,transaction_id,transfer_date,created_at,updated_at,verified_at,cancelled_at
+    rows=c.execute("""SELECT operation_id,user_id,plan,language,status,amount,proof_text,CASE WHEN proof_image IS NOT NULL AND proof_image!='' THEN 1 ELSE 0 END AS has_proof_image,payment_method,payer_phone,destination_account,transaction_id,transfer_date,archive_chat_id,archive_message_id,archive_status,archive_attempts,archive_next_attempt_at,archive_last_error,archived_at,created_at,updated_at,verified_at,cancelled_at
                       FROM payment_operations ORDER BY created_at DESC LIMIT 100""").fetchall()
     c.close()
     return {"items":[dict(r) for r in rows]}
