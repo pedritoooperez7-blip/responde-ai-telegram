@@ -37,3 +37,20 @@ Esta copia conserva la estructura del proyecto y actualiza el backend y la inter
 - Prueba aislada de BPA: entrega la cuenta BPA configurada.
 - Prueba aislada de Saldo Móvil: verifica pago, rechaza repetición y rechaza un importe distinto al SMS.
 - Estas pruebas usan una base SQLite temporal; no se conectan a Railway ni procesan dinero real.
+
+
+## Archivo de comprobantes en Telegram (cola persistente y reintentos)
+
+- Configurar `PAYMENT_ARCHIVE_CHAT_ID` con el ID del grupo/canal privado de archivo y añadir el bot con permiso para enviar mensajes y fotos.
+- Los comprobantes se guardan en una cola persistente SQLite (`payment_proof_archive_queue`) y se procesan en segundo plano. Los reinicios conservan la cola si `DB_PATH` apunta a un volumen persistente.
+- Los fallos se reintentan indefinidamente con backoff exponencial desde 30 segundos hasta un máximo de 6 horas. Los trabajos `processing` abandonados se recuperan después de 5 minutos.
+- El texto y la imagen originales permanecen en `payment_operations` hasta que Telegram devuelve un `message_id` y la base guarda la referencia. Después se limpian las copias grandes de SQLite.
+- El panel administrativo muestra estado del archivo, intentos, último error y referencias del chat/mensaje de Telegram. Para un chat privado, el administrador debe pertenecer al grupo/canal.
+- Si no se configura `PAYMENT_ARCHIVE_CHAT_ID`, el comprobante permanece en SQLite y el arranque registra una advertencia.
+- Un timeout ambiguo después de que Telegram acepte el mensaje puede producir duplicados en un reintento: Telegram Bot API no ofrece una clave de idempotencia para `sendPhoto`/`sendMessage`. Se prioriza no perder el comprobante.
+- No se modifican las reglas de pagos automáticos/manuales ni la concesión de Premium.
+
+## Validación de esta entrega ZIP
+- Sintaxis Python de los módulos modificados: correcta (`py_compile`).
+- Suite offline: 199 pruebas descubiertas, 4 fallos y 4 omitidas. Los cuatro fallos están en las pruebas del atajo de pagos y devuelven `unmatched` en lugar de los resultados esperados; no afectan directamente al archivo de comprobantes, pero impiden declarar la suite completa como aprobada.
+- No se realizaron llamadas reales a Telegram, Railway, proveedores de IA ni pagos. Antes de producción hay que ejecutar CI y una prueba controlada en una rama/PR.

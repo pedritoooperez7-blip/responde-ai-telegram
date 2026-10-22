@@ -61,6 +61,32 @@ class WebhookSecretTests(unittest.TestCase):
                 tb.mini_app_url()
 
 
+class SendPhotoTests(unittest.TestCase):
+    def test_send_photo_uses_multipart_and_returns_message(self):
+        response_body = json.dumps({"ok": True, "result": {"message_id": 991}}).encode()
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return response_body
+        with mock.patch.dict(os.environ, VALID_ENV), mock.patch.object(tb.urllib.request, "urlopen", return_value=FakeResponse()) as opened:
+            result = tb.send_photo("-100123", b"fake-image-bytes", "receipt.jpg", "Comprobante")
+        self.assertEqual(result["message_id"], 991)
+        request = opened.call_args.args[0]
+        self.assertIn("multipart/form-data", request.headers["Content-type"])
+        self.assertIn(b"name=\"photo\"", request.data)
+        self.assertIn(b"fake-image-bytes", request.data)
+
+    def test_send_photo_rejection_raises_safe_error(self):
+        response_body = json.dumps({"ok": False, "description": "Bad Request: chat not found"}).encode()
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return response_body
+        with mock.patch.dict(os.environ, VALID_ENV), mock.patch.object(tb.urllib.request, "urlopen", return_value=FakeResponse()):
+            with self.assertRaises(tb.TelegramBotError):
+                tb.send_photo("-100123", b"fake-image-bytes")
+
+
 class StartPayloadTests(unittest.TestCase):
     def test_start_payload_has_three_buttons_and_mini_app(self):
         payload = tb.build_start_payload(
