@@ -113,3 +113,4 @@ Esta rama reemplaza a `bolt/liggacuba-production` (PR #48, ya fusionado): integr
 - Historiales de cambios antiguos movidos a `docs/`.
 - Ficheros `.BACKUP_*` eliminados del repositorio.
 - Suite: **199 pruebas declaradas** (195 offline + 4 en vivo). En el entorno de esta rama se ejecutaron 87 offline con resultado correcto; el resto requiere las dependencias del proyecto (ver la sección «Pruebas»).
+- actualizando railway
