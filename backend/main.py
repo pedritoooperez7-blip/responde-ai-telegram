@@ -372,8 +372,17 @@ def init_db():
         except sqlite3.OperationalError as exc:
             if "duplicate column name" not in str(exc).lower():
                 raise
-    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_transaction ON payment_operations(transaction_id) WHERE transaction_id IS NOT NULL AND transaction_id != ''")
-    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_source_sms ON payment_operations(source_sms) WHERE source_sms IS NOT NULL AND source_sms != ''")
+    # Historical databases may already contain duplicate identifiers from older
+    # builds. Do not crash startup while adding defense-in-depth indexes; the
+    # payment endpoint also serializes and checks duplicates transactionally.
+    for index_sql, index_name in (
+        ("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_transaction ON payment_operations(transaction_id) WHERE transaction_id IS NOT NULL AND transaction_id != ''", "idx_payment_transaction"),
+        ("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_source_sms ON payment_operations(source_sms) WHERE source_sms IS NOT NULL AND source_sms != ''", "idx_payment_source_sms"),
+    ):
+        try:
+            c.execute(index_sql)
+        except sqlite3.IntegrityError:
+            logger.error("Could not create %s because legacy payment duplicates exist; runtime duplicate checks remain enabled", index_name)
     c.commit(); c.close()
 init_db()
 
@@ -1567,6 +1576,10 @@ def atajo_pago(p: AtajoPayment, request: Request):
             }
 
         matched = candidates[0]
+        if matched["plan"] not in {"weekly", "annual"}:
+            c.rollback()
+            logger.error("Payment operation has invalid plan operation_id=%s", matched["operation_id"])
+            return {"success": False, "status": "invalid_operation"}
         t = now()
         updated = c.execute(
             """UPDATE payment_operations
@@ -1614,6 +1627,19 @@ def atajo_pago(p: AtajoPayment, request: Request):
         return {"success": False, "status": "duplicate"}
     finally:
         c.close()
+
+@app.get("/api/payments/pricing")
+def payment_pricing():
+    """Public price list sourced from the same configuration used to charge."""
+    currency = _payments.payment_currency()
+    return {
+        "currency": currency,
+        "plans": {
+            "weekly": {"amount_value": _payments.verification_amount("weekly"), "amount": amount("weekly", "es"), "days": 7},
+            "annual": {"amount_value": _payments.verification_amount("annual"), "amount": amount("annual", "es"), "days": 365},
+        },
+    }
+
 
 @app.post("/api/payments/pending")
 def pending(p: Pending, request: Request):
@@ -1701,6 +1727,9 @@ def proof(p:Proof, request:Request):
     uid=current_user(request)
     c=db()
     try:
+        # Lock before reading the state: cancellation/review must not race with
+        # proof submission and resurrect a closed operation.
+        c.execute("BEGIN IMMEDIATE")
         row=c.execute("SELECT * FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,uid)).fetchone()
         if not row: raise HTTPException(404,"Operación no encontrada")
         if row["status"] not in {"pending","proof_submitted"}: raise HTTPException(409,"La operación ya no admite comprobantes")
@@ -1715,24 +1744,25 @@ def proof(p:Proof, request:Request):
         t=now()
         archive_chat=(os.getenv("PAYMENT_ARCHIVE_CHAT_ID") or "").strip()
         if archive_chat:
-            # Keep the original proof in payment_operations until the durable queue
-            # confirms Telegram delivery and records its message_id.
+            # Keep the original proof until Telegram confirms durable delivery.
             c.execute("""INSERT INTO payment_proof_archive_queue(operation_id,chat_id,proof_text,proof_image,status,attempts,next_attempt_at,created_at,updated_at)
                        VALUES(?,?,?,?,'pending',0,?,?,?)
                        ON CONFLICT(operation_id) DO UPDATE SET chat_id=excluded.chat_id,proof_text=excluded.proof_text,
                        proof_image=excluded.proof_image,status='pending',next_attempt_at=excluded.next_attempt_at,
                        last_error=NULL,processing_started_at=NULL,attempts=0,archive_message_id=NULL,updated_at=excluded.updated_at""",
                       (p.operation_id,archive_chat,p.proof_text,image,t,t,t))
-            c.execute("""UPDATE payment_operations SET status='proof_submitted',proof_text=?,proof_image=?,
+            cur=c.execute("""UPDATE payment_operations SET status='proof_submitted',proof_text=?,proof_image=?,
                        archive_status='queued',archive_chat_id=NULL,archive_message_id=NULL,archive_last_error=NULL,archive_next_attempt_at=?,updated_at=?
-                       WHERE operation_id=? AND user_id=?""",
+                       WHERE operation_id=? AND user_id=? AND status IN ('pending','proof_submitted')""",
                       (p.proof_text,image,t,t,p.operation_id,uid))
             archive_status='queued'
         else:
-            c.execute("""UPDATE payment_operations SET status='proof_submitted',proof_text=?,proof_image=?,
+            cur=c.execute("""UPDATE payment_operations SET status='proof_submitted',proof_text=?,proof_image=?,
                        archive_status='not_configured',archive_chat_id=NULL,archive_message_id=NULL,updated_at=?
-                       WHERE operation_id=? AND user_id=?""",(p.proof_text,image,t,p.operation_id,uid))
+                       WHERE operation_id=? AND user_id=? AND status IN ('pending','proof_submitted')""",(p.proof_text,image,t,p.operation_id,uid))
             archive_status='not_configured'
+        if cur.rowcount != 1:
+            raise HTTPException(409,"La operación ya no admite comprobantes")
         c.commit()
     except Exception:
         c.rollback()
@@ -1746,17 +1776,35 @@ def proof(p:Proof, request:Request):
 def cancel(p:PaymentId, request:Request):
     uid=current_user(request)
     if not uid: raise HTTPException(400,"user_id requerido")
-    c=db(); row=c.execute("SELECT * FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,uid)).fetchone()
-    if not row: c.close(); raise HTTPException(404,"Operación no encontrada")
-    if row["status"] in {"verified","cancelled"}: raise HTTPException(409,"La operación ya está cerrada")
-    t=now(); cur=c.execute("UPDATE payment_operations SET status='cancelled',cancelled_at=?,updated_at=? WHERE operation_id=? AND user_id=? AND status IN ('pending','proof_submitted')",(t,t,p.operation_id,uid)); c.commit(); c.close()
-    if cur.rowcount != 1: raise HTTPException(409,"La operación ya está cerrada")
+    c=db()
+    try:
+        row=c.execute("SELECT status FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,uid)).fetchone()
+        if not row: raise HTTPException(404,"Operación no encontrada")
+        if row["status"] not in {"pending","proof_submitted"}:
+            raise HTTPException(409,"La operación ya está cerrada o siendo procesada")
+        t=now()
+        # Conditional update is the final authority if state changes after SELECT.
+        cur=c.execute("UPDATE payment_operations SET status='cancelled',cancelled_at=?,updated_at=? WHERE operation_id=? AND user_id=? AND status IN ('pending','proof_submitted')",(t,t,p.operation_id,uid))
+        if cur.rowcount != 1: raise HTTPException(409,"La operación ya está cerrada")
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
     return {"success":True,"status":"cancelled"}
 
 @app.post("/api/payments/status")
 def status(p:PaymentId, request:Request):
     uid=current_user(request)
-    c=db(); row=c.execute("SELECT operation_id,user_id,plan,language,status,amount,created_at,updated_at,verified_at,cancelled_at FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,uid)).fetchone(); c.close()
+    c=db()
+    try:
+        row=c.execute("""SELECT po.operation_id,po.user_id,po.plan,po.language,po.status,po.amount,
+                       po.created_at,po.updated_at,po.verified_at,po.cancelled_at,u.premium_until
+                       FROM payment_operations po LEFT JOIN users u ON u.user_id=po.user_id
+                       WHERE po.operation_id=? AND po.user_id=?""",(p.operation_id,uid)).fetchone()
+    finally:
+        c.close()
     if not row: raise HTTPException(404,"Operación no encontrada")
     return dict(row)
 
@@ -1903,6 +1951,9 @@ def verify_payment(p:PaymentId, request:Request):
         if row["status"] not in {"pending","proof_submitted"}:
             c.rollback()
             raise HTTPException(409,"Operación no verificable o ya procesada")
+        if row["plan"] not in {"weekly", "annual"}:
+            c.rollback()
+            raise HTTPException(409,"El plan de esta operación no es válido")
         # Reserve the operation atomically so a concurrent request cannot grant Premium twice.
         t=now()
         cur=c.execute("UPDATE payment_operations SET status='processing',updated_at=? WHERE operation_id=? AND status IN ('pending','proof_submitted')",(t,p.operation_id))
@@ -1958,6 +2009,23 @@ def reject_payment(p: PaymentReview, request:Request):
         c.close()
     audit(ident["username"],"payment_rejected",p.operation_id,{"reason":p.reason,"user_id":row["user_id"]})
     return {"success":True,"status":"rejected"}
+
+@app.get("/api/admin/payments/{operation_id}/proof")
+def admin_payment_proof(operation_id: str, request: Request):
+    admin(request,"payments")
+    c=db()
+    try:
+        row=c.execute("""SELECT operation_id,proof_text,proof_image,archive_status,archive_chat_id,
+                       archive_message_id,archived_at FROM payment_operations WHERE operation_id=?""",
+                      (operation_id,)).fetchone()
+    finally:
+        c.close()
+    if not row:
+        raise HTTPException(404,"Operación no encontrada")
+    if not (row["proof_text"] or row["proof_image"] or row["archive_message_id"]):
+        raise HTTPException(404,"No hay comprobante local; revisa el estado del archivo de Telegram")
+    return dict(row)
+
 
 @app.get("/api/admin/stats")
 def admin_stats(request:Request):
