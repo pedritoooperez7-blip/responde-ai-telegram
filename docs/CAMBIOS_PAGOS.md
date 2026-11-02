@@ -54,3 +54,7 @@ Esta copia conserva la estructura del proyecto y actualiza el backend y la inter
 - Sintaxis Python de los módulos modificados: correcta (`py_compile`).
 - Suite offline: 199 pruebas descubiertas, 4 fallos y 4 omitidas. Los cuatro fallos están en las pruebas del atajo de pagos y devuelven `unmatched` en lugar de los resultados esperados; no afectan directamente al archivo de comprobantes, pero impiden declarar la suite completa como aprobada.
 - No se realizaron llamadas reales a Telegram, Railway, proveedores de IA ni pagos. Antes de producción hay que ejecutar CI y una prueba controlada en una rama/PR.
+
+## Corrección y validación posterior (2026-11-02)
+
+La entrega ZIP posterior detectó que `expected_values()` usaba `.get()` sobre `sqlite3.Row`, provocando que el matcher leyera importe `0` y devolviera `unmatched`. Se corrigió el acceso compatible con filas SQLite y diccionarios. La suite actual, incluyendo pruebas añadidas para pago manual y precios, pasa con **201 aprobadas, 4 omitidas y 0 fallidas**. Ver `docs/ESTADO_PAGOS_PRODUCCION.md` para el estado completo y las validaciones reales pendientes.

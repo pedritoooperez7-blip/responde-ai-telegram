@@ -87,9 +87,19 @@ def expected_values(operation: Mapping[str, Any], currency: str | None = None) -
     the display string, so the numeric part and its suffix are parsed without
     converting anything.
     """
-    configured = (currency or payment_currency()).upper()
-    raw_value = operation.get("amount_value") if hasattr(operation, "get") else None
-    raw_currency = (operation.get("amount_currency") if hasattr(operation, "get") else "") or ""
+    configured = (currency or payment_currency()).strip().upper()
+
+    # sqlite3.Row implements keyed access but does not expose Mapping.get().
+    # Payment matching receives both sqlite rows and plain dictionaries.
+    def field(name: str, default: Any = None) -> Any:
+        try:
+            return operation[name]
+        except (KeyError, IndexError, TypeError):
+            getter = getattr(operation, "get", None)
+            return getter(name, default) if callable(getter) else default
+
+    raw_value = field("amount_value")
+    raw_currency = field("amount_currency", "") or ""
     raw_currency = str(raw_currency).strip().upper()
     if raw_value is not None:
         try:
@@ -97,7 +107,7 @@ def expected_values(operation: Mapping[str, Any], currency: str | None = None) -
             return value, raw_currency or configured
         except (TypeError, ValueError):
             pass
-    display = str((operation.get("amount") if hasattr(operation, "get") else "") or "")
+    display = str(field("amount", "") or "")
     digits = "".join(ch for ch in display if ch.isdigit() or ch == ".")
     try:
         value = round(float(digits), 2)

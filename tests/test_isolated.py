@@ -245,6 +245,10 @@ class TestHardening(unittest.TestCase):
         self.assertEqual(payment["status"], "verified")
         self.assertEqual(payment["transaction_id"], "TX-UNIQUE-001")
         self.assertTrue(premium_until)
+        status = client.post("/api/payments/status", headers=headers, json={"operation_id": operation_id, "user_id": uid})
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(status.json()["status"], "verified")
+        self.assertTrue(status.json()["premium_until"])
 
 
     def test_bpa_shortcut_uses_configured_bpa_destination(self):
@@ -1129,6 +1133,21 @@ class TestPaymentProofValidation(unittest.TestCase):
         response = client.post("/api/payments/proof", headers=headers, json={"operation_id": oid, "user_id": "x", "proof_text": "Solo texto"})
         self.assertEqual(response.status_code, 200, response.text)
 
+    def test_admin_can_view_submitted_proof_only_with_payment_permission(self):
+        headers, oid = self._pending_operation("proof-admin-view")
+        submitted = client.post("/api/payments/proof", headers=headers, json={
+            "operation_id": oid, "proof_text": "Transferencia de prueba", "proof_image": valid_image_data_url()
+        })
+        self.assertEqual(submitted.status_code, 200, submitted.text)
+        self.assertEqual(client.get(f"/api/admin/payments/{oid}/proof").status_code, 401)
+        login = client.post("/api/admin/login", json={"master_key": main.ADMIN_KEY})
+        self.assertEqual(login.status_code, 200, login.text)
+        admin_headers = {"Authorization": "Bearer " + login.json()["token"]}
+        viewed = client.get(f"/api/admin/payments/{oid}/proof", headers=admin_headers)
+        self.assertEqual(viewed.status_code, 200, viewed.text)
+        self.assertEqual(viewed.json()["proof_text"], "Transferencia de prueba")
+        self.assertTrue(viewed.json()["proof_image"].startswith("data:image/jpeg;base64,"))
+
     def test_non_image_data_is_rejected_and_status_unchanged(self):
         headers, oid = self._pending_operation("proof-invalid")
         invalid_values = [
@@ -1158,6 +1177,59 @@ class TestPaymentProofValidation(unittest.TestCase):
         self.assertEqual(client.post("/api/payments/cancel", headers=headers, json={"operation_id": oid, "user_id": "x"}).status_code, 200)
         response = client.post("/api/payments/proof", headers=headers, json={"operation_id": oid, "proof_image": valid_image_data_url()})
         self.assertEqual(response.status_code, 409, response.text)
+
+
+class TestManualPaymentReview(unittest.TestCase):
+    def _admin_headers(self):
+        login = client.post("/api/admin/login", json={"master_key": main.ADMIN_KEY})
+        self.assertEqual(login.status_code, 200, login.text)
+        return {"Authorization": "Bearer " + login.json()["token"]}
+
+    def _pending(self, uid, plan="weekly"):
+        headers = auth(uid)
+        response = client.post("/api/payments/pending", headers=headers, json={
+            "user_id": uid, "plan": plan, "language": "es", "payment_method": "BANDEC"
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        return headers, response.json()["operation_id"]
+
+    def test_manual_approval_grants_premium_once_and_returns_expiry(self):
+        uid = "manual-verify-" + uuid.uuid4().hex[:8]
+        user_headers, oid = self._pending(uid, "weekly")
+        proof = client.post("/api/payments/proof", headers=user_headers, json={
+            "operation_id": oid, "proof_text": "Pago manual de prueba"
+        })
+        self.assertEqual(proof.status_code, 200, proof.text)
+        admin_headers = self._admin_headers()
+        verified = client.post("/api/admin/payments/verify", headers=admin_headers, json={
+            "operation_id": oid, "user_id": uid
+        })
+        self.assertEqual(verified.status_code, 200, verified.text)
+        self.assertEqual(verified.json()["status"], "verified")
+        self.assertTrue(main.premium(uid))
+        first_expiry = verified.json()["premium_until"]
+        duplicate = client.post("/api/admin/payments/verify", headers=admin_headers, json={
+            "operation_id": oid, "user_id": uid
+        })
+        self.assertEqual(duplicate.status_code, 409, duplicate.text)
+        self.assertEqual(main.user(uid)["premium_until"], first_expiry)
+        status = client.post("/api/payments/status", headers=user_headers, json={"operation_id": oid, "user_id": uid})
+        self.assertEqual(status.json()["premium_until"], first_expiry)
+
+    def test_manual_rejection_does_not_grant_premium_and_is_terminal(self):
+        uid = "manual-reject-" + uuid.uuid4().hex[:8]
+        _, oid = self._pending(uid)
+        admin_headers = self._admin_headers()
+        rejected = client.post("/api/admin/payments/reject", headers=admin_headers, json={
+            "operation_id": oid, "action": "reject", "reason": "Comprobante no válido"
+        })
+        self.assertEqual(rejected.status_code, 200, rejected.text)
+        self.assertEqual(rejected.json()["status"], "rejected")
+        self.assertFalse(main.premium(uid))
+        duplicate = client.post("/api/admin/payments/reject", headers=admin_headers, json={
+            "operation_id": oid, "action": "reject", "reason": "repetido"
+        })
+        self.assertEqual(duplicate.status_code, 409, duplicate.text)
 
 
 class TestPaymentCancellation(unittest.TestCase):
@@ -1403,6 +1475,21 @@ class TestPaymentCurrencySeparation(unittest.TestCase):
         self.assertEqual(data["amount_currency"], "CUP")
         self.assertEqual(data["amount_value"], 2500.0)
         self.assertEqual(data["amount"], "2500 CUP")
+
+    def test_public_pricing_matches_payment_operation_amounts(self):
+        pricing = client.get("/api/payments/pricing")
+        self.assertEqual(pricing.status_code, 200, pricing.text)
+        self.assertEqual(pricing.json()["currency"], main._payments.payment_currency())
+        _, weekly = self._pending("pricing-weekly-" + uuid.uuid4().hex[:6])
+        _, annual = self._pending("pricing-annual-" + uuid.uuid4().hex[:6])
+        self.assertEqual(pricing.json()["plans"]["weekly"]["amount"], weekly["amount"])
+        # Create an annual operation to ensure both displayed and charged values share config.
+        headers = auth("pricing-annual-check-" + uuid.uuid4().hex[:6])
+        response = client.post("/api/payments/pending", headers=headers, json={
+            "user_id": "ignored", "plan": "annual", "language": "en", "payment_method": "BANDEC"
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(pricing.json()["plans"]["annual"]["amount"], response.json()["amount"])
 
     def test_legacy_usd_operation_never_matches_a_cup_transfer(self):
         uid = "currency-legacy-" + uuid.uuid4().hex[:6]
