@@ -151,6 +151,36 @@ def send_photo(chat_id: int | str, photo: bytes, filename: str = "comprobante.jp
     return result if isinstance(result, dict) else {}
 
 
+def send_document(chat_id: int | str, document: bytes, filename: str = "backup.bin", caption: str = "") -> Dict[str, Any]:
+    """Send a file to Telegram (multipart). Used for database backups; nothing is stored locally."""
+    boundary = "----LiggaCubaBoundary" + hashlib.sha256(os.urandom(16)).hexdigest()[:24]
+    fields = {"chat_id": str(chat_id), "caption": (caption or "")[:900], "parse_mode": "HTML"}
+    chunks = []
+    for name, value in fields.items():
+        chunks.append((f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").encode("utf-8"))
+    safe_name = os.path.basename(filename or "backup.bin").replace('"', "")[:100]
+    chunks.append((f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{safe_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").encode("utf-8"))
+    chunks.append(document)
+    chunks.append(f"\r\n--{boundary}--\r\n".encode("ascii"))
+    url = f"{TELEGRAM_API_BASE}/bot{bot_token()}/sendDocument"
+    request = urllib.request.Request(url, data=b"".join(chunks), headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=90.0) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8", errors="replace")).get("description", "")
+        except Exception:
+            detail = ""
+        raise TelegramBotError(f"Telegram sendDocument falló (HTTP {exc.code}): {str(detail)[:180]}") from None
+    except (TimeoutError, OSError, ValueError):
+        raise TelegramBotError("No se pudo confirmar el envío del archivo a Telegram") from None
+    if not isinstance(body, dict) or body.get("ok") is not True:
+        raise TelegramBotError(str(body.get("description", "Telegram rechazó el archivo"))[:220] if isinstance(body, dict) else "Respuesta inválida de Telegram")
+    result = body.get("result")
+    return result if isinstance(result, dict) else {}
+
+
 def set_webhook(url: str, secret_token: str, allowed_updates: Optional[list[str]] = None) -> Dict[str, Any]:
     """Register the production webhook (idempotent; safe to re-run)."""
     payload: Dict[str, Any] = {

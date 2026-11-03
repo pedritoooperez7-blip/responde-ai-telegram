@@ -52,3 +52,25 @@ Notas:
   está activo: el script evita ese problema.
 * La restauración requiere intervención manual; no hay automatización ni borrado
   de la base actual por parte del código.
+
+## Backup automático a Telegram
+
+El servicio envía una copia consistente de SQLite (API de backup de SQLite, comprimida con gzip) a un chat privado
+cada `BACKUP_INTERVAL_HOURS` horas (6 por defecto; el primer envío ocurre ~10 min después de arrancar).
+
+| Variable | Efecto |
+|---|---|
+| `BACKUP_CHAT_ID` | Chat destino. Si falta, usa `PAYMENT_ARCHIVE_CHAT_ID`. El bot debe poder publicar allí. |
+| `BACKUP_ENCRYPTION_KEY` | Cifra el archivo con Fernet (recomendado: contiene datos personales). **Guárdala aparte: sin ella no se puede restaurar.** |
+| `BACKUP_INTERVAL_HOURS` | Frecuencia en horas (mínimo 0.25). |
+| `DISABLE_TELEGRAM_BACKUP` | `1` lo desactiva. |
+
+Restaurar (con la app detenida):
+
+```bash
+BACKUP_ENCRYPTION_KEY=... python scripts/restore_telegram_backup.py liggacuba-XXXX.db.gz.enc /base/liggacuba.db
+```
+
+El script nunca sobrescribe un archivo existente y verifica `PRAGMA integrity_check`.
+Límites: Telegram permite subir hasta 50 MB por archivo (si la base lo supera, se registra un error y no se envía);
+las fotos de Citas viven en disco (`DATING_PHOTOS_DIR`, por defecto junto a la base) y **no** van en este backup.

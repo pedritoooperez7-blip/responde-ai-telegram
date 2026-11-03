@@ -54,6 +54,7 @@ Ninguna tiene valor por defecto inseguro; todo se configura en Railway (o el hos
 | `OCR_RATE_LIMIT_PER_MINUTE` / `OCR_DAILY_LIMIT` / `OCR_MAX_CONCURRENT` | Opcional | Límites de OCR (defecto 10/min, 50/día, 2 simultáneos por proceso). |
 | `ANALYZE_RATE_LIMIT_PER_MINUTE` / `GENERATION_RATE_LIMIT_PER_HOUR` | Opcional | Límites de análisis (20/min) y generación (40/h) por usuario. |
 | `ADMIN_LOGIN_MAX_ATTEMPTS` / `ADMIN_LOGIN_WINDOW_SECONDS` | Opcional | Protección del login admin (defecto 10 intentos / 900 s). |
+| `BACKUP_CHAT_ID` / `BACKUP_ENCRYPTION_KEY` / `BACKUP_INTERVAL_HOURS` | Opcional (recomendado) | Backup automático de SQLite a un chat privado de Telegram, cifrado y cada 6 h por defecto. Ver `docs/BACKUP_RESTORE.md`. |
 | `DISABLE_BACKGROUND_PURGE` | Opcional | `1` desactiva la purga periódica (para investigar incidentes). |
 
 Detalle operativo, límites y decisiones pendientes: [`docs/OPERACIONES_V1.md`](docs/OPERACIONES_V1.md). Copias de seguridad: [`docs/BACKUP_RESTORE.md`](docs/BACKUP_RESTORE.md).
