@@ -10,6 +10,9 @@
 
   const TEXT = {
     es: {
+      form_create_sub: 'Cuéntanos un poco de ti. Tarda menos de un minuto.', form_edit_sub: 'Actualiza la información que ven los demás.',
+      sec_basic: 'Lo básico', sec_identity: 'Identidad y preferencias', sec_location: 'Dónde vives', sec_about: 'Sobre ti', sec_age: 'Edad de las personas que buscas', sec_contact: 'Contacto', sec_legal: 'Confirmaciones',
+      chars_left: '{n} caracteres restantes', interests_ph: 'música, viajes, cine…', bio_ph: 'Cuenta algo sobre ti…', name_ph: 'Tu nombre', municipality_ph: 'Ej. Plaza de la Revolución', age_to: 'a', age_summary: 'De {a} a {b} años',
       title: 'Citas', tab_discover: 'Descubrir', tab_matches: 'Matches', tab_mine: 'Mi perfil',
       intro_title: 'Conoce gente nueva', intro_text: 'Dale like a quien te guste. Si hay match, hablan por Telegram o WhatsApp: en LiggaCuba no hay chat interno.',
       intro_1: 'Solo mayores de 18 años', intro_2: 'Tu contacto lo ven únicamente tus matches', intro_3: 'Todas las fotos se revisan antes de publicarse',
@@ -37,6 +40,9 @@
       safety: 'Consejo: antes de ver a alguien en persona, reúnanse en un lugar público y avisa a una persona de confianza.',
     },
     en: {
+      form_create_sub: 'Tell us a little about you. It takes under a minute.', form_edit_sub: 'Update the information others can see.',
+      sec_basic: 'The basics', sec_identity: 'Identity and preferences', sec_location: 'Where you live', sec_about: 'About you', sec_age: 'Age of the people you look for', sec_contact: 'Contact', sec_legal: 'Confirmations',
+      chars_left: '{n} characters left', interests_ph: 'music, travel, movies…', bio_ph: 'Tell something about yourself…', name_ph: 'Your name', municipality_ph: 'e.g. Downtown', age_to: 'to', age_summary: 'From {a} to {b} years old',
       title: 'Dating', tab_discover: 'Discover', tab_matches: 'Matches', tab_mine: 'My profile',
       intro_title: 'Meet new people', intro_text: 'Like the people you want to meet. On a match you talk on Telegram or WhatsApp: LiggaCuba has no in-app chat.',
       intro_1: 'Adults 18+ only', intro_2: 'Only your matches can see your contact', intro_3: 'Every photo is reviewed before it goes live',
@@ -165,33 +171,94 @@
       options.map(o => el('option', { value: o, text: labelFn ? labelFn(o) : o, selected: o === current })));
   }
 
+  // Selector de opción única con botones (sustituye al <select>); el valor vive en un input oculto.
+  function chipGroup(name, options, current, labelFn) {
+    const input = el('input', { type: 'hidden', name, value: current || '' });
+    const wrap = el('div', { class: 'df-chips', role: 'radiogroup' });
+    const paint = () => wrap.querySelectorAll('button').forEach(b => {
+      const on = b.dataset.v === input.value;
+      b.classList.toggle('on', on); b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    options.forEach(o => wrap.append(el('button', {
+      class: 'df-chip', type: 'button', 'data-v': o, text: labelFn ? labelFn(o) : o,
+      onclick: () => { input.value = o; paint(); },
+    })));
+    paint();
+    return { node: el('div', {}, wrap, input), input };
+  }
+  function section(icon, title, ...kids) {
+    return el('div', { class: 'df-section' },
+      el('div', { class: 'df-sec-head' }, el('span', { class: 'df-sec-icon' }, el('i', { class: 'fa-solid ' + icon })), el('h3', { text: title })),
+      ...kids);
+  }
+  function dfield(label, control, help) {
+    return el('label', { class: 'df-field' }, el('span', { class: 'df-label', text: label }), control, help ? el('small', { text: help }) : null);
+  }
+
   function renderForm() {
     const p = D.me?.profile || {};
     const creating = !D.me?.profile;
     const username = p.telegram_username || tg?.initDataUnsafe?.user?.username || '';
     const f = {};
-    const form = el('form', { class: 'd-form', novalidate: true },
-      field(T('name'), f.display_name = el('input', { name: 'display_name', maxlength: 40, value: p.display_name || tg?.initDataUnsafe?.user?.first_name || '' })),
-      field(T('birth'), f.birth_date = el('input', { name: 'birth_date', type: 'date', value: p.birth_date || '', max: new Date().toISOString().slice(0, 10) })),
-      field(T('gender'), f.gender = select('gender', D.cfg.genders, p.gender, T)),
-      field(T('looking'), f.looking_for = select('looking_for', D.cfg.looking_for, p.looking_for, T)),
-      field(T('province'), f.province = select('province', D.cfg.provinces, p.province)),
-      field(T('municipality'), f.municipality = el('input', { name: 'municipality', maxlength: 60, value: p.municipality || '' })),
-      field(T('bio'), f.bio = el('textarea', { name: 'bio', maxlength: D.cfg.max_bio, rows: 4, value: p.bio || '' }), T('bio_help')),
-      field(T('interests'), f.interests = el('input', { name: 'interests', value: (p.interests || []).join(', ') })),
-      el('div', { class: 'd-field' }, el('span', { text: T('age_range') }),
-        el('div', { class: 'd-row' },
-          f.min_age = el('input', { type: 'number', inputmode: 'numeric', min: 18, max: 99, value: p.min_age || 18, 'aria-label': 'min' }),
-          el('span', { text: '–' }),
-          f.max_age = el('input', { type: 'number', inputmode: 'numeric', min: 18, max: 99, value: p.max_age || 60, 'aria-label': 'max' }))),
-      el('div', { class: 'd-card soft' }, el('strong', { text: T('contact_title') }),
+
+    const gender = chipGroup('gender', D.cfg.genders, p.gender, T);
+    const looking = chipGroup('looking_for', D.cfg.looking_for, p.looking_for, T);
+    f.gender = gender.input; f.looking_for = looking.input;
+
+    // Contador de caracteres de la biografía
+    const maxBio = D.cfg.max_bio;
+    const counter = el('small', { class: 'df-counter' });
+    f.bio = el('textarea', { name: 'bio', maxlength: maxBio, rows: 4, placeholder: T('bio_ph'), value: p.bio || '' });
+    const paintBio = () => { counter.textContent = T('chars_left', { n: Math.max(0, maxBio - f.bio.value.length) }); };
+    f.bio.oninput = paintBio; paintBio();
+
+    // Vista previa de intereses como etiquetas (textContent: nunca innerHTML)
+    const chipsBox = el('div', { class: 'chips' });
+    f.interests = el('input', { name: 'interests', placeholder: T('interests_ph'), value: (p.interests || []).join(', ') });
+    const paintInterests = () => chipsBox.replaceChildren(...f.interests.value.split(',').map(x => x.trim()).filter(Boolean).slice(0, 12).map(x => el('span', { class: 'chip', text: x })));
+    f.interests.oninput = paintInterests; paintInterests();
+
+    // Rango de edad con resumen
+    f.min_age = el('input', { type: 'number', inputmode: 'numeric', min: 18, max: 99, value: p.min_age || 18, 'aria-label': 'min' });
+    f.max_age = el('input', { type: 'number', inputmode: 'numeric', min: 18, max: 99, value: p.max_age || 60, 'aria-label': 'max' });
+    const ageSummary = el('small', { class: 'df-counter' });
+    const paintAge = () => { ageSummary.textContent = T('age_summary', { a: f.min_age.value || 18, b: f.max_age.value || 99 }); };
+    f.min_age.oninput = paintAge; f.max_age.oninput = paintAge; paintAge();
+
+    f.display_name = el('input', { name: 'display_name', maxlength: 40, placeholder: T('name_ph'), autocomplete: 'given-name', value: p.display_name || tg?.initDataUnsafe?.user?.first_name || '' });
+    f.birth_date = el('input', { name: 'birth_date', type: 'date', value: p.birth_date || '', max: new Date().toISOString().slice(0, 10) });
+    f.province = select('province', D.cfg.provinces, p.province);
+    f.municipality = el('input', { name: 'municipality', maxlength: 60, placeholder: T('municipality_ph'), value: p.municipality || '' });
+
+    const form = el('form', { class: 'd-form df-form', novalidate: true },
+      el('div', { class: 'df-hero' },
+        el('span', { class: 'df-hero-icon' }, el('i', { class: 'fa-solid fa-heart' })),
+        el('div', {}, el('h2', { text: creating ? T('create_profile') : T('edit_profile') }),
+          el('p', { text: creating ? T('form_create_sub') : T('form_edit_sub') }))),
+      section('fa-user', T('sec_basic'),
+        dfield(T('name'), f.display_name),
+        dfield(T('birth'), f.birth_date)),
+      section('fa-venus-mars', T('sec_identity'),
+        el('div', { class: 'df-field' }, el('span', { class: 'df-label', text: T('gender') }), gender.node),
+        el('div', { class: 'df-field' }, el('span', { class: 'df-label', text: T('looking') }), looking.node)),
+      section('fa-location-dot', T('sec_location'),
+        dfield(T('province'), f.province),
+        dfield(T('municipality'), f.municipality)),
+      section('fa-pen', T('sec_about'),
+        el('div', { class: 'df-field' }, el('span', { class: 'df-label', text: T('bio') }), f.bio, el('div', { class: 'df-meta' }, el('small', { text: T('bio_help') }), counter)),
+        el('div', { class: 'df-field' }, el('span', { class: 'df-label', text: T('interests') }), f.interests, chipsBox)),
+      section('fa-sliders', T('sec_age'),
+        el('div', { class: 'df-age' }, f.min_age, el('span', { text: T('age_to') }), f.max_age), ageSummary),
+      section('fa-paper-plane', T('sec_contact'),
+        el('p', { class: 'd-muted small', text: T('contact_title') }),
         el('label', { class: 'd-check' }, f.share_telegram = el('input', { type: 'checkbox', checked: !!p.share_telegram, disabled: !username }), el('span', { text: T('share_tg') + (username ? ' (@' + username + ')' : '') })),
         username ? null : el('small', { class: 'd-muted', text: T('tg_missing') }),
-        field(T('whatsapp'), f.whatsapp = el('input', { name: 'whatsapp', type: 'tel', inputmode: 'tel', placeholder: '+53 5xxxxxxx', value: p.whatsapp || '' }))),
-      creating ? el('label', { class: 'd-check' }, f.confirm_adult = el('input', { type: 'checkbox' }), el('span', { text: T('adult') })) : null,
-      creating ? el('label', { class: 'd-check' }, f.accept_terms = el('input', { type: 'checkbox' }),
-        el('span', {}, T('terms') + ' ', el('a', { href: '/terms.html', target: '_blank', rel: 'noopener', text: T('terms_link') }))) : null,
-      el('div', { class: 'd-row' },
+        dfield(T('whatsapp'), f.whatsapp = el('input', { name: 'whatsapp', type: 'tel', inputmode: 'tel', placeholder: '+53 5xxxxxxx', value: p.whatsapp || '' }))),
+      creating ? section('fa-shield-halved', T('sec_legal'),
+        el('label', { class: 'd-check' }, f.confirm_adult = el('input', { type: 'checkbox' }), el('span', { text: T('adult') })),
+        el('label', { class: 'd-check' }, f.accept_terms = el('input', { type: 'checkbox' }),
+          el('span', {}, T('terms') + ' ', el('a', { href: '/terms.html', target: '_blank', rel: 'noopener', text: T('terms_link') })))) : null,
+      el('div', { class: 'd-row df-actions' },
         el('button', { class: 'secondary', type: 'button', text: T('cancel'), onclick: () => { D.tab = D.me?.profile ? 'mine' : 'intro'; render(); } }),
         f.submit = el('button', { class: 'primary', type: 'submit', text: T('save') })));
     form.onsubmit = async (ev) => {
@@ -213,7 +280,8 @@
         render();
       } catch (e) { fail(e); setBusy(f.submit, false, T('save')); }
     };
-    root().replaceChildren(el('h2', { text: creating ? T('create_profile') : T('edit_profile') }), form);
+    root().replaceChildren(form);
+    window.scrollTo(0, 0);
   }
 
   // ---- mi perfil y fotos -----------------------------------------------

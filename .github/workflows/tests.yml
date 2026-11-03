@@ -1,0 +1,25 @@
+name: tests
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            requirements-test.txt
+      - name: Install Tesseract
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-spa tesseract-ocr-eng
+      - run: pip install -r requirements-test.txt
+      - name: Syntax checks
+        run: |
+          python -m py_compile backend/*.py scripts/*.py
+          node --check app.js && node --check dating.js
+      - name: Offline test suite
+        run: python -m pytest tests/ -q --ignore=tests/test_provider_integration.py

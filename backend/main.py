@@ -10,13 +10,13 @@ from typing import Any, Dict, Optional
 from urllib.parse import parse_qs
 from starlette.concurrency import run_in_threadpool
 try:
-    from . import db as _db, limits as _limits, payments as _payments, dating as _dating
+    from . import db as _db, limits as _limits, payments as _payments, dating as _dating, telegram_backup as _tgbackup
     from .ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
-    from .telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo
+    from .telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo, send_document
 except ImportError:  # Support running uvicorn with backend/ as the working directory.
-    import db as _db, limits as _limits, payments as _payments, dating as _dating
+    import db as _db, limits as _limits, payments as _payments, dating as _dating, telegram_backup as _tgbackup
     from ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
-    from telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo
+    from telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo, send_document
 logger = logging.getLogger(__name__)
 
 ai_generate_reply = _provider_generate_reply
@@ -24,13 +24,42 @@ ai_generate_reply = _provider_generate_reply
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 app = FastAPI(title="LiggaCuba API", version="2.1")
 _cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+
+
+def _default_cors_origins() -> list:
+    """Without CORS_ORIGINS, fall back to this deployment's own origin (never a wildcard when it is known)."""
+    from urllib.parse import urlsplit
+    found = []
+    for name in ("PUBLIC_BASE_URL", "TELEGRAM_MINI_APP_URL"):
+        parts = urlsplit((os.getenv(name) or "").strip())
+        if parts.scheme == "https" and parts.netloc:
+            origin = f"{parts.scheme}://{parts.netloc}"
+            if origin not in found:
+                found.append(origin)
+    return found
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins or ["*"],
+    allow_origins=_cors_origins or _default_cors_origins() or ["*"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Authorization", "Content-Type", "X-Admin-Key", "X-Atajo-Key"],
 )
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    headers = response.headers
+    headers.setdefault("X-Content-Type-Options", "nosniff")
+    headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    if request.url.path.startswith("/api/"):
+        headers.setdefault("Cache-Control", "no-store")
+    else:
+        headers.setdefault("Content-Security-Policy",
+                           "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org https://telegram.org")
+    return response
+
 
 FREE_DAILY_LIMIT = 3
 FREE_CHAT_MODES = {"gracioso", "coquetear", "enamorar"}
@@ -89,7 +118,10 @@ def _client_ip(request: Request) -> str:
     X-Forwarded-For can be spoofed, so it is only a throttling hint; the
     per-username limiter below does not depend on it.
     """
-    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    # The proxy (Railway) appends the real peer address at the END of the list;
+    # the first entries are client-supplied and can be forged to dodge limits.
+    parts = [x.strip() for x in (request.headers.get("x-forwarded-for") or "").split(",") if x.strip()]
+    forwarded = parts[-1] if parts else ""
     if forwarded and len(forwarded) <= 45:
         return forwarded
     return request.client.host if request.client else "unknown"
@@ -642,6 +674,10 @@ def check_operational_configuration() -> list[str]:
         warnings.append("No BANDEC/BPA destination account is configured: payment operations cannot be created.")
     if not (os.getenv("PAYMENT_ARCHIVE_CHAT_ID") or "").strip():
         warnings.append("PAYMENT_ARCHIVE_CHAT_ID is missing: proof archiving is disabled; proofs remain in SQLite.")
+    if not _tgbackup.backup_chat_id():
+        warnings.append("BACKUP_CHAT_ID/PAYMENT_ARCHIVE_CHAT_ID is missing: automatic database backups to Telegram are disabled.")
+    elif not (os.getenv("BACKUP_ENCRYPTION_KEY") or "").strip():
+        warnings.append("BACKUP_ENCRYPTION_KEY is not set: Telegram database backups will be sent unencrypted.")
     return warnings
 
 
@@ -651,6 +687,10 @@ def _log_operational_configuration():
         logger.warning("Configuration check: %s", message)
     start_background_purge()
     start_payment_archive_worker()
+    try:
+        _tgbackup.start_backup_worker(DB_PATH, send_document)
+    except Exception:
+        logger.warning("Could not start the Telegram backup worker", exc_info=True)
 
 
 PURGE_INTERVAL_SECONDS = 6 * 60 * 60
