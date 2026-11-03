@@ -10,11 +10,11 @@ from typing import Any, Dict, Optional
 from urllib.parse import parse_qs
 from starlette.concurrency import run_in_threadpool
 try:
-    from . import db as _db, limits as _limits, payments as _payments
+    from . import db as _db, limits as _limits, payments as _payments, dating as _dating
     from .ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
     from .telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo
 except ImportError:  # Support running uvicorn with backend/ as the working directory.
-    import db as _db, limits as _limits, payments as _payments
+    import db as _db, limits as _limits, payments as _payments, dating as _dating
     from ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
     from telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo
 logger = logging.getLogger(__name__)
@@ -383,6 +383,7 @@ def init_db():
             c.execute(index_sql)
         except sqlite3.IntegrityError:
             logger.error("Could not create %s because legacy payment duplicates exist; runtime duplicate checks remain enabled", index_name)
+    _dating.init_schema(c)
     c.commit(); c.close()
 init_db()
 
@@ -539,7 +540,7 @@ def admin_identity(request: Request):
         raise HTTPException(503, "ADMIN_KEY no configurado en Railway")
     key = request.headers.get("x-admin-key", "")
     if key and hmac.compare_digest(key, ADMIN_KEY):
-        return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics"]}
+        return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics", "dating"]}
     auth = request.headers.get("authorization", "")
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
     if not token or "." not in token:
@@ -564,7 +565,7 @@ def admin_identity(request: Request):
             if int(session["expires_at"] or 0) < int(time.time()):
                 raise HTTPException(401, "Sesión administrativa expirada")
             if data.get("role") == "owner" and username == "owner":
-                return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics"]}
+                return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics", "dating"]}
             row = c.execute("SELECT * FROM admin_users WHERE username=? AND is_active=1", (username,)).fetchone()
             if not row:
                 raise HTTPException(401, "Administrador desactivado")
@@ -616,6 +617,7 @@ def purge_expired_records():
         c.execute("DELETE FROM ai_generation_events WHERE created_at < ?", (event_cutoff,))
         c.execute("DELETE FROM admin_audit WHERE created_at < ?", (audit_cutoff,))
         c.execute("DELETE FROM ai_response_cache WHERE expires_at < ?", (current.isoformat(),))
+        c.execute("DELETE FROM dating_reports WHERE status != 'open' AND resolved_at < ?", ((current - timedelta(days=180)).isoformat(),))
         c.commit()
     except Exception:
         c.rollback()
@@ -835,6 +837,8 @@ def admin_telegram_access(p: Usage, request: Request):
     return {"allowed": bool(uid in allowed), "url": "/admin.html" if uid in allowed else None}
 @app.get("/app.js")
 def js(): return FileResponse(os.path.join(ROOT,"app.js"),media_type="application/javascript")
+@app.get("/dating.js")
+def dating_js(): return FileResponse(os.path.join(ROOT,"dating.js"),media_type="application/javascript")
 @app.get("/style.css")
 def css(): return FileResponse(os.path.join(ROOT,"style.css"),media_type="text/css")
 @app.get("/liggacuba-logo.jpg")
@@ -1820,7 +1824,7 @@ def admin_login(p: AdminLogin, request: Request):
         # be locked out by failed attempts from a shared or spoofed address.
         ADMIN_LOGIN_IP_LIMITER.reset(ip_key)
         username = "owner"
-        permissions = ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics"]
+        permissions = ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics", "dating"]
         ttl = OWNER_SESSION_TTL
     else:
         username_input = p.username.strip()
@@ -1919,7 +1923,7 @@ def admin_list(request:Request):
 def admin_create(p:AdminCreate, request:Request):
     ident=admin(request,"admins"); username=re.sub(r"[^a-zA-Z0-9_.-]","",p.username.strip())
     if len(username)<3 or len(p.password)<10: raise HTTPException(400,"Usuario mínimo 3 caracteres y contraseña mínimo 10")
-    allowed={"users","premium","payments","stats","audit","ai_analytics"}; perms=sorted(set(p.permissions)&allowed)
+    allowed={"users","premium","payments","stats","audit","ai_analytics","dating"}; perms=sorted(set(p.permissions)&allowed)
     if not perms: raise HTTPException(400,"Selecciona al menos un permiso")
     salt=os.urandom(16); digest=salt.hex()+":"+hashlib.pbkdf2_hmac("sha256",p.password.encode(),salt,180000).hex(); t=now(); c=db()
     try: c.execute("INSERT INTO admin_users(username,password_hash,permissions,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?)",(username,digest,json.dumps(perms),1,t,t)); c.commit()
@@ -2223,3 +2227,36 @@ def admin_ai_provider_delete(provider_id: str, request: Request):
         raise HTTPException(404, "Proveedor no encontrado")
     audit(ident["username"], "ai_provider_deleted", provider_id, {})
     return {"success": True, "provider_id": provider_id}
+
+
+# ---------------------------------------------------------------------------
+# LiggaCuba Citas (sin chat interno: los matches se contactan por Telegram/WhatsApp)
+# ---------------------------------------------------------------------------
+def _dating_photos_dir() -> str:
+    configured = (os.getenv("DATING_PHOTOS_DIR") or "").strip()
+    if configured:
+        return configured
+    if _db.is_file_database(DB_PATH):
+        return os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "dating_photos")
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), "liggacuba_dating_photos")
+
+
+def _dating_secret() -> str:
+    if not SESSION_SECRET or len(SESSION_SECRET) < 32:
+        raise HTTPException(503, "SESSION_SECRET debe configurarse con al menos 32 caracteres")
+    return SESSION_SECRET
+
+
+def _dating_notify(user_id: str, text: str) -> None:
+    try:
+        send_message(user_id, text)
+    except Exception as exc:  # el aviso es opcional: nunca debe romper el match
+        logger.warning("Dating notification not delivered: error_type=%s", type(exc).__name__)
+
+
+app.include_router(_dating.build_router(
+    current_user=current_user, connect=db, is_premium=lambda uid: premium(uid), admin=admin, audit=audit,
+    notify=_dating_notify, secret=_dating_secret, photos_dir=_dating_photos_dir,
+    free_daily_likes=_env_int("DATING_FREE_DAILY_LIKES", 20),
+))
