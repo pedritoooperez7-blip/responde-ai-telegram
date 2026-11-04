@@ -1724,6 +1724,15 @@ def pending(p: Pending, request: Request):
                 ),
             }
 
+        # Exigir un teléfono guardado antes de crear una operación nueva.
+        phone = str(registered_user.get("payment_phone") or "").strip()
+        if not phone:
+            c.rollback()
+            raise HTTPException(
+                400,
+                "Configura tu número de teléfono en Perfil antes de iniciar el pago."
+            )
+
         oid = uuid.uuid4().hex[:12].upper()
         t = now()
         a = amount(p.plan, p.language)
