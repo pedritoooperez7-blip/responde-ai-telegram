@@ -424,5 +424,101 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(dating.age_from("2000-11-03", TODAY), 25)
 
 
+class WizardPrefsTests(unittest.TestCase):
+    """Asistente de perfil: preferencias, orden del feed, fecha de nacimiento y migración."""
+
+    def setUp(self):
+        self.c = make_db()
+
+    def test_prefs_whitelist_drops_unknown_keys_and_values(self):
+        cleaned = dating.clean_prefs({
+            "intent": ["serious", "serious", "hack"], "work": "office", "kids": "invalid",
+            "unknown": "x", "dealbreakers": ["smoke", "none"], "common": "travel",
+        })
+        self.assertEqual(cleaned, {"intent": ["serious"], "work": "office", "dealbreakers": ["none"]})
+        self.assertEqual(dating.clean_prefs("no es dict"), {})
+
+    def test_prefs_saved_and_kept_when_request_omits_them(self):
+        create_user(self.c, "1", "ana_test", prefs={"work": "office", "intent": ["serious"]})
+        prefs = dating.overview(self.c, "1", SECRET)["profile"]["prefs"]
+        self.assertEqual(prefs, {"intent": ["serious"], "work": "office"})
+        again = dating.clean_profile(base_profile(bio="Nueva bio"), "ana_test", existing=True, today=TODAY)
+        self.assertIsNone(again["prefs"])
+        dating.upsert_profile(self.c, "1", again)
+        self.assertEqual(dating.overview(self.c, "1", SECRET)["profile"]["prefs"], prefs)
+
+    def test_feed_prefers_same_province_then_affinity(self):
+        create_user(self.c, "1", "ana_test", gender="mujer", looking_for="hombres", province="La Habana",
+                    prefs={"intent": ["serious"], "kids": "want", "common": ["travel", "sport"]})
+        far_fit = create_user(self.c, "2", "far_fit_u", gender="hombre", looking_for="mujeres", province="Holguín",
+                              prefs={"intent": ["serious"], "kids": "want", "common": ["travel"]})
+        near_low = create_user(self.c, "3", "near_low", gender="hombre", looking_for="mujeres", province="La Habana",
+                               prefs={"intent": ["casual"]})
+        near_fit = create_user(self.c, "4", "near_fit", gender="hombre", looking_for="mujeres", province="La Habana",
+                               prefs={"intent": ["serious"], "kids": "want", "common": ["travel", "sport"]})
+        feed = dating.candidate_feed(self.c, "1", SECRET, today=TODAY)
+        self.assertEqual([p["public_id"] for p in feed], [near_fit, near_low, far_fit])
+        self.assertEqual(feed[0]["in_common"], 4)  # intención + hijos + 2 intereses comunes
+        self.assertNotIn("prefs", feed[0])  # las respuestas privadas no viajan a otras personas
+
+    def test_birth_date_is_locked_after_creation(self):
+        create_user(self.c, "1", "ana_test")
+        with self.assertRaises(dating.DatingError) as ctx:
+            dating.clean_profile(base_profile(birth_date="1990-01-01"), "ana_test", existing=True,
+                                 today=TODAY, locked_birth_date="2000-05-10")
+        self.assertEqual(ctx.exception.code, "birth_locked")
+        ok = dating.clean_profile(base_profile(birth_date=""), "ana_test", existing=True, today=TODAY,
+                                  locked_birth_date="2000-05-10")
+        self.assertEqual(ok["birth_date"], "2000-05-10")
+
+    def test_daily_likes_reset_at_cuban_midnight_not_utc(self):
+        from datetime import timezone as tz
+        create_user(self.c, "1", "ana_test", gender="mujer", looking_for="hombres")
+        # 23:30 hora de Cuba del 1/nov (04:30 UTC del 2/nov): cuenta como el día 1 de Cuba
+        late = dating._cuba_day_start_utc(date(2026, 11, 2))
+        self.assertTrue(late.startswith("2026-11-02T05:00") or late.startswith("2026-11-02T04:00"))
+        self.c.execute("INSERT INTO dating_swipes VALUES('1','x','like',?)", ("2026-11-02T04:30:00",))
+        self.assertEqual(dating.likes_today(self.c, "1", date(2026, 11, 2)), 0)   # aún era el 1 en Cuba
+        self.assertEqual(dating.likes_today(self.c, "1", date(2026, 11, 1)), 1)
+        self.c.execute("INSERT INTO dating_swipes VALUES('1','y','like',?)", ("2026-11-02T06:00:00",))
+        self.assertEqual(dating.likes_today(self.c, "1", date(2026, 11, 2)), 1)
+
+    def test_rejected_photos_do_not_use_slots_and_positions_do_not_repeat(self):
+        create_user(self.c, "1", "ana_test")
+        self.c.execute("DELETE FROM dating_photos")
+        with tempfile.TemporaryDirectory() as folder:
+            ids = [dating.add_photo(self.c, "1", folder, b"jpg")["id"] for _ in range(dating.MAX_PHOTOS)]
+            with self.assertRaises(dating.DatingError):
+                dating.add_photo(self.c, "1", folder, b"jpg")
+            dating.admin_review_photo(self.c, ids[0], False, "mala", "admin", folder)
+            dating.delete_photo(self.c, "1", folder, ids[2])
+            dating.add_photo(self.c, "1", folder, b"jpg")
+            positions = [r[0] for r in self.c.execute("SELECT position FROM dating_photos WHERE status!='rejected'")]
+            self.assertEqual(len(positions), len(set(positions)))
+
+    def test_minor_report_is_rate_limited_per_reporter(self):
+        for i in range(5):
+            create_user(self.c, str(10 + i), f"target_{i:02d}")
+        create_user(self.c, "1", "report_er")
+        publics = [dating.get_profile(self.c, str(10 + i))["public_id"] for i in range(5)]
+        for target in publics[:dating.MAX_MINOR_REPORTS_PER_DAY]:
+            dating.report_user(self.c, "1", target, "minor")
+        with self.assertRaises(dating.DatingError) as ctx:
+            dating.report_user(self.c, "1", publics[3], "minor")
+        self.assertEqual(ctx.exception.code, "report_limit")
+        dating.report_user(self.c, "1", publics[3], "scam")  # otros motivos no se limitan igual
+
+    def test_schema_migration_adds_prefs_column_to_old_database(self):
+        c = sqlite3.connect(":memory:")
+        c.row_factory = sqlite3.Row
+        c.execute("CREATE TABLE dating_profiles(user_id TEXT PRIMARY KEY, public_id TEXT, display_name TEXT, birth_date TEXT, "
+                  "gender TEXT, looking_for TEXT, province TEXT, municipality TEXT, bio TEXT, interests TEXT, min_age INTEGER, "
+                  "max_age INTEGER, whatsapp TEXT, share_telegram INTEGER, visible INTEGER, status TEXT, accepted_terms_at TEXT, "
+                  "created_at TEXT, updated_at TEXT)")
+        dating.init_schema(c)
+        self.assertIn("prefs", [r[1] for r in c.execute("PRAGMA table_info(dating_profiles)")])
+        dating.init_schema(c)  # idempotente
+
+
 if __name__ == "__main__":
     unittest.main()

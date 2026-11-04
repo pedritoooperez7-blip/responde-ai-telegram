@@ -11,11 +11,11 @@ Módulo de citas tipo Tinder dentro del mismo proyecto. **No tiene chat interno*
 | Interfaz Mini App | `dating.js` + sección `#datingScreen` de `index.html` + estilos al final de `style.css` + pestaña "Citas" en la barra inferior |
 | Moderación | Pestaña "Citas" en `admin.html` (permiso nuevo `dating`; el owner ya lo tiene) |
 | Textos legales | Secciones nuevas en `terms.html` y `privacy.html` |
-| Pruebas | `tests/test_dating.py` (39 pruebas, sin red ni FastAPI) |
+| Pruebas | `tests/test_dating.py` (47 pruebas, sin red ni FastAPI) y `tests/e2e_dating_wizard.py` (opcional, navegador sin cabeza con la API simulada) |
 
 ## Flujo de la persona usuaria
 
-1. Entra a **Citas** y crea su perfil: nombre, fecha de nacimiento (**solo mayores de 18**), género, a quién busca, provincia, descripción, intereses, rango de edad.
+1. Entra a **Citas** y crea su perfil con el **asistente por pantallas** (ver abajo): nombre, fecha de nacimiento (**solo mayores de 18**, no se puede cambiar después), género, a quién busca, rango de edad, provincia, descripción, intereses y preferencias de estilo de vida.
 2. Elige **al menos un canal de contacto** (Telegram y/o WhatsApp). Sin canal no se guarda el perfil.
 3. Sube fotos. Quedan **pendientes** hasta que un administrador las aprueba; el perfil no aparece para otros hasta tener una foto aprobada.
 4. **Descubrir**: like o pasar. Los free tienen `DATING_FREE_DAILY_LIKES` likes al día (20 por defecto).
@@ -24,9 +24,21 @@ Módulo de citas tipo Tinder dentro del mismo proyecto. **No tiene chat interno*
 
 Premium: likes ilimitados, ver quién te dio like y deshacer el último swipe.
 
+## Asistente de perfil (onboarding por pantallas)
+
+Una pregunta por pantalla, con barra de progreso en 5 etapas (**Sobre ti, Tu tipo, Estilo de vida, Objetivos de pareja, Casi listo**), botón Atrás y el botón Continuar fijo abajo. Usa los mismos colores y componentes que el resto de la app. Está en `dating.js` (sección «asistente de perfil»).
+
+* Las preguntas de opción única avanzan solas al tocar; las de varias opciones y las opcionales se pueden omitir.
+* El avance se guarda en el teléfono (`localStorage`, clave `liggacuba_dating_draft_v1`) y se borra al crear el perfil. No incluye las casillas de +18 y términos, que se piden siempre.
+* El perfil se envía **una sola vez** al final (`POST /api/dating/profile`). Después se pide subir fotos.
+* **Editar perfil** muestra un resumen por etapas; cada etapa se edita por separado y se guarda todo junto. La fecha de nacimiento aparece bloqueada.
+* Las respuestas de estilo de vida y objetivos viajan en `prefs` y el servidor solo acepta las claves y valores de `PREF_SCHEMA` (`dating.py`). **No se muestran a otras personas**; solo se usan para ordenar el feed y calcular «N cosas en común».
+* Orden del feed: misma provincia primero; luego más afinidad (intención ×3, hijos ×2, coincidencias en estilo de vida e intereses). El azar desempata. Las respuestas no excluyen perfiles: solo ordenan.
+* Para añadir o cambiar una pregunta hay que tocar `STEPS` en `dating.js` **y** `PREF_SCHEMA` en `dating.py` (si no, el servidor la descarta).
+
 ## API (todas con sesión de usuario, salvo `config` y `photo`)
 
-`GET /api/dating/config` · `POST /api/dating/me` · `POST /api/dating/profile` · `POST /api/dating/photos` · `DELETE /api/dating/photos/{id}` · `GET /api/dating/photo/{id}?e=&s=` (URL firmada) · `POST /api/dating/feed` · `POST /api/dating/swipe` · `POST /api/dating/undo` (Premium) · `POST /api/dating/likes` · `POST /api/dating/matches` · `POST /api/dating/unmatch` · `POST /api/dating/block` · `POST /api/dating/report` · `POST /api/dating/visibility` · `POST /api/dating/delete`
+`GET /api/dating/config` · `POST /api/dating/me` · `POST /api/dating/profile` (admite `prefs`) · `POST /api/dating/photos` · `DELETE /api/dating/photos/{id}` · `GET /api/dating/photo/{id}?e=&s=` (URL firmada) · `POST /api/dating/feed` · `POST /api/dating/swipe` · `POST /api/dating/undo` (Premium) · `POST /api/dating/likes` · `POST /api/dating/matches` · `POST /api/dating/unmatch` · `POST /api/dating/block` · `POST /api/dating/report` · `POST /api/dating/visibility` · `POST /api/dating/delete`
 
 Administración (permiso `dating`): `GET /api/admin/dating/overview` · `POST /api/admin/dating/photos/{id}/review` · `POST /api/admin/dating/reports/{id}/resolve` · `POST /api/admin/dating/profiles/{user_id}/restore`
 

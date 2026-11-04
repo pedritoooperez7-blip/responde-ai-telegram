@@ -79,6 +79,8 @@
 
   const D = { cfg: null, me: null, tab: 'discover', feed: [], photoIdx: 0, busy: false, likesInfo: null, lastSwiped: false };
   const root = () => $('#datingBody');
+  // replaceChildren() convierte null y arreglos en texto ("null", "[object HTMLDivElement]"): se aplanan y filtran antes.
+  const setBody = (...kids) => root().replaceChildren(...kids.flat(Infinity).filter(k => k != null && k !== false));
 
   // ---- utilidades -------------------------------------------------------
   function el(tag, props, ...kids) {
@@ -128,15 +130,17 @@
   }
   async function openDating() {
     hideOthers();
-    root().replaceChildren(el('p', { class: 'd-muted', text: T('loading') }));
+    setBody(el('p', { class: 'd-muted', text: T('loading') }));
     try {
       if (!D.cfg) D.cfg = await (await fetch('/api/dating/config')).json();
       D.me = await jpost('/api/dating/me');
       D.tab = D.me.profile ? (['intro', 'form'].includes(D.tab) ? 'discover' : D.tab) : 'intro';
       render();
-    } catch (e) { root().replaceChildren(el('p', { class: 'd-muted', text: e.message || T('error') })); }
+    } catch (e) { setBody(el('p', { class: 'd-muted', text: e.message || T('error') })); }
   }
   function render() {
+    $('#datingScreen').classList.remove('wz-on');
+    if (D.tab !== 'form') $('.bottom-nav').classList.remove('hidden');
     const head = $('#datingTabs');
     const hasProfile = !!D.me?.profile;
     head.classList.toggle('hidden', !hasProfile);
@@ -146,7 +150,7 @@
     if (D.tab === 'form') return renderForm();
     const status = D.me.profile.status;
     if (D.tab === 'discover') {
-      if (status === 'suspended') return root().replaceChildren(el('p', { class: 'd-notice danger', text: T('suspended') }));
+      if (status === 'suspended') return setBody(el('p', { class: 'd-notice danger', text: T('suspended') }));
       return renderDiscover();
     }
     if (D.tab === 'matches') return renderMatches();
@@ -155,7 +159,7 @@
 
   // ---- introducción y formulario ---------------------------------------
   function renderIntro() {
-    root().replaceChildren(
+    setBody(
       el('div', { class: 'd-card' },
         el('h2', { text: T('intro_title') }),
         el('p', { class: 'd-muted', text: T('intro_text') }),
@@ -195,93 +199,382 @@
     return el('label', { class: 'df-field' }, el('span', { class: 'df-label', text: label }), control, help ? el('small', { text: help }) : null);
   }
 
-  function renderForm() {
-    const p = D.me?.profile || {};
-    const creating = !D.me?.profile;
-    const username = p.telegram_username || tg?.initDataUnsafe?.user?.username || '';
-    const f = {};
+  // ---- asistente de perfil (una pregunta por pantalla) -------------------
+  // Mismos colores y componentes que el resto de la app. Las respuestas de estilo de vida
+  // y objetivos se guardan como preferencias (lista blanca en el servidor) y ordenan el feed.
+  const WT = {
+    es: {
+      stage_0: 'Sobre ti', stage_1: 'Tu tipo', stage_2: 'Estilo de vida', stage_3: 'Objetivos de pareja', stage_4: 'Casi listo',
+      next: 'Continuar', skip: 'Omitir', done_btn: 'Listo', create: 'Crear mi perfil', save: 'Guardar cambios', edit: 'Editar',
+      multi_sub: 'Elige todas las que quieras', opt_sub: 'Opcional',
+      name_t: '¿Cómo te llamas?', name_s: 'Es el nombre que verán las demás personas.', name_bad: 'Escribe al menos 2 letras, sin enlaces ni @usuarios.',
+      birth_t: '¿Cuál es tu fecha de nacimiento?', birth_s: 'Solo para mayores de 18 años. Nunca mostramos tu fecha: solo tu edad.',
+      birth_age: 'Tienes {n} años', birth_under: 'Citas es solo para mayores de 18 años.', birth_bad: 'Escribe una fecha válida.',
+      birth_locked: 'La fecha de nacimiento no se puede cambiar. Si te equivocaste, contacta a soporte.',
+      ages_t: '¿Qué rango de edad te interesa?', ages_s: 'Solo verás personas dentro de este rango (y ellas deben encajar con tu edad).', ages_bad: 'La edad mínima no puede ser mayor que la máxima (entre 18 y 99).',
+      loc_t: '¿Dónde vives?', loc_s: 'Mostramos primero a quienes viven cerca de ti.', loc_pick: 'Elige tu provincia.',
+      about_t: 'Cuéntanos algo de ti', about_s: 'Opcional. Sin enlaces ni @usuarios: tu contacto solo lo ven tus matches.',
+      contact_t: '¿Cómo te escriben tus matches?', contact_s: 'Solo lo verán las personas con las que hagas match. Elige al menos un canal.', contact_bad: 'Elige Telegram o escribe un WhatsApp válido (con código de país).',
+      legal_t: 'Último paso', legal_s: 'Confirma estas dos cosas para crear tu perfil.', legal_bad: 'Debes confirmar las dos casillas.',
+      sum_t: 'Tu perfil de Citas', sum_s: 'Toca una sección para cambiarla.', n_answers: '{n} respuestas', cancel: 'Cancelar',
+      done_t: '¡Tu perfil está listo!', done_s: 'Último paso: sube tus fotos. Se revisan antes de que tu perfil aparezca para otras personas.', add_photos: 'Agregar fotos',
+      prem_t: 'Con Premium', prem_s: 'Likes ilimitados, ver quién te dio like y deshacer el último swipe.', see_premium: 'Ver Premium',
+      in_common: '{n} cosas en común', in_common_one: '1 cosa en común', draft_saved: 'Guardamos tu avance en este teléfono.',
+    },
+    en: {
+      stage_0: 'About you', stage_1: 'Your type', stage_2: 'Lifestyle', stage_3: 'Relationship goals', stage_4: 'Almost done',
+      next: 'Continue', skip: 'Skip', done_btn: 'Done', create: 'Create my profile', save: 'Save changes', edit: 'Edit',
+      multi_sub: 'Choose as many as you like', opt_sub: 'Optional',
+      name_t: "What's your name?", name_s: 'This is the name other people will see.', name_bad: 'Use at least 2 letters, with no links or @usernames.',
+      birth_t: "What's your date of birth?", birth_s: 'Adults 18+ only. We never show your date, only your age.',
+      birth_age: 'You are {n} years old', birth_under: 'Dating is for adults 18+ only.', birth_bad: 'Enter a valid date.',
+      birth_locked: 'Your date of birth cannot be changed. If you made a mistake, contact support.',
+      ages_t: 'What age range interests you?', ages_s: 'You will only see people in this range (and they must fit your age).', ages_bad: 'Minimum age cannot be higher than maximum (18 to 99).',
+      loc_t: 'Where do you live?', loc_s: 'We show people who live near you first.', loc_pick: 'Choose your province.',
+      about_t: 'Tell us about yourself', about_s: 'Optional. No links or @usernames: only your matches see your contact.',
+      contact_t: 'How should your matches reach you?', contact_s: 'Only people you match with will see it. Pick at least one channel.', contact_bad: 'Pick Telegram or enter a valid WhatsApp number (with country code).',
+      legal_t: 'Last step', legal_s: 'Confirm these two things to create your profile.', legal_bad: 'You must tick both boxes.',
+      sum_t: 'Your Dating profile', sum_s: 'Tap a section to change it.', n_answers: '{n} answers', cancel: 'Cancel',
+      done_t: 'Your profile is ready!', done_s: 'Last step: add your photos. They are reviewed before your profile shows to other people.', add_photos: 'Add photos',
+      prem_t: 'With Premium', prem_s: 'Unlimited likes, see who liked you and undo your last swipe.', see_premium: 'See Premium',
+      in_common: '{n} things in common', in_common_one: '1 thing in common', draft_saved: 'Your progress is saved on this phone.',
+    },
+  };
+  const L = () => (state.language === 'en' ? 'en' : 'es');
+  const X = (k, vars) => {
+    let s = WT[L()][k] ?? WT.es[k] ?? k;
+    if (vars) for (const [a, b] of Object.entries(vars)) s = s.replace('{' + a + '}', b);
+    return s;
+  };
+  const lab = (o) => o[L()] || o.es;
+  const op = (v, icon, es, en) => ({ v, icon, es, en });
+  // kind: single | multi | name | birth | ages | location | about | contact | legal
+  // field = campo del perfil; pref = clave dentro de prefs (ver PREF_SCHEMA en dating.py)
+  const STEPS = [
+    { id: 'gender', stage: 0, kind: 'single', field: 'gender', required: true, title: { es: '¿Cuál es tu género?', en: 'What is your gender?' },
+      opts: [op('hombre', 'fa-mars', 'Hombre', 'Man'), op('mujer', 'fa-venus', 'Mujer', 'Woman'), op('otro', 'fa-genderless', 'Otro', 'Other')] },
+    { id: 'name', stage: 0, kind: 'name' },
+    { id: 'birth', stage: 0, kind: 'birth' },
+    { id: 'intent', stage: 0, kind: 'multi', pref: 'intent', title: { es: '¿Qué buscas ahora mismo?', en: 'What are you looking for right now?' },
+      opts: [op('serious', 'fa-heart', 'Una relación seria', 'A serious relationship'), op('casual', 'fa-champagne-glasses', 'Salir y ver qué surge', 'Go out and see what happens'),
+        op('online', 'fa-mobile-screen', 'Hablar online', 'Chat online'), op('unsure', 'fa-compass', 'Aún no lo sé', 'Not sure yet')] },
+    { id: 'important', stage: 0, kind: 'multi', pref: 'important', title: { es: '¿Qué es lo más importante para ti?', en: 'What matters most to you?' },
+      opts: [op('travel', 'fa-plane', 'Alguien con quien viajar', 'Someone to travel with'), op('emotional', 'fa-heart', 'Conexión emocional', 'Emotional connection'),
+        op('fun', 'fa-face-laugh', 'Diversión y espontaneidad', 'Fun and spontaneity'), op('family', 'fa-house', 'Formar una familia', 'Building a family'),
+        op('goals', 'fa-bullseye', 'Una pareja que apoye mis metas', 'A partner who supports my goals')] },
 
-    const gender = chipGroup('gender', D.cfg.genders, p.gender, T);
-    const looking = chipGroup('looking_for', D.cfg.looking_for, p.looking_for, T);
-    f.gender = gender.input; f.looking_for = looking.input;
+    { id: 'looking', stage: 1, kind: 'single', field: 'looking_for', required: true, title: { es: '¿A quién te interesa conocer?', en: 'Who do you want to meet?' },
+      opts: [op('hombres', 'fa-mars', 'Hombres', 'Men'), op('mujeres', 'fa-venus', 'Mujeres', 'Women'), op('todos', 'fa-users', 'Todos', 'Everyone')] },
+    { id: 'ages', stage: 1, kind: 'ages' },
+    { id: 'attention', stage: 1, kind: 'multi', pref: 'attention', title: { es: '¿Qué es lo primero que te llama la atención?', en: 'What do you notice first?' },
+      opts: [op('eyes', 'fa-eye', 'Ojos', 'Eyes'), op('hair', 'fa-scissors', 'Pelo', 'Hair'), op('smile', 'fa-face-smile', 'Sonrisa', 'Smile'),
+        op('style', 'fa-shirt', 'Estilo', 'Style'), op('voice', 'fa-microphone', 'Voz', 'Voice'), op('humor', 'fa-face-laugh', 'Sentido del humor', 'Sense of humor')] },
+    { id: 'distance', stage: 1, kind: 'single', pref: 'distance', title: { es: '¿A qué distancia debería vivir esa persona?', en: 'How far away should they live?' },
+      opts: [op('neighborhood', 'fa-location-dot', 'En mi barrio', 'In my neighborhood'), op('city', 'fa-city', 'En mi ciudad', 'In my city'),
+        op('province', 'fa-map', 'En mi provincia', 'In my province'), op('any', 'fa-earth-americas', 'La distancia no importa', 'Distance does not matter')] },
+    { id: 'first_move', stage: 1, kind: 'single', pref: 'first_move', title: { es: '¿Quién debería dar el primer paso?', en: 'Who should make the first move?' },
+      opts: [op('me', 'fa-hand-point-up', 'Yo', 'Me'), op('them', 'fa-hand-holding-heart', 'La otra persona', 'The other person'), op('either', 'fa-shuffle', 'Me da igual', 'Either one')] },
 
-    // Contador de caracteres de la biografía
-    const maxBio = D.cfg.max_bio;
-    const counter = el('small', { class: 'df-counter' });
-    f.bio = el('textarea', { name: 'bio', maxlength: maxBio, rows: 4, placeholder: T('bio_ph'), value: p.bio || '' });
-    const paintBio = () => { counter.textContent = T('chars_left', { n: Math.max(0, maxBio - f.bio.value.length) }); };
-    f.bio.oninput = paintBio; paintBio();
+    { id: 'work', stage: 2, kind: 'single', pref: 'work', title: { es: '¿Cómo es tu horario de trabajo?', en: 'What is your work schedule like?' },
+      opts: [op('office', 'fa-laptop', 'Horario de oficina', 'Office hours'), op('flexible', 'fa-clock', 'Horario flexible', 'Flexible hours'),
+        op('night', 'fa-moon', 'Turnos de noche', 'Night shifts'), op('own', 'fa-briefcase', 'Tengo mi propio negocio', 'I run my own business')] },
+    { id: 'weekend', stage: 2, kind: 'single', pref: 'weekend', title: { es: '¿Cómo sueles pasar el fin de semana?', en: 'How do you usually spend weekends?' },
+      opts: [op('out', 'fa-people-group', 'Saliendo y conociendo gente', 'Going out and meeting people'), op('sport', 'fa-person-running', 'Deporte y aire libre', 'Sports and outdoors'),
+        op('home', 'fa-couch', 'En casa, recargando pilas', 'At home, recharging'), op('work', 'fa-book', 'Trabajando o estudiando', 'Working or studying')] },
+    { id: 'social', stage: 2, kind: 'single', pref: 'social', title: { es: '¿Cómo es tu energía social?', en: 'What is your social energy like?' },
+      opts: [op('party', 'fa-champagne-glasses', 'Soy el alma de la fiesta', 'Life of the party'), op('small', 'fa-user-group', 'Me abro en grupos pequeños', 'I open up in small groups'),
+        op('reserved', 'fa-user', 'Soy reservado/a hasta tener confianza', 'Reserved until I trust people'), op('mood', 'fa-gauge', 'Depende de mi humor', 'Depends on my mood')] },
+    { id: 'first_date', stage: 2, kind: 'single', pref: 'first_date', title: { es: '¿Cómo sería tu primera cita ideal?', en: 'What would your ideal first date be?' },
+      opts: [op('coffee', 'fa-mug-hot', 'Café y un paseo', 'Coffee and a walk'), op('dinner', 'fa-utensils', 'Cena y copas', 'Dinner and drinks'),
+        op('active', 'fa-person-running', 'Algo activo', 'Something active'), op('undecided', 'fa-circle-question', 'Aún no lo he decidido', 'Not decided yet')] },
 
-    // Vista previa de intereses como etiquetas (textContent: nunca innerHTML)
-    const chipsBox = el('div', { class: 'chips' });
-    f.interests = el('input', { name: 'interests', placeholder: T('interests_ph'), value: (p.interests || []).join(', ') });
-    const paintInterests = () => chipsBox.replaceChildren(...f.interests.value.split(',').map(x => x.trim()).filter(Boolean).slice(0, 12).map(x => el('span', { class: 'chip', text: x })));
-    f.interests.oninput = paintInterests; paintInterests();
+    { id: 'kids', stage: 3, kind: 'single', pref: 'kids', title: { es: '¿Hijos en tus planes?', en: 'Are kids in your plans?' },
+      opts: [op('want', 'fa-baby', 'Quiero tener hijos', 'I want kids'), op('open', 'fa-seedling', 'Estoy abierto/a a la idea', 'Open to the idea'),
+        op('have', 'fa-children', 'Ya tengo hijos', 'I already have kids'), op('no', 'fa-ban', 'Prefiero no tener hijos', 'I prefer not to have kids')] },
+    { id: 'ambition', stage: 3, kind: 'single', pref: 'ambition', title: { es: '¿Qué nivel de ambición buscas en tu pareja?', en: 'What level of ambition do you look for in a partner?' },
+      opts: [op('career', 'fa-briefcase', 'Con foco en su carrera', 'Career-focused'), op('balanced', 'fa-scale-balanced', 'Equilibrio entre trabajo y vida', 'Work-life balance'),
+        op('family', 'fa-house', 'La familia primero', 'Family first'), op('any', 'fa-shuffle', 'No importa', 'Does not matter')] },
+    { id: 'common', stage: 3, kind: 'multi', pref: 'common', title: { es: '¿Qué te gustaría tener en común?', en: 'What would you like to have in common?' },
+      opts: [op('traditional', 'fa-ring', 'Valores tradicionales', 'Traditional values'), op('home', 'fa-house', 'Hogar y comodidad', 'Home and comfort'),
+        op('travel', 'fa-plane', 'Viajes y descubrimientos', 'Travel and discovery'), op('growth', 'fa-book', 'Desarrollo personal', 'Personal growth'),
+        op('career', 'fa-briefcase', 'Carrera y ambición', 'Career and ambition'), op('sport', 'fa-dumbbell', 'Deporte y aire libre', 'Sports and outdoors'),
+        op('cinema', 'fa-film', 'Cine y música', 'Movies and music'), op('nightlife', 'fa-champagne-glasses', 'Vida nocturna y diversión', 'Nightlife and fun')] },
+    { id: 'dealbreakers', stage: 3, kind: 'multi', pref: 'dealbreakers', title: { es: '¿Algo que no aceptarías?', en: 'Anything you would not accept?' },
+      opts: [op('smoke', 'fa-ban-smoking', 'Que fume', 'Smoking'), op('no_relationship', 'fa-heart-crack', 'Que no quiera una relación', 'Not wanting a relationship'),
+        op('far', 'fa-location-dot', 'Que viva muy lejos', 'Living too far away'), op('values', 'fa-scale-balanced', 'Valores muy distintos', 'Very different values'),
+        op('none', 'fa-xmark', 'Ninguna de estas', 'None of these')] },
 
-    // Rango de edad con resumen
-    f.min_age = el('input', { type: 'number', inputmode: 'numeric', min: 18, max: 99, value: p.min_age || 18, 'aria-label': 'min' });
-    f.max_age = el('input', { type: 'number', inputmode: 'numeric', min: 18, max: 99, value: p.max_age || 60, 'aria-label': 'max' });
-    const ageSummary = el('small', { class: 'df-counter' });
-    const paintAge = () => { ageSummary.textContent = T('age_summary', { a: f.min_age.value || 18, b: f.max_age.value || 99 }); };
-    f.min_age.oninput = paintAge; f.max_age.oninput = paintAge; paintAge();
+    { id: 'location', stage: 4, kind: 'location' },
+    { id: 'about', stage: 4, kind: 'about' },
+    { id: 'contact', stage: 4, kind: 'contact' },
+    { id: 'legal', stage: 4, kind: 'legal' },
+  ];
+  const WZ_KEY = 'liggacuba_dating_draft_v1';
+  let W = null;
 
-    f.display_name = el('input', { name: 'display_name', maxlength: 40, placeholder: T('name_ph'), autocomplete: 'given-name', value: p.display_name || tg?.initDataUnsafe?.user?.first_name || '' });
-    f.birth_date = el('input', { name: 'birth_date', type: 'date', value: p.birth_date || '', max: new Date().toISOString().slice(0, 10) });
-    f.province = select('province', D.cfg.provinces, p.province);
-    f.municipality = el('input', { name: 'municipality', maxlength: 60, placeholder: T('municipality_ph'), value: p.municipality || '' });
+  const ageOf = (iso) => {
+    const b = new Date(iso + 'T00:00:00'); if (!iso || isNaN(b)) return null;
+    const t = new Date(); let n = t.getFullYear() - b.getFullYear();
+    if (t.getMonth() < b.getMonth() || (t.getMonth() === b.getMonth() && t.getDate() < b.getDate())) n--;
+    return n;
+  };
+  const tgUser = () => D.me?.profile?.telegram_username || tg?.initDataUnsafe?.user?.username || '';
+  const wzSteps = () => STEPS.filter(s => (W.only == null ? true : s.stage === W.only) && (s.kind !== 'legal' || W.creating));
+  const wzGet = (s) => s.field ? W.a[s.field] : W.a.prefs[s.pref];
+  const wzSet = (s, v) => { if (s.field) W.a[s.field] = v; else if (v == null || (Array.isArray(v) && !v.length)) delete W.a.prefs[s.pref]; else W.a.prefs[s.pref] = v; };
+  const wzEmpty = (s) => {
+    if (s.kind === 'about') return !(W.a.bio || '').trim() && !(W.a.interests || '').trim();
+    if (['single', 'multi'].includes(s.kind)) { const v = wzGet(s); return !v || (Array.isArray(v) && !v.length); }
+    return false;
+  };
+  const wzOptional = (s) => !s.required && ['single', 'multi', 'about'].includes(s.kind) && !(s.field);
+  function wzPersist() {
+    if (!W.creating) return;
+    try {
+      const { accept_terms, confirm_adult, ...rest } = W.a;
+      localStorage.setItem(WZ_KEY, JSON.stringify({ a: rest, i: W.i }));
+    } catch (_) { /* sin almacenamiento: el avance simplemente no se guarda */ }
+  }
+  const wzClearDraft = () => { try { localStorage.removeItem(WZ_KEY); } catch (_) { /* nada */ } };
 
-    const form = el('form', { class: 'd-form df-form', novalidate: true },
-      el('div', { class: 'df-hero' },
-        el('span', { class: 'df-hero-icon' }, el('i', { class: 'fa-solid fa-heart' })),
-        el('div', {}, el('h2', { text: creating ? T('create_profile') : T('edit_profile') }),
-          el('p', { text: creating ? T('form_create_sub') : T('form_edit_sub') }))),
-      section('fa-user', T('sec_basic'),
-        dfield(T('name'), f.display_name),
-        dfield(T('birth'), f.birth_date)),
-      section('fa-venus-mars', T('sec_identity'),
-        el('div', { class: 'df-field' }, el('span', { class: 'df-label', text: T('gender') }), gender.node),
-        el('div', { class: 'df-field' }, el('span', { class: 'df-label', text: T('looking') }), looking.node)),
-      section('fa-location-dot', T('sec_location'),
-        dfield(T('province'), f.province),
-        dfield(T('municipality'), f.municipality)),
-      section('fa-pen', T('sec_about'),
-        el('div', { class: 'df-field' }, el('span', { class: 'df-label', text: T('bio') }), f.bio, el('div', { class: 'df-meta' }, el('small', { text: T('bio_help') }), counter)),
-        el('div', { class: 'df-field' }, el('span', { class: 'df-label', text: T('interests') }), f.interests, chipsBox)),
-      section('fa-sliders', T('sec_age'),
-        el('div', { class: 'df-age' }, f.min_age, el('span', { text: T('age_to') }), f.max_age), ageSummary),
-      section('fa-paper-plane', T('sec_contact'),
-        el('p', { class: 'd-muted small', text: T('contact_title') }),
-        el('label', { class: 'd-check' }, f.share_telegram = el('input', { type: 'checkbox', checked: !!p.share_telegram, disabled: !username }), el('span', { text: T('share_tg') + (username ? ' (@' + username + ')' : '') })),
+  function wzValid(s) {
+    const a = W.a;
+    switch (s.kind) {
+      case 'single': return { ok: s.required ? !!wzGet(s) : true };
+      case 'name': { const n = (a.display_name || '').trim(); return /(https?:|www\.|t\.me|wa\.me|@\w{4,})/i.test(n) || n.length < 2 ? { ok: false, msg: n ? X('name_bad') : '' } : { ok: true }; }
+      case 'birth': {
+        if (W.lockedBirth) return { ok: true };
+        const n = ageOf(a.birth_date);
+        if (n == null) return { ok: false, msg: a.birth_date ? X('birth_bad') : '' };
+        if (n < 18) return { ok: false, msg: X('birth_under') };
+        if (n > 99) return { ok: false, msg: X('birth_bad') };
+        return { ok: true, msg: X('birth_age', { n }) };
+      }
+      case 'ages': { const lo = Number(a.min_age), hi = Number(a.max_age); return lo >= 18 && hi <= 99 && lo <= hi ? { ok: true } : { ok: false, msg: X('ages_bad') }; }
+      case 'location': return a.province ? { ok: true } : { ok: false, msg: '' };
+      case 'contact': { const digits = String(a.whatsapp || '').replace(/\D/g, ''); const wa = digits.length >= 8 && digits.length <= 15;
+        return (a.share_telegram && tgUser()) || wa ? { ok: true } : { ok: false, msg: (a.whatsapp || a.share_telegram) ? X('contact_bad') : '' }; }
+      case 'legal': return a.confirm_adult && a.accept_terms ? { ok: true } : { ok: false, msg: '' };
+      default: return { ok: true };
+    }
+  }
+  function wzLabel(s, steps) {
+    if (s.kind === 'legal') return X(W.creating ? 'create' : 'save');
+    if (W.only != null && s === steps[steps.length - 1]) return X('done_btn');
+    return wzOptional(s) && wzEmpty(s) ? X('skip') : X('next');
+  }
+
+  function wzBody(s, refresh) {
+    const a = W.a;
+    if (s.kind === 'single' || s.kind === 'multi') {
+      const multi = s.kind === 'multi';
+      const wrap = el('div', { class: 'wz-opts' });
+      const paint = () => {
+        const cur = wzGet(s);
+        wrap.querySelectorAll('button').forEach(b => {
+          const on = multi ? (cur || []).includes(b.dataset.v) : cur === b.dataset.v;
+          b.classList.toggle('on', on); b.setAttribute('aria-pressed', on ? 'true' : 'false');
+        });
+      };
+      s.opts.forEach(o => wrap.append(el('button', { class: 'wz-opt', type: 'button', 'data-v': o.v, onclick: () => {
+        if (multi) {
+          let cur = [...(wzGet(s) || [])];
+          if (cur.includes(o.v)) cur = cur.filter(x => x !== o.v);
+          else cur = o.v === 'none' ? ['none'] : [...cur.filter(x => x !== 'none'), o.v];
+          wzSet(s, cur); paint(); refresh(); wzPersist();
+        } else {
+          wzSet(s, o.v); paint(); refresh(); wzPersist();
+          const tok = W.tok = (W.tok || 0) + 1;
+          setTimeout(() => { if (W && W.tok === tok && W.view === 'steps') wzNext(s); }, 220);   // avanza solo, como en las referencias
+        }
+      } },
+      el('span', { class: 'wz-ico' }, el('i', { class: 'fa-solid ' + o.icon })), el('span', { class: 'wz-lab', text: lab(o) }),
+      multi ? el('span', { class: 'wz-mark' }, el('i', { class: 'fa-solid fa-check' })) : null)));
+      paint(); return wrap;
+    }
+    if (s.kind === 'name') {
+      const input = el('input', { type: 'text', maxlength: 40, autocomplete: 'given-name', placeholder: T('name_ph'), value: a.display_name || '' });
+      input.oninput = () => { a.display_name = input.value; refresh(); wzPersist(); };
+      return el('label', { class: 'df-field wz-field' }, input);
+    }
+    if (s.kind === 'birth') {
+      if (W.lockedBirth) return el('div', { class: 'd-notice' }, el('b', { text: ageOf(a.birth_date) + ' ' + T('years') }), el('br'), X('birth_locked'));
+      const input = el('input', { type: 'date', value: a.birth_date || '', max: new Date().toISOString().slice(0, 10) });
+      input.onchange = input.oninput = () => { a.birth_date = input.value; refresh(); wzPersist(); };
+      return el('label', { class: 'df-field wz-field' }, input);
+    }
+    if (s.kind === 'ages') {
+      const lo = el('input', { type: 'number', inputmode: 'numeric', min: 18, max: 99, value: a.min_age, 'aria-label': 'min' });
+      const hi = el('input', { type: 'number', inputmode: 'numeric', min: 18, max: 99, value: a.max_age, 'aria-label': 'max' });
+      lo.oninput = () => { a.min_age = lo.value; refresh(); wzPersist(); }; hi.oninput = () => { a.max_age = hi.value; refresh(); wzPersist(); };
+      return el('div', { class: 'df-field wz-field' }, el('div', { class: 'df-age' }, lo, el('span', { text: T('age_to') }), hi));
+    }
+    if (s.kind === 'location') {
+      const muni = el('input', { type: 'text', maxlength: 60, placeholder: T('municipality_ph'), value: a.municipality || '' });
+      muni.oninput = () => { a.municipality = muni.value; wzPersist(); };
+      const chips = el('div', { class: 'df-chips', role: 'radiogroup' });
+      const paint = () => chips.querySelectorAll('button').forEach(b => { const on = b.dataset.v === a.province; b.classList.toggle('on', on); b.setAttribute('aria-pressed', on ? 'true' : 'false'); });
+      D.cfg.provinces.forEach(pv => chips.append(el('button', { class: 'df-chip', type: 'button', 'data-v': pv, text: pv, onclick: () => { a.province = pv; paint(); refresh(); wzPersist(); } })));
+      paint();
+      return el('div', { class: 'wz-stack' }, chips, el('label', { class: 'df-field wz-field' }, el('span', { class: 'df-label', text: T('municipality') }), muni));
+    }
+    if (s.kind === 'about') {
+      const maxBio = D.cfg.max_bio; const counter = el('small', { class: 'df-counter' });
+      const bio = el('textarea', { maxlength: maxBio, rows: 4, placeholder: T('bio_ph'), value: a.bio || '' });
+      const paintBio = () => { counter.textContent = T('chars_left', { n: Math.max(0, maxBio - bio.value.length) }); };
+      bio.oninput = () => { a.bio = bio.value; paintBio(); refresh(); wzPersist(); }; paintBio();
+      const box = el('div', { class: 'chips' });
+      const ints = el('input', { type: 'text', placeholder: T('interests_ph'), value: a.interests || '' });
+      const paintInts = () => box.replaceChildren(...ints.value.split(',').map(x => x.trim()).filter(Boolean).slice(0, 6).map(x => el('span', { class: 'chip', text: x })));
+      ints.oninput = () => { a.interests = ints.value; paintInts(); refresh(); wzPersist(); }; paintInts();
+      return el('div', { class: 'wz-stack' },
+        el('div', { class: 'df-field wz-field' }, el('span', { class: 'df-label', text: T('bio') }), bio, el('div', { class: 'df-meta' }, el('small', { text: T('bio_help') }), counter)),
+        el('div', { class: 'df-field wz-field' }, el('span', { class: 'df-label', text: T('interests') }), ints, box));
+    }
+    if (s.kind === 'contact') {
+      const username = tgUser();
+      const tgCheck = el('input', { type: 'checkbox', checked: !!(a.share_telegram && username), disabled: !username });
+      tgCheck.onchange = () => { a.share_telegram = tgCheck.checked; refresh(); wzPersist(); };
+      const wa = el('input', { type: 'tel', inputmode: 'tel', placeholder: '+53 5xxxxxxx', value: a.whatsapp || '' });
+      wa.oninput = () => { a.whatsapp = wa.value; refresh(); wzPersist(); };
+      return el('div', { class: 'wz-stack' },
+        el('label', { class: 'd-check wz-card' }, tgCheck, el('span', { text: T('share_tg') + (username ? ' (@' + username + ')' : '') })),
         username ? null : el('small', { class: 'd-muted', text: T('tg_missing') }),
-        dfield(T('whatsapp'), f.whatsapp = el('input', { name: 'whatsapp', type: 'tel', inputmode: 'tel', placeholder: '+53 5xxxxxxx', value: p.whatsapp || '' }))),
-      creating ? section('fa-shield-halved', T('sec_legal'),
-        el('label', { class: 'd-check' }, f.confirm_adult = el('input', { type: 'checkbox' }), el('span', { text: T('adult') })),
-        el('label', { class: 'd-check' }, f.accept_terms = el('input', { type: 'checkbox' }),
-          el('span', {}, T('terms') + ' ', el('a', { href: '/terms.html', target: '_blank', rel: 'noopener', text: T('terms_link') })))) : null,
-      el('div', { class: 'd-row df-actions' },
-        el('button', { class: 'secondary', type: 'button', text: T('cancel'), onclick: () => { D.tab = D.me?.profile ? 'mine' : 'intro'; render(); } }),
-        f.submit = el('button', { class: 'primary', type: 'submit', text: T('save') })));
-    form.onsubmit = async (ev) => {
-      ev.preventDefault();
-      setBusy(f.submit, true, T('saving'));
-      try {
-        const body = {
-          display_name: f.display_name.value, birth_date: f.birth_date.value, gender: f.gender.value, looking_for: f.looking_for.value,
-          province: f.province.value, municipality: f.municipality.value, bio: f.bio.value,
-          interests: f.interests.value.split(',').map(s => s.trim()).filter(Boolean),
-          min_age: Number(f.min_age.value) || 18, max_age: Number(f.max_age.value) || 99,
-          whatsapp: f.whatsapp.value, share_telegram: !!f.share_telegram.checked,
-          confirm_adult: creating ? !!f.confirm_adult.checked : true, accept_terms: creating ? !!f.accept_terms.checked : true,
-        };
-        D.me = await jpost('/api/dating/profile', body);
-        D.feed = []; toast(T('profile_saved'));
-        D.tab = D.me.photos.length ? 'discover' : 'mine';
-        if (!D.me.photos.length) toast(T('need_photo'));
-        render();
-      } catch (e) { fail(e); setBusy(f.submit, false, T('save')); }
-    };
-    root().replaceChildren(form);
+        el('label', { class: 'df-field wz-field' }, el('span', { class: 'df-label', text: T('whatsapp') }), wa));
+    }
+    if (s.kind === 'legal') {
+      const adult = el('input', { type: 'checkbox', checked: !!a.confirm_adult }); adult.onchange = () => { a.confirm_adult = adult.checked; refresh(); };
+      const terms = el('input', { type: 'checkbox', checked: !!a.accept_terms }); terms.onchange = () => { a.accept_terms = terms.checked; refresh(); };
+      return el('div', { class: 'wz-stack' },
+        el('label', { class: 'd-check wz-card' }, adult, el('span', { text: T('adult') })),
+        el('label', { class: 'd-check wz-card' }, terms, el('span', {}, T('terms') + ' ', el('a', { href: '/terms.html', target: '_blank', rel: 'noopener', text: T('terms_link') }))));
+    }
+    return el('div');
+  }
+
+  function wzTitle(s) {
+    const map = { name: ['name_t', 'name_s'], birth: ['birth_t', 'birth_s'], ages: ['ages_t', 'ages_s'], location: ['loc_t', 'loc_s'],
+      about: ['about_t', 'about_s'], contact: ['contact_t', 'contact_s'], legal: ['legal_t', 'legal_s'] };
+    if (map[s.kind]) return { title: X(map[s.kind][0]), sub: X(map[s.kind][1]) };
+    return { title: lab(s.title), sub: s.kind === 'multi' ? X('multi_sub') : (wzOptional(s) ? X('opt_sub') : '') };
+  }
+
+  function renderWizard() {
+    if (W.view === 'summary') return wzSummary();
+    if (W.view === 'done') return wzDone();
+    const steps = wzSteps();
+    W.i = Math.max(0, Math.min(W.i, steps.length - 1));
+    const s = steps[W.i];
+    const inStage = steps.filter(x => x.stage === s.stage);
+    const stagesShown = [...new Set(steps.map(x => x.stage))];
+    const msg = el('p', { class: 'wz-msg', role: 'status' });
+    const btn = el('button', { class: 'primary', type: 'button', onclick: () => wzNext(s) });
+    const refresh = () => { const v = wzValid(s); btn.disabled = !v.ok; msg.textContent = v.msg || ''; msg.classList.toggle('ok', !!v.ok && !!v.msg); btn.textContent = wzLabel(s, steps); };
+    const head = wzTitle(s);
+    setBody(...[
+      el('div', { class: 'wz-top' },
+        el('button', { class: 'back-btn', type: 'button', onclick: wzBack }, el('i', { class: 'fa-solid fa-arrow-left' }), el('span', { text: T('back') })),
+        el('strong', { text: X('stage_' + s.stage) })),
+      el('div', { class: 'wz-progress', 'aria-hidden': 'true' }, stagesShown.map(st => {
+        const fill = st < s.stage ? 100 : st === s.stage ? Math.round(((inStage.indexOf(s) + 1) / inStage.length) * 100) : 0;
+        const bar = el('b'); bar.style.width = fill + '%';
+        return el('i', {}, bar);
+      })),
+      el('h2', { class: 'wz-title', text: head.title }),
+      head.sub ? el('p', { class: 'wz-sub', text: head.sub }) : null,
+      wzBody(s, refresh), msg,
+      el('div', { class: 'wz-foot' }, btn)].filter(Boolean));
+    refresh();
     window.scrollTo(0, 0);
+  }
+  function wzBack() {
+    W.tok = (W.tok || 0) + 1;
+    if (W.i > 0) { W.i--; wzPersist(); return renderWizard(); }
+    if (W.only != null) { W.view = 'summary'; return renderWizard(); }
+    D.tab = D.me?.profile ? 'mine' : 'intro'; render();
+  }
+  async function wzNext(s) {
+    if (!wzValid(s).ok || W.busy) return;
+    wzPersist();
+    if (s.kind === 'legal') return wzSubmit();
+    const steps = wzSteps();
+    if (W.i < steps.length - 1) { W.i++; return renderWizard(); }
+    W.view = 'summary'; renderWizard();   // fin de la etapa editada
+  }
+  async function wzSubmit() {
+    const a = W.a; W.busy = true;
+    const body = {
+      display_name: (a.display_name || '').trim(), birth_date: a.birth_date, gender: a.gender, looking_for: a.looking_for,
+      province: a.province, municipality: a.municipality || '', bio: a.bio || '',
+      interests: (a.interests || '').split(',').map(x => x.trim()).filter(Boolean),
+      min_age: Number(a.min_age) || 18, max_age: Number(a.max_age) || 99, whatsapp: a.whatsapp || '',
+      share_telegram: !!(a.share_telegram && tgUser()), prefs: a.prefs,
+      confirm_adult: W.creating ? !!a.confirm_adult : true, accept_terms: W.creating ? !!a.accept_terms : true,
+    };
+    try {
+      D.me = await jpost('/api/dating/profile', body);
+      D.feed = []; toast(T('profile_saved'));
+      if (W.creating) { wzClearDraft(); W.view = 'done'; W.busy = false; return renderWizard(); }
+      W.busy = false; D.tab = 'mine'; render();
+    } catch (e) { W.busy = false; fail(e); }
+  }
+
+  const wzStageBrief = (st) => {
+    const a = W.a;
+    if (st === 0) { const n = ageOf(a.birth_date); return [a.display_name, n != null ? n + ' ' + T('years') : ''].filter(Boolean).join(', '); }
+    if (st === 1) return [T(a.looking_for || ''), a.min_age + '–' + a.max_age].filter(Boolean).join(' · ');
+    if (st === 4) return [a.province, a.municipality].filter(Boolean).join(' · ');
+    const n = STEPS.filter(x => x.stage === st && !wzEmpty(x)).length; return X('n_answers', { n });
+  };
+  function wzSummary() {
+    const save = el('button', { class: 'primary', type: 'button', text: X('save'), onclick: wzSubmit });
+    setBody(
+      el('h2', { class: 'wz-title', text: X('sum_t') }), el('p', { class: 'wz-sub', text: X('sum_s') }),
+      ...[0, 1, 2, 3, 4].map(st => el('div', { class: 'wz-sum' },
+        el('div', { class: 'grow' }, el('strong', { text: X('stage_' + st) }), el('small', { text: wzStageBrief(st) })),
+        el('button', { class: 'mini-btn', type: 'button', text: X('edit'), onclick: () => { W.only = st; W.i = 0; W.view = 'steps'; renderWizard(); } }))),
+      el('div', { class: 'wz-foot' }, save, el('button', { class: 'secondary', type: 'button', text: X('cancel'), onclick: () => { D.tab = 'mine'; render(); } })));
+    window.scrollTo(0, 0);
+  }
+  function wzDone() {
+    const a = W.a; const n = ageOf(a.birth_date);
+    const picked = [];
+    STEPS.filter(s => s.pref && ['intent', 'work', 'weekend'].includes(s.pref)).forEach(s => {
+      const v = wzGet(s); (Array.isArray(v) ? v : v ? [v] : []).forEach(x => { const o = s.opts.find(y => y.v === x); if (o) picked.push(lab(o)); });
+    });
+    setBody(...[
+      el('div', { class: 'wz-done' }, el('span', { class: 'wz-ico big' }, el('i', { class: 'fa-solid fa-heart' })),
+        el('h2', { class: 'wz-title', text: X('done_t') }), el('p', { class: 'wz-sub', text: X('done_s') })),
+      el('div', { class: 'd-card' },
+        el('h2', { text: `${a.display_name}${n != null ? ', ' + n : ''}` }),
+        el('p', { class: 'd-muted', text: [a.province, a.municipality].filter(Boolean).join(' · ') }),
+        el('div', { class: 'chips' }, picked.slice(0, 6).map(x => el('span', { class: 'chip', text: x })))),
+      state.premium ? null : el('div', { class: 'd-card soft' }, el('strong', { text: X('prem_t') }), el('p', { class: 'd-muted', text: X('prem_s') }),
+        el('button', { class: 'secondary', type: 'button', text: X('see_premium'), onclick: () => goPremium('general') })),
+      el('div', { class: 'wz-foot' }, el('button', { class: 'primary', type: 'button', text: X('add_photos'), onclick: () => { D.tab = 'mine'; render(); } }))].filter(Boolean));
+    window.scrollTo(0, 0);
+  }
+
+  function renderForm() {
+    const p = D.me?.profile; const creating = !p;
+    const defaults = { display_name: tg?.initDataUnsafe?.user?.first_name || '', birth_date: '', gender: '', looking_for: '', min_age: 18, max_age: 60,
+      province: '', municipality: '', bio: '', interests: '', whatsapp: '', share_telegram: false, confirm_adult: false, accept_terms: false, prefs: {} };
+    W = { creating, only: null, i: 0, view: 'steps', a: { ...defaults }, lockedBirth: p ? p.birth_date : '', busy: false, tok: 0 };
+    if (p) {
+      Object.assign(W.a, { display_name: p.display_name, birth_date: p.birth_date, gender: p.gender, looking_for: p.looking_for, min_age: p.min_age, max_age: p.max_age,
+        province: p.province, municipality: p.municipality || '', bio: p.bio || '', interests: (p.interests || []).join(', '), whatsapp: p.whatsapp || '',
+        share_telegram: !!p.share_telegram, prefs: JSON.parse(JSON.stringify(p.prefs || {})) });
+      W.view = 'summary';
+    } else {
+      try {
+        const draft = JSON.parse(localStorage.getItem(WZ_KEY) || 'null');
+        if (draft && draft.a) { W.a = { ...defaults, ...draft.a, prefs: { ...(draft.a.prefs || {}) }, confirm_adult: false, accept_terms: false }; W.i = Number(draft.i) || 0; }
+      } catch (_) { /* borrador dañado: se ignora */ }
+    }
+    $('.bottom-nav').classList.add('hidden');       // pantalla completa durante el asistente
+    $('#datingTabs').classList.add('hidden');
+    $('#datingScreen').classList.add('wz-on');
+    renderWizard();
   }
 
   // ---- mi perfil y fotos -----------------------------------------------
@@ -292,7 +585,11 @@
       el('img', { src: safePhoto(ph.url), alt: '' }), badge(ph.status),
       ph.status === 'rejected' && ph.reject_reason ? el('small', { text: ph.reject_reason }) : null,
       el('button', { class: 'photo-del', type: 'button', 'aria-label': T('photo_delete'), text: '×', onclick: async () => {
-        try { await fetch('/api/dating/photos/' + Number(ph.id), { method: 'DELETE' }); D.me = await jpost('/api/dating/me'); renderMine(); } catch (e) { fail(e); } } }))));
+        try {
+          const r = await fetch('/api/dating/photos/' + Number(ph.id), { method: 'DELETE' });
+          if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(typeof d.detail === 'string' ? d.detail : T('error')); }
+          D.me = await jpost('/api/dating/me'); renderMine();
+        } catch (e) { fail(e); } } }))));
     const input = el('input', { type: 'file', accept: 'image/*', hidden: true });
     const addBtn = el('button', { class: 'secondary', type: 'button', text: T('add_photo'), disabled: D.me.photos.length >= D.cfg.max_photos, onclick: () => input.click() });
     input.onchange = async () => {
@@ -309,7 +606,7 @@
     };
     const status = p.status === 'under_review' ? el('p', { class: 'd-notice', text: T('under_review') })
       : p.status === 'suspended' ? el('p', { class: 'd-notice danger', text: T('suspended') }) : null;
-    root().replaceChildren(
+    setBody(
       status,
       el('div', { class: 'd-card' },
         el('h2', { text: `${p.display_name}, ${p.age}` }),
@@ -348,15 +645,15 @@
   }
   async function renderDiscover() {
     if (!D.feed.length) {
-      root().replaceChildren(el('p', { class: 'd-muted', text: T('loading') }));
+      setBody(el('p', { class: 'd-muted', text: T('loading') }));
       try { await loadFeed(); } catch (e) {
         if (e.status === 409) { D.tab = 'mine'; toast(e.message); return render(); }
-        return root().replaceChildren(el('p', { class: 'd-muted', text: e.message }));
+        return setBody(el('p', { class: 'd-muted', text: e.message }));
       }
     }
     const p = D.feed[0];
     if (!p) {
-      return root().replaceChildren(likesBanner(),
+      return setBody(likesBanner(),
         el('div', { class: 'd-card center' }, el('h2', { text: T('empty_title') }), el('p', { class: 'd-muted', text: T('empty_text') }),
           el('button', { class: 'secondary', type: 'button', text: T('refresh'), onclick: renderDiscover })));
     }
@@ -368,13 +665,13 @@
       el('button', { class: 'tap left', type: 'button', 'aria-label': '‹', onclick: () => { D.photoIdx = Math.max(0, idx - 1); renderDiscover(); } }),
       el('button', { class: 'tap right', type: 'button', 'aria-label': '›', onclick: () => { D.photoIdx = Math.min(photos.length - 1, idx + 1); renderDiscover(); } }));
     const limitText = D.premium ? T('likes_unlimited') : (D.likesLeft != null ? T('likes_left', { n: D.likesLeft }) : '');
-    root().replaceChildren(likesBanner(),
+    setBody(likesBanner(),
       el('div', { class: 'd-card profile' }, shot,
         el('div', { class: 'd-info' },
           el('h2', { text: `${p.display_name}, ${p.age}` }),
           el('p', { class: 'd-muted', text: [p.province, p.municipality].filter(Boolean).join(' · ') + (p.same_province ? ' · ' + T('same_province') : '') }),
           p.bio ? el('p', { text: p.bio }) : null,
-          el('div', { class: 'chips' }, (p.interests || []).map(i => el('span', { class: 'chip', text: i }))),
+          el('div', { class: 'chips' }, p.in_common ? el('span', { class: 'chip match', text: X(p.in_common === 1 ? 'in_common_one' : 'in_common', { n: p.in_common }) }) : null, (p.interests || []).map(i => el('span', { class: 'chip', text: i }))),
           el('button', { class: 'text-btn small', type: 'button', text: T('report'), onclick: () => reportSheet(p.public_id) }))),
       el('div', { class: 'd-actions' },
         el('button', { class: 'round', type: 'button', 'aria-label': T('pass'), onclick: () => swipe('pass'), text: '✕' }),
@@ -392,7 +689,7 @@
   }
   function renderLikes() {
     const list = D.likesInfo?.profiles || [];
-    root().replaceChildren(
+    setBody(
       el('button', { class: 'back-btn', type: 'button', onclick: renderDiscover }, el('span', { text: '← ' + T('back') })),
       list.map(p => el('div', { class: 'match-row' },
         el('img', { src: safePhoto(p.photos[0]), alt: '' }),
@@ -432,17 +729,17 @@
       el('button', { class: 'contact-btn ' + (c.type === 'whatsapp' ? 'wa' : 'tg'), type: 'button', text: T('write_to') + ' ' + (c.type === 'whatsapp' ? 'WhatsApp' : 'Telegram'), onclick: () => openExternal(c.url) })));
   }
   async function renderMatches() {
-    root().replaceChildren(el('p', { class: 'd-muted', text: T('loading') }));
+    setBody(el('p', { class: 'd-muted', text: T('loading') }));
     try {
       const d = await jpost('/api/dating/matches');
-      if (!d.matches.length) return root().replaceChildren(el('div', { class: 'd-card center' }, el('p', { class: 'd-muted', text: T('matches_empty') })));
-      root().replaceChildren(d.matches.map(m => el('div', { class: 'd-card match' },
+      if (!d.matches.length) return setBody(el('div', { class: 'd-card center' }, el('p', { class: 'd-muted', text: T('matches_empty') })));
+      setBody(d.matches.map(m => el('div', { class: 'd-card match' },
         el('div', { class: 'match-row' },
           el('img', { src: safePhoto(m.photos[0]), alt: '' }),
           el('div', { class: 'grow' }, el('strong', { text: `${m.display_name}, ${m.age}` }), el('small', { text: [m.province, m.municipality].filter(Boolean).join(' · ') })),
           el('button', { class: 'mini-btn', type: 'button', text: '⋯', 'aria-label': T('report'), onclick: () => manageSheet(m) })),
         contactButtons(m.contacts))));
-    } catch (e) { root().replaceChildren(el('p', { class: 'd-muted', text: e.message })); }
+    } catch (e) { setBody(el('p', { class: 'd-muted', text: e.message })); }
   }
 
   // ---- hojas modales ----------------------------------------------------
