@@ -69,7 +69,7 @@ async function generate(text,imageFile=state.lastAnalysisImage){
     try{
       r=await fetch('/api/generate-reply',{method:'POST',headers:{'Content-Type':'application/json'},body});
       d=await r.json();
-      if(r.status===409&&String(d.detail||'').includes('procesando')&&attempt<2){await new Promise(resolve=>setTimeout(resolve,700*(attempt+1)));continue;}
+      if(r.status===409&&/procesando|en curso/i.test(String(d.detail||''))&&attempt<2){await new Promise(resolve=>setTimeout(resolve,700*(attempt+1)));continue;}
       break;
     }catch(error){lastError=error;if(attempt<2){await new Promise(resolve=>setTimeout(resolve,400*(attempt+1)));continue;}throw new Error('Se perdió la conexión al recibir la respuesta. Puedes volver a intentarlo sin generar otra operación.');}
   }
