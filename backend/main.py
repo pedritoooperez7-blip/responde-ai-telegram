@@ -178,7 +178,17 @@ def db():
 
 
 def now(): return datetime.utcnow().isoformat()
-def today(): return datetime.utcnow().date().isoformat()
+try:  # los reinicios diarios y las estadísticas del día usan la fecha de Cuba (los registros siguen en UTC)
+    from zoneinfo import ZoneInfo
+    CUBA_TZ = ZoneInfo("America/Havana")
+except Exception:  # sin base de zonas horarias en el sistema: Cuba = UTC-5 como respaldo
+    CUBA_TZ = timezone(timedelta(hours=-5))
+def cuba_today(): return datetime.now(timezone.utc).astimezone(CUBA_TZ).date().isoformat()
+def cuba_day_start_utc() -> str:
+    """Medianoche de Cuba de hoy en UTC (formato de now(): ISO sin zona), para comparar con used_at/created_at."""
+    d = datetime.now(timezone.utc).astimezone(CUBA_TZ).date()
+    return datetime(d.year, d.month, d.day, tzinfo=CUBA_TZ).astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+def today(): return cuba_today()
 
 
 def _quota_charge_is_from_today(connection, log_id, uid: str) -> bool:
@@ -188,7 +198,7 @@ def _quota_charge_is_from_today(connection, log_id, uid: str) -> bool:
     row = connection.execute("SELECT used_at FROM usage_logs WHERE id=? AND user_id=?", (log_id, uid)).fetchone()
     if not row:
         return False
-    return str(row["used_at"] or "")[:10] == today()
+    return str(row["used_at"] or "") >= cuba_day_start_utc()   # used_at se guarda en UTC
 
 def _utc_datetime(value=None):
     """Parse a timestamp as an aware UTC datetime; naive legacy values are treated as UTC."""
@@ -2089,7 +2099,7 @@ def admin_ai_monitor(request: Request):
     admin(request, "ai_analytics")
     c = db()
     try:
-        today_start = today() + "T00:00:00"
+        today_start = cuba_day_start_utc()
         totals = c.execute("""
           SELECT COUNT(*) total,
                  SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) successes,

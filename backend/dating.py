@@ -30,7 +30,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 try:
@@ -52,6 +52,7 @@ PHOTO_MAX_PIXELS = 24_000_000
 PHOTO_URL_TTL = 3600
 REPORT_AUTOHIDE_THRESHOLD = 3
 UNDO_WINDOW_SECONDS = 24 * 3600
+MAX_MINOR_REPORTS_PER_DAY = 3
 
 GENDERS = ("hombre", "mujer", "otro")
 LOOKING_FOR = ("hombres", "mujeres", "todos")
@@ -74,7 +75,7 @@ CREATE TABLE IF NOT EXISTS dating_profiles(
   display_name TEXT NOT NULL, birth_date TEXT NOT NULL,
   gender TEXT NOT NULL, looking_for TEXT NOT NULL,
   province TEXT NOT NULL, municipality TEXT NOT NULL DEFAULT '',
-  bio TEXT NOT NULL DEFAULT '', interests TEXT NOT NULL DEFAULT '[]',
+  bio TEXT NOT NULL DEFAULT '', interests TEXT NOT NULL DEFAULT '[]', prefs TEXT NOT NULL DEFAULT '{}',
   min_age INTEGER NOT NULL DEFAULT 18, max_age INTEGER NOT NULL DEFAULT 99,
   whatsapp TEXT NOT NULL DEFAULT '', share_telegram INTEGER NOT NULL DEFAULT 0,
   visible INTEGER NOT NULL DEFAULT 1,
@@ -124,14 +125,121 @@ class DatingError(Exception):
 
 def init_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    # Bases creadas antes del asistente de perfil no tienen la columna ``prefs``.
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(dating_profiles)").fetchall()}
+    if "prefs" not in columns:
+        connection.execute("ALTER TABLE dating_profiles ADD COLUMN prefs TEXT NOT NULL DEFAULT '{}'")
+        connection.commit()
+
+
+def _utcnow() -> datetime:
+    """Fecha/hora UTC sin zona (mismo formato que ya hay guardado en la base)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _now() -> str:
-    return datetime.utcnow().isoformat()
+    return _utcnow().isoformat()
 
 
 def _today() -> date:
-    return datetime.utcnow().date()
+    return _utcnow().date()
+
+
+try:  # hora de Cuba: el resto de la app reinicia los límites diarios a medianoche cubana
+    from zoneinfo import ZoneInfo
+    _CUBA_TZ = ZoneInfo("America/Havana")
+except Exception:  # pragma: no cover - sin base de zonas horarias
+    _CUBA_TZ = timezone(timedelta(hours=-5))
+
+
+def _cuba_today() -> date:
+    return datetime.now(timezone.utc).astimezone(_CUBA_TZ).date()
+
+
+def _cuba_day_start_utc(day: date) -> str:
+    """Medianoche cubana de ``day`` expresada en UTC (formato ISO sin zona)."""
+    start = datetime(day.year, day.month, day.day, tzinfo=_CUBA_TZ).astimezone(timezone.utc)
+    return start.replace(tzinfo=None).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Preferencias del asistente de perfil (lista blanca: lo demás se descarta)
+# ---------------------------------------------------------------------------
+
+PREF_SCHEMA = {
+    # clave: (tipo, opciones permitidas)
+    "intent": ("multi", ("serious", "casual", "online", "unsure")),
+    "important": ("multi", ("travel", "emotional", "fun", "family", "goals")),
+    "attention": ("multi", ("eyes", "hair", "smile", "style", "voice", "humor")),
+    "distance": ("single", ("neighborhood", "city", "province", "any")),
+    "first_move": ("single", ("me", "them", "either")),
+    "work": ("single", ("office", "flexible", "night", "own")),
+    "weekend": ("single", ("out", "sport", "home", "work")),
+    "social": ("single", ("party", "small", "reserved", "mood")),
+    "first_date": ("single", ("coffee", "dinner", "active", "undecided")),
+    "kids": ("single", ("want", "open", "have", "no")),
+    "ambition": ("single", ("career", "balanced", "family", "any")),
+    "common": ("multi", ("traditional", "home", "travel", "growth", "career", "sport", "cinema", "nightlife")),
+    "dealbreakers": ("multi", ("smoke", "no_relationship", "far", "values", "none")),
+}
+# Campos de opción única cuya coincidencia suma puntos en el feed (clave -> peso).
+_MATCH_SINGLE_WEIGHTS = {"work": 1, "weekend": 1, "social": 1, "first_date": 1, "kids": 2, "ambition": 1}
+_MATCH_MULTI_WEIGHTS = {"intent": 3, "important": 1, "common": 1, "attention": 0}
+
+
+def clean_prefs(raw: Any) -> Dict[str, Any]:
+    """Valida las respuestas del asistente. Ignora claves y valores desconocidos."""
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for key, (kind, options) in PREF_SCHEMA.items():
+        value = raw.get(key)
+        if kind == "single":
+            if isinstance(value, str) and value in options:
+                out[key] = value
+        elif isinstance(value, (list, tuple)):
+            picked: List[str] = []
+            for item in value:
+                if isinstance(item, str) and item in options and item not in picked:
+                    picked.append(item)
+            if "none" in picked and len(picked) > 1:
+                picked = ["none"]
+            if picked:
+                out[key] = picked
+    return out
+
+
+def load_prefs(raw: Any) -> Dict[str, Any]:
+    try:
+        return clean_prefs(json.loads(raw or "{}"))
+    except (TypeError, ValueError):
+        return {}
+
+
+def compat_score(mine: Dict[str, Any], theirs: Dict[str, Any]) -> int:
+    """Puntos por coincidencias entre dos juegos de preferencias (solo ordena el feed)."""
+    score = 0
+    for key, weight in _MATCH_SINGLE_WEIGHTS.items():
+        if mine.get(key) and mine.get(key) == theirs.get(key):
+            score += weight
+    for key, weight in _MATCH_MULTI_WEIGHTS.items():
+        shared = set(mine.get(key, [])) & set(theirs.get(key, []))
+        if shared:
+            score += weight * (1 if key == "intent" else len(shared))
+    return score
+
+
+def in_common(mine: Dict[str, Any], theirs: Dict[str, Any]) -> int:
+    """Número de respuestas en común que se muestra en la tarjeta."""
+    total = 0
+    for key, (kind, _options) in PREF_SCHEMA.items():
+        if key == "dealbreakers":
+            continue
+        if kind == "single":
+            total += 1 if mine.get(key) and mine.get(key) == theirs.get(key) else 0
+        else:
+            total += len(set(mine.get(key, [])) & set(theirs.get(key, [])))
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +276,14 @@ def _clean_text(value: Any, maximum: int, field: str, required: bool = False) ->
 
 
 def clean_profile(data: Dict[str, Any], telegram_username: str = "", existing: bool = False,
-                  today: Optional[date] = None) -> Dict[str, Any]:
+                  today: Optional[date] = None, locked_birth_date: Optional[str] = None) -> Dict[str, Any]:
+    """Valida el perfil. Si ``locked_birth_date`` viene, la fecha de nacimiento no se puede cambiar."""
     today = today or _today()
+    if locked_birth_date:
+        sent = str(data.get("birth_date") or "")
+        if sent and sent != locked_birth_date:
+            raise DatingError("La fecha de nacimiento no se puede cambiar. Si te equivocaste, contacta a soporte.", 409, "birth_locked")
+        data = {**data, "birth_date": locked_birth_date}
     name = _clean_text(data.get("display_name"), MAX_NAME, "El nombre", required=True)
     if len(name) < 2:
         raise DatingError("El nombre debe tener al menos 2 caracteres.")
@@ -223,6 +337,8 @@ def clean_profile(data: Dict[str, Any], telegram_username: str = "", existing: b
         "province": province, "municipality": municipality, "bio": bio,
         "interests": json.dumps(interests, ensure_ascii=False), "min_age": min_age, "max_age": max_age,
         "whatsapp": whatsapp, "share_telegram": 1 if share_telegram else 0,
+        # None = no venía en la petición: se conservan las preferencias guardadas.
+        "prefs": json.dumps(clean_prefs(data.get("prefs")), ensure_ascii=False) if data.get("prefs") is not None else None,
     }
 
 
@@ -236,20 +352,21 @@ def upsert_profile(c: sqlite3.Connection, uid: str, cleaned: Dict[str, Any], now
     if get_profile(c, uid):
         c.execute(
             "UPDATE dating_profiles SET display_name=?,birth_date=?,gender=?,looking_for=?,province=?,municipality=?,"
-            "bio=?,interests=?,min_age=?,max_age=?,whatsapp=?,share_telegram=?,updated_at=? WHERE user_id=?",
+            "bio=?,interests=?,min_age=?,max_age=?,whatsapp=?,share_telegram=?,prefs=COALESCE(?,prefs),updated_at=? WHERE user_id=?",
             (cleaned["display_name"], cleaned["birth_date"], cleaned["gender"], cleaned["looking_for"],
              cleaned["province"], cleaned["municipality"], cleaned["bio"], cleaned["interests"],
-             cleaned["min_age"], cleaned["max_age"], cleaned["whatsapp"], cleaned["share_telegram"], now, uid),
+             cleaned["min_age"], cleaned["max_age"], cleaned["whatsapp"], cleaned["share_telegram"],
+             cleaned.get("prefs"), now, uid),
         )
     else:
         c.execute(
             "INSERT INTO dating_profiles(user_id,public_id,display_name,birth_date,gender,looking_for,province,"
-            "municipality,bio,interests,min_age,max_age,whatsapp,share_telegram,accepted_terms_at,created_at,updated_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "municipality,bio,interests,min_age,max_age,whatsapp,share_telegram,prefs,accepted_terms_at,created_at,updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (uid, uuid.uuid4().hex[:16], cleaned["display_name"], cleaned["birth_date"], cleaned["gender"],
              cleaned["looking_for"], cleaned["province"], cleaned["municipality"], cleaned["bio"],
              cleaned["interests"], cleaned["min_age"], cleaned["max_age"], cleaned["whatsapp"],
-             cleaned["share_telegram"], now, now, now),
+             cleaned["share_telegram"], cleaned.get("prefs") or "{}", now, now, now),
         )
     c.commit()
     return get_profile(c, uid)
@@ -302,7 +419,9 @@ def add_photo(c: sqlite3.Connection, uid: str, photos_dir: str, jpeg: bytes, now
     uid = str(uid)
     if not get_profile(c, uid):
         raise DatingError("Primero crea tu perfil de Citas.", 409, "no_profile")
-    count = c.execute("SELECT COUNT(*) FROM dating_photos WHERE user_id=?", (uid,)).fetchone()[0]
+    # Las fotos rechazadas no ocupan cupo; la posición sigue al máximo para no repetirse tras borrar.
+    count = c.execute("SELECT COUNT(*) FROM dating_photos WHERE user_id=? AND status!='rejected'", (uid,)).fetchone()[0]
+    position = c.execute("SELECT COALESCE(MAX(position),-1)+1 FROM dating_photos WHERE user_id=?", (uid,)).fetchone()[0]
     if count >= MAX_PHOTOS:
         raise DatingError(f"Máximo {MAX_PHOTOS} fotos.", 409, "photo_limit")
     os.makedirs(photos_dir, exist_ok=True)
@@ -311,7 +430,7 @@ def add_photo(c: sqlite3.Connection, uid: str, photos_dir: str, jpeg: bytes, now
         handle.write(jpeg)
     cur = c.execute(
         "INSERT INTO dating_photos(user_id,filename,position,status,created_at) VALUES(?,?,?,?,?)",
-        (uid, filename, count, "pending", now or _now()),
+        (uid, filename, position, "pending", now or _now()),
     )
     c.commit()
     return {"id": cur.lastrowid, "status": "pending"}
@@ -366,14 +485,18 @@ def _approved_photo_urls(c: sqlite3.Connection, user_id: str, secret: str) -> Li
     return [photo_url(secret, r["id"]) for r in rows]
 
 
-def card(c: sqlite3.Connection, row: sqlite3.Row, secret: str, viewer_province: str = "") -> Dict[str, Any]:
-    return {
+def card(c: sqlite3.Connection, row: sqlite3.Row, secret: str, viewer_province: str = "",
+         viewer_prefs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    out = {
         "public_id": row["public_id"], "display_name": row["display_name"], "age": age_from(row["birth_date"]),
         "province": row["province"], "municipality": row["municipality"], "bio": row["bio"],
         "interests": json.loads(row["interests"] or "[]"),
         "photos": _approved_photo_urls(c, row["user_id"], secret),
         "same_province": bool(viewer_province) and row["province"] == viewer_province,
     }
+    if viewer_prefs is not None:
+        out["in_common"] = in_common(viewer_prefs, load_prefs(row["prefs"]))
+    return out
 
 
 def contact_links(row: sqlite3.Row, telegram_username: str) -> List[Dict[str, str]]:
@@ -428,6 +551,7 @@ def overview(c: sqlite3.Connection, uid: str, secret: str) -> Dict[str, Any]:
     profile = {k: me[k] for k in ("public_id", "display_name", "birth_date", "gender", "looking_for", "province",
                                    "municipality", "bio", "min_age", "max_age", "whatsapp", "status")}
     profile["interests"] = json.loads(me["interests"] or "[]")
+    profile["prefs"] = load_prefs(me["prefs"])
     profile["share_telegram"] = bool(me["share_telegram"])
     profile["visible"] = bool(me["visible"])
     profile["age"] = age_from(me["birth_date"])
@@ -465,21 +589,27 @@ def candidate_feed(c: sqlite3.Connection, uid: str, secret: str, limit: int = 10
         sql += "AND p.looking_for='todos' "
     sql += "ORDER BY (p.province=?) DESC, RANDOM() LIMIT 200"
     params.append(me["province"])
-    result = []
+    my_prefs = load_prefs(me["prefs"])
+    wants_near = my_prefs.get("distance") in ("neighborhood", "city")
+    candidates = []
     for row in c.execute(sql, params).fetchall():
         their_age = age_from(row["birth_date"], today)
         if not (me["min_age"] <= their_age <= me["max_age"]):
             continue
         if not (row["min_age"] <= my_age <= row["max_age"]):
             continue
-        result.append(card(c, row, secret, me["province"]))
-        if len(result) >= limit:
-            break
-    return result
+        score = compat_score(my_prefs, load_prefs(row["prefs"]))
+        if wants_near and row["province"] == me["province"] and me["municipality"] and row["municipality"].lower() == me["municipality"].lower():
+            score += 2
+        candidates.append((row["province"] == me["province"], score, row))
+    # sort estable: la misma provincia primero, luego más afinidad; el azar de SQL desempata
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [card(c, row, secret, me["province"], my_prefs) for _same, _score, row in candidates[:limit]]
 
 
 def likes_today(c: sqlite3.Connection, uid: str, today: Optional[date] = None) -> int:
-    start = (today or _today()).isoformat() + "T00:00:00"
+    """Likes dados hoy. El día cambia a medianoche de Cuba (igual que el resto de la app)."""
+    start = _cuba_day_start_utc(today or _cuba_today())
     return c.execute(
         "SELECT COUNT(*) FROM dating_swipes WHERE user_id=? AND action='like' AND created_at>=?", (str(uid), start)
     ).fetchone()[0]
@@ -535,7 +665,7 @@ def undo_last_swipe(c: sqlite3.Connection, uid: str, secret: str, now: Optional[
     row = c.execute("SELECT * FROM dating_swipes WHERE user_id=? ORDER BY created_at DESC LIMIT 1", (uid,)).fetchone()
     if not row:
         raise DatingError("No hay nada que deshacer.", 404)
-    age = (datetime.utcnow() - datetime.fromisoformat(row["created_at"])).total_seconds()
+    age = (_utcnow() - datetime.fromisoformat(row["created_at"])).total_seconds()
     if age > UNDO_WINDOW_SECONDS:
         raise DatingError("Ese swipe ya no se puede deshacer.", 409)
     a, b = _pair(uid, row["target_id"])
@@ -544,7 +674,8 @@ def undo_last_swipe(c: sqlite3.Connection, uid: str, secret: str, now: Optional[
     c.execute("DELETE FROM dating_swipes WHERE user_id=? AND target_id=?", (uid, row["target_id"]))
     c.commit()
     target = c.execute("SELECT * FROM dating_profiles WHERE user_id=?", (row["target_id"],)).fetchone()
-    return {"profile": card(c, target, secret) if target and target["status"] == "active" else None}
+    me = get_profile(c, uid)
+    return {"profile": card(c, target, secret, me["province"], load_prefs(me["prefs"])) if target and target["status"] == "active" else None}
 
 
 def likes_received(c: sqlite3.Connection, uid: str, secret: str, is_premium: bool) -> Dict[str, Any]:
@@ -560,7 +691,8 @@ def likes_received(c: sqlite3.Connection, uid: str, secret: str, is_premium: boo
         "ORDER BY s.created_at DESC LIMIT 50", (uid, uid, uid, uid)).fetchall()
     out: Dict[str, Any] = {"count": len(rows), "locked": not is_premium}
     if is_premium:
-        out["profiles"] = [card(c, r, secret, me["province"]) for r in rows]
+        my_prefs = load_prefs(me["prefs"])
+        out["profiles"] = [card(c, r, secret, me["province"], my_prefs) for r in rows]
     return out
 
 
@@ -618,6 +750,12 @@ def report_user(c: sqlite3.Connection, uid: str, target_public_id: str, reason: 
     details = re.sub(r"[\x00-\x1f\x7f]", " ", str(details or "")).strip()[:500]
     if c.execute("SELECT 1 FROM dating_reports WHERE reporter_id=? AND reported_id=? AND status='open'", (uid, tid)).fetchone():
         return {"success": True, "duplicate": True}
+    if reason == "minor":
+        # "Parece menor" oculta el perfil al instante: se limita para que no sirva para ocultar perfiles ajenos en masa.
+        since = ((_utcnow() if now is None else datetime.fromisoformat(now)) - timedelta(days=1)).isoformat()
+        recent = c.execute("SELECT COUNT(*) FROM dating_reports WHERE reporter_id=? AND reason='minor' AND created_at>=?", (uid, since)).fetchone()[0]
+        if recent >= MAX_MINOR_REPORTS_PER_DAY:
+            raise DatingError("Has enviado demasiados reportes de este tipo hoy. Un administrador revisará los anteriores.", 429, "report_limit")
     c.execute("INSERT INTO dating_reports(reporter_id,reported_id,reason,details,created_at) VALUES(?,?,?,?,?)",
               (uid, tid, reason, details, now or _now()))
     distinct = c.execute("SELECT COUNT(DISTINCT reporter_id) FROM dating_reports WHERE reported_id=? AND status='open'", (tid,)).fetchone()[0]
@@ -755,6 +893,7 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
         municipality: str = ""
         bio: str = ""
         interests: List[str] = []
+        prefs: Optional[Dict[str, Any]] = None
         min_age: int = 18
         max_age: int = 99
         whatsapp: str = ""
@@ -831,7 +970,8 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
             if existing and existing["status"] == "suspended":
                 raise DatingError("Tu perfil de Citas está suspendido. Contacta a soporte.", 403, "suspended")
             cleaned = clean_profile(p.model_dump() if hasattr(p, "model_dump") else p.dict(),
-                                    _username_of(c, uid), existing=bool(existing))
+                                    _username_of(c, uid), existing=bool(existing),
+                                    locked_birth_date=existing["birth_date"] if existing else None)
             upsert_profile(c, uid, cleaned)
             return overview(c, uid, secret())
         return run(work)
