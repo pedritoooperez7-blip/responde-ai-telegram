@@ -18,7 +18,8 @@ _DEADLINE_CONTEXT: ContextVar[float | None] = ContextVar("ai_deadline_context", 
 _HEALTH_LOCK = threading.Lock()
 _PROVIDER_HEALTH: dict[tuple[str, str], dict[str, Any]] = {}
 
-DEFAULT_GLOBAL_DEADLINE_SECONDS = 12.0
+DEFAULT_GLOBAL_DEADLINE_SECONDS = float(os.getenv("AI_GLOBAL_DEADLINE_SECONDS") or 30.0)
+DEFAULT_REQUEST_TIMEOUT_SECONDS = float(os.getenv("AI_REQUEST_TIMEOUT_SECONDS") or 20.0)
 MAX_REPLY_LENGTH = 1200
 
 
@@ -321,7 +322,7 @@ def record_provider_metrics(provider: str, model: str, status: str, latency_ms: 
         })
 
 
-def _request_json(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float = 8) -> dict[str, Any]:
+def _request_json(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS) -> dict[str, Any]:
     """Perform a bounded JSON POST and emit only sanitized operational diagnostics."""
     # Re-validate the target (including DNS) immediately before connecting.
     try:
@@ -339,7 +340,7 @@ def _request_json(url: str, headers: dict[str, str], body: dict[str, Any], timeo
             close()
 
 
-def _request_json_impl(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float = 8) -> dict[str, Any]:
+def _request_json_impl(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS) -> dict[str, Any]:
     remaining = remaining_provider_budget()
     if remaining is not None:
         if remaining <= 0:
@@ -473,8 +474,8 @@ def validate_reply_quality(reply: str, alternative: str) -> bool:
 
 def validate_reply_schema(value: Any) -> dict[str, str]:
     """Validate the public two-reply schema without coercing non-string values."""
-    if not isinstance(value, dict) or set(value) != {"reply", "alternative"}:
-        raise ValueError("El JSON debe contener únicamente reply y alternative.")
+    if not isinstance(value, dict) or not {"reply", "alternative"} <= set(value):
+        raise ValueError("El JSON debe contener reply y alternative.")
     reply, alternative = value.get("reply"), value.get("alternative")
     if not isinstance(reply, str) or not isinstance(alternative, str):
         raise ValueError("reply y alternative deben ser cadenas de texto.")
@@ -501,8 +502,16 @@ def _parse_replies(answer: str) -> dict[str, str] | None:
             candidate = candidate[:-3].strip()
     try:
         value = json.loads(candidate)
-        return validate_reply_schema(value)
     except (json.JSONDecodeError, TypeError, ValueError):
+        # El modelo a veces antepone o añade texto: toma el primer objeto JSON completo.
+        try:
+            start = candidate.index("{")
+            value, _ = json.JSONDecoder().raw_decode(candidate[start:])
+        except (ValueError, json.JSONDecodeError):
+            return None
+    try:
+        return validate_reply_schema(value)
+    except (TypeError, ValueError):
         return None
 
 
@@ -569,7 +578,7 @@ def _generate_reply_impl(text: str, mode: str, module: str, image_data_url: str 
 
     provider_failures = []
     timings = _timing_context()
-    for _priority, name, model, call in providers:
+    for _prio, name, model, call in providers:
         provider_started = time.monotonic()
         try:
             answer = call()
