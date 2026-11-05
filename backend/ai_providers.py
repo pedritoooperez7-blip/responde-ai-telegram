@@ -723,15 +723,32 @@ def _gemini(prompt: str, content: Any) -> str:
             raise ProviderError("Contenido de usuario inválido")
         inputs.append({"type": "text", "text": content})
 
-    data = _with_retry(lambda: _request_json(
-        "https://generativelanguage.googleapis.com/v1beta/interactions",
-        {"x-goog-api-key": key},
-        {
-            "model": model,
-            "input": inputs,
-            "store": False,
-        },
-    ))
+    # gemini-3.8-flash devuelve 503 "high demand" con frecuencia: si el modelo principal
+    # está saturado o sin cuota, se prueba un modelo de respaldo antes de abandonar Gemini.
+    fallback_raw = os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.5-flash-lite")
+    models = [model] + [m.strip() for m in fallback_raw.split(",") if m.strip() and m.strip() != model]
+    data = None
+    last_error: ProviderError | None = None
+    for candidate in models:
+        try:
+            data = _with_retry(lambda candidate=candidate: _request_json(
+                "https://generativelanguage.googleapis.com/v1beta/interactions",
+                {"x-goog-api-key": key},
+                {
+                    "model": candidate,
+                    "input": inputs,
+                    "store": False,
+                },
+            ), max_attempts=2)
+            model = candidate
+            break
+        except ProviderError as exc:
+            last_error = exc
+            if exc.category not in ("service_unavailable", "rate_limit", "quota_exceeded", "timeout", "invalid_request"):
+                raise
+            logging.getLogger(__name__).warning("Gemini model %s unavailable (category=%s); trying next model", candidate, exc.category)
+    if data is None:
+        raise last_error or ProviderError("Gemini no disponible", True, None, "service_unavailable")
 
     _record_usage_from_response("gemini", model, data)
 
