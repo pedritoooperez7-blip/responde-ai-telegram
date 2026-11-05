@@ -4,6 +4,29 @@ const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];con
 const modes={chat:[['gracioso','fa-face-grin-stars',false],['coquetear','fa-face-smile-wink',false],['provocativo','fa-bolt',true],['enamorar','fa-heart',false],['salvar','fa-life-ring',true]],story:[['gracioso','fa-face-grin-stars',false],['coquetear','fa-face-smile-wink',false],['provocativo','fa-bolt',true],['enamorar','fa-heart',true]]};
 const labels={es:{gracioso:'Gracioso',coquetear:'Coquetear',provocativo:'Provocativo',enamorar:'Enamorar',salvar:'Salvar Situación'},en:{gracioso:'Funny',coquetear:'Flirt',provocativo:'Provocative',enamorar:'Romantic',salvar:'Save Situation'}};
 const i18n={es:{loading:'Cargando...',chat:'Chat',story:'Estado Story',chat_image:'Imagen de la conversación',chat_help:'Sube una captura de tu chat',story_image:'Captura del estado',story_help:'Sube una captura del estado para responder',add:'Agregar',replace:'Reemplazar',delete:'Eliminar',mode:'Modo de respuesta',mode_help:'Elige el estilo de tu respuesta',refresh:'Actualizar',analyze:'Analizar con LiggaCuba',back:'Atrás',profile_sub:'Tu asistente para conversaciones',stats_chats:'Chats',stats_stories:'Historias',stats_total:'Análisis',premium:'Premium',premium_title:'Desbloquea todo el poder',premium_desc:'Respuestas más completas, todos los modos y sin límite diario.',get_premium:'Obtener Premium',settings:'Configuración',language:'Idioma',contact:'Contáctanos',more:'Más',weekly:'Semanal',annual:'Anual',seven_days:'7 días',annual_save:'365 días · 1 año',premium_benefit1:'Análisis ilimitados',premium_benefit2:'Todos los modos de respuesta',premium_benefit3:'Salvar Situación incluido',premium_benefit4:'Acceso a funciones Premium futuras',choose_plan:'Elige tu plan',payment_confirm_number:'Número a confirmar',payment_confirm_help:'Se utiliza para identificar tu pago.',payment_phone_required:'Configura tu número de teléfono en Perfil antes de continuar.',payment_method_title:'Método de pago',payment_method_help:'Elige cómo quieres pagar tu Premium',continue_to_transfer:'Continuar a los datos de pago',transfer_title:'Datos de la transferencia',transfer_help:'Comprueba los datos y completa tu pago',payment_method_locked:'Ya existe una operación de pago. Cancélala antes de cambiar el método.',continue_payment:'Continuar con Premium',payment_title:'Activa tu Premium',payment_help:'Paga con el importe exacto. La confirmación automática funciona en paralelo con la revisión manual.',proof_placeholder:'Referencia o datos del pago (opcional)',proof_image:'Foto del comprobante',send_proof:'Enviar comprobante',payment_instructions:'Realiza la transferencia con el importe exacto. Espera la confirmación automática o envía el comprobante para revisión manual.',manual_review_help:'El comprobante será revisado por administración. Enviar un comprobante no activa Premium automáticamente.',waiting:'Comprobante enviado. Estamos esperando verificación.',cancel_payment:'Cancelar operación',create_payment:'Crear operación de pago',crop_title:'Ajustar captura',crop_help:'Mueve y ajusta el recorte para dejar visible solo la conversación.',cancel:'Cancelar',use:'Usar recorte',result:'Resultado',recognized:'Texto reconocido',ligga_reply:'Respuesta de LiggaCuba',copy:'Copiar',another:'Analizar otra',support:'Centro de Soporte',support_help:'Elige una vía de contacto.',privacy:'Política de Privacidad',terms:'Términos de Uso',about:'Sobre LiggaCuba',more_help:'Información y recursos',home:'Inicio',dating:'Citas',profile:'Perfil',more_screen:'Más',premium_active:'Premium activo',premium_until:'Activo hasta',free_plan:'Plan gratuito',free_help:'3 análisis diarios',go_premium:'Mejorar a Premium',no_more:'Has usado tus 3 análisis gratuitos de hoy.',no_text:'No pude leer texto suficiente. Ajusta el recorte o usa una captura más clara.',premium_only:'Este modo es exclusivo de Premium.',support_telegram:'Telegram · @pedritoficial',support_whatsapp:'WhatsApp · +53 52677163'},en:{loading:'Loading...',chat:'Chat',story:'Story Status',chat_image:'Conversation image',chat_help:'Upload a screenshot of your chat',story_image:'Story screenshot',story_help:'Upload a story screenshot to reply',add:'Add',replace:'Replace',delete:'Delete',mode:'Response mode',mode_help:'Choose your response style',refresh:'Refresh',analyze:'Analyze with LiggaCuba',back:'Back',profile_sub:'Your conversation assistant',stats_chats:'Chats',stats_stories:'Stories',stats_total:'Analyses',premium:'Premium',premium_title:'Unlock the full power',premium_desc:'Better responses, every mode and no daily limit.',get_premium:'Get Premium',settings:'Settings',language:'Language',contact:'Contact us',more:'More',weekly:'Weekly',annual:'Annual',seven_days:'7 days',annual_save:'365 days · 1 year',premium_benefit1:'Unlimited analyses',premium_benefit2:'All response modes',premium_benefit3:'Save Situation included',premium_benefit4:'Access to future Premium features',choose_plan:'Choose your plan',payment_confirm_number:'Number to confirm',payment_confirm_help:'Used to identify your payment.',payment_phone_required:'Add your phone number in Profile before continuing.',payment_method_title:'Payment method',payment_method_help:'Choose how you want to pay for Premium',continue_to_transfer:'Continue to payment details',transfer_title:'Transfer details',transfer_help:'Review the details and complete your payment',payment_method_locked:'A payment operation already exists. Cancel it before changing the method.',continue_payment:'Continue to Premium',payment_title:'Activate Premium',payment_help:'Pay the exact amount. Automatic confirmation works alongside manual review.',proof_placeholder:'Payment reference or details (optional)',proof_image:'Receipt photo',send_proof:'Submit proof',payment_instructions:'Transfer the exact amount. Wait for automatic confirmation or submit proof for manual review.',manual_review_help:'The receipt will be reviewed by an administrator. Submitting proof does not activate Premium automatically.',waiting:'Proof submitted. We are waiting for verification.',cancel_payment:'Cancel operation',create_payment:'Create payment operation',crop_title:'Adjust screenshot',crop_help:'Move and adjust the crop to keep only the conversation visible.',cancel:'Cancel',use:'Use crop',result:'Result',recognized:'Recognized text',ligga_reply:'LiggaCuba reply',copy:'Copy',another:'Analyze another',support:'Support Center',support_help:'Choose a contact method.',privacy:'Privacy Policy',terms:'Terms of Use',about:'About LiggaCuba',more_help:'Information and resources',home:'Home',dating:'Dating',profile:'Profile',more_screen:'More',premium_active:'Premium active',premium_until:'Active until',free_plan:'Free plan',free_help:'3 analyses per day',go_premium:'Upgrade to Premium',no_more:'You have used your 3 free analyses today.',no_text:'I could not read enough text. Adjust the crop or use a clearer screenshot.',premium_only:'This mode is exclusive to Premium.',support_telegram:'Telegram · @pedritoficial',support_whatsapp:'WhatsApp · +53 52677163'}};
+const i18nExtra={
+es:{payment_destination:'Destino',copy_destination:'Copiar destino',copy_number:'Copiar número',destination_copied:'Destino copiado',number_copied:'Número a confirmar copiado',
+ proof_entry_text:'Si no se encuentra tu pago, utiliza nuestro sistema de envío de comprobante.',proof_screen_title:'Enviar comprobante',proof_screen_help:'Adjunta la foto o los datos de tu pago para que administración lo revise.',
+ active_payment_title:'Tienes una operación de pago activa',resume_operation:'Retomar operación',delete_and_new:'Borrar y crear nueva',
+ phone_label:'Tu número de teléfono',phone_save:'Guardar',phone_replace:'Reemplazar',phone_delete:'Eliminar',phone_help:'Se guarda en tu perfil y se utiliza para identificar los pagos.',cancel:'Cancelar',
+ phone_deleted:'Número eliminado',phone_delete_confirm:'¿Eliminar tu número de teléfono? Tendrás que agregarlo de nuevo para pagar.',
+ support:'Centro de Soporte',support_reason_help:'Elige el motivo de tu consulta.',support_contact_by:'Contactar por',support_pick_reason:'Selecciona un motivo para continuar.',support_ready:'Se abrirá el chat con el mensaje ya escrito.'},
+en:{payment_destination:'Destination',copy_destination:'Copy destination',copy_number:'Copy number',destination_copied:'Destination copied',number_copied:'Confirmation number copied',
+ proof_entry_text:"If your payment can't be found, use our proof-of-payment submission system.",proof_screen_title:'Send proof of payment',proof_screen_help:'Attach a photo or the details of your payment so an admin can review it.',
+ active_payment_title:'You have an active payment operation',resume_operation:'Resume operation',delete_and_new:'Delete and create new',
+ phone_label:'Your phone number',phone_save:'Save',phone_replace:'Replace',phone_delete:'Delete',phone_help:'Saved to your profile and used to identify payments.',cancel:'Cancel',
+ phone_deleted:'Number deleted',phone_delete_confirm:'Delete your phone number? You will need to add it again to pay.',
+ support:'Support Center',support_reason_help:'Choose the reason for your request.',support_contact_by:'Contact via',support_pick_reason:'Select a reason to continue.',support_ready:'The chat will open with the message already written.'}
+};
+Object.assign(i18n.es,i18nExtra.es);Object.assign(i18n.en,i18nExtra.en);
+const supportReasons=[
+ {id:'analysis',icon:'fa-wand-magic-sparkles',es:'Problema con un análisis',en:'Problem with an analysis',msg_es:'tengo un problema con un análisis',msg_en:'I have a problem with an analysis'},
+ {id:'payment',icon:'fa-credit-card',es:'Problema con un pago o Premium',en:'Problem with a payment or Premium',msg_es:'tengo un problema con un pago o con mi Premium',msg_en:'I have a problem with a payment or my Premium'},
+ {id:'dating',icon:'fa-heart',es:'Problema en Citas',en:'Problem with Dating',msg_es:'tengo un problema en la sección de Citas',msg_en:'I have a problem in the Dating section'},
+ {id:'account',icon:'fa-user-gear',es:'Cuenta o número de teléfono',en:'Account or phone number',msg_es:'tengo un problema con mi cuenta o mi número de teléfono',msg_en:'I have a problem with my account or phone number'},
+ {id:'report',icon:'fa-flag',es:'Reportar a un usuario',en:'Report a user',msg_es:'quiero reportar a un usuario',msg_en:'I want to report a user'},
+ {id:'other',icon:'fa-circle-question',es:'Otro motivo',en:'Something else',msg_es:'necesito ayuda con otra consulta',msg_en:'I need help with something else'}
+];
 function toast(m){const e=$('#toast');e.textContent=m;e.classList.add('show');setTimeout(()=>e.classList.remove('show'),2300)}
 function t(k){return i18n[state.language][k]||k}
 function applyLanguage(){document.documentElement.lang=state.language;$$('[data-i18n]').forEach(e=>{const k=e.dataset.i18n;if(i18n[state.language][k])e.textContent=i18n[state.language][k]});$$('[data-i18n-placeholder]').forEach(e=>{const k=e.dataset.i18nPlaceholder;if(i18n[state.language][k])e.placeholder=i18n[state.language][k]});const weeklyPrice=$('.plan[data-plan="weekly"] b'),annualPrice=$('.plan[data-plan="annual"] b');if(weeklyPrice)weeklyPrice.textContent=state.paymentPricing?.plans?.weekly?.amount||'2500 CUP';if(annualPrice)annualPrice.textContent=state.paymentPricing?.plans?.annual?.amount||'15500 CUP';const iphoneNote=$('[data-i18n="iphone_soon"]');if(iphoneNote)iphoneNote.textContent=state.language==='es'?'Disponible próximamente':'Coming soon';$('#languageValue').textContent=state.language==='es'?'Español':'English';renderModes();updateUsage();}
@@ -15,7 +38,7 @@ function updateUsage(){['#usageText','#storyUsageText'].forEach(s=>{if($(s))$(s)
 const _fetch=window.fetch.bind(window);
 window.fetch=async function(url,options={}){options={...options,headers:{...(options.headers||{})}};if(state.authToken&&((String(url).startsWith("/api/")&&!String(url).startsWith("/api/auth/"))||String(url)==="/ocr"))options.headers.Authorization="Bearer "+state.authToken;return _fetch(url,options)};
 
-async function auth(){try{const r=await fetch('/api/auth/telegram',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData:tg?.initData||'',user_id:state.userId})});if(!r.ok)throw 0;const d=await r.json();state.userId=String(d.user_id);state.authToken=String(d.token||"");if(state.authToken)sessionStorage.setItem('liggacuba_auth',state.authToken);checkAdminShortcut();state.premium=!!d.premium;state.remaining=Number(d.remaining||0);loadProfile();updateUsage()}catch(e){refreshUsage()}}
+async function auth(){try{const r=await fetch('/api/auth/telegram',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData:tg?.initData||'',user_id:state.userId})});if(!r.ok)throw 0;const d=await r.json();state.userId=String(d.user_id);state.authToken=String(d.token||"");if(state.authToken)sessionStorage.setItem('liggacuba_auth',state.authToken);checkAdminShortcut();window.warmDating?.();state.premium=!!d.premium;state.remaining=Number(d.remaining||0);loadProfile();updateUsage()}catch(e){refreshUsage()}}
 async function checkAdminShortcut(){try{const r=await fetch('/api/admin/telegram-access',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId})});if(!r.ok)throw new Error('No autorizado');const d=await r.json();$('#adminShortcut')?.classList.toggle('hidden',!d.allowed);if(d.allowed&&$('#adminShortcut'))$('#adminShortcut').setAttribute('href',d.url||'/admin.html')}catch(e){$('#adminShortcut')?.classList.add('hidden')}}
 async function refreshUsage(){try{const r=await fetch('/api/usage',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId})});const d=await r.json();if(!r.ok)throw new Error(d.detail||'Error');state.premium=!!d.premium;state.remaining=Number(d.remaining||0);updateUsage()}catch(e){toast(e.message)}}
 function openFile(input){const f=input.files?.[0];if(!f)return;if(f.size>8*1024*1024){toast(state.language==='es'?'Máximo 8 MB':'Maximum 8 MB');input.value='';return}openCropper(f)}
@@ -54,70 +77,95 @@ async function generate(text,imageFile=state.lastAnalysisImage){
   state.lastGenerationKey=null;state.lastReply2=typeof d.alternative==='string'?d.alternative:'';state.lastProvider=typeof d.provider==='string'?d.provider:'desconocido';state.lastOCRText=typeof d.ocr_text==='string'?d.ocr_text:'';return d.reply
 }
 const screenStack=[];
-const TOP_SCREENS=['homeScreen','datingScreen','profileScreen','settingsScreen','moreScreen','paymentMethodScreen','transferScreen','premiumScreen'];
-const FULL_SCREENS=['premiumScreen','transferScreen','paymentMethodScreen'];
+const TOP_SCREENS=['homeScreen','datingScreen','profileScreen','settingsScreen','moreScreen','paymentMethodScreen','transferScreen','proofScreen','supportScreen','premiumScreen'];
+const FULL_SCREENS=['premiumScreen','transferScreen','paymentMethodScreen','proofScreen','supportScreen'];
 // Pantalla principal visible. No usar $$('.screen').find(): chatScreen y storyScreen viven dentro de homeScreen y siempre
 // aparecen "visibles", lo que dejaba la pila de navegación con 'chatScreen' y la pantalla en blanco al volver atrás.
 function currentScreenId(){return TOP_SCREENS.find(id=>{const e=$('#'+id);return e&&!e.classList.contains('hidden')})||'homeScreen'}
 function hideTopScreens(){TOP_SCREENS.forEach(id=>$('#'+id)?.classList.add('hidden'))}
 function showScreen(id){const cur=currentScreenId();if(cur!==id)screenStack.push(cur);hideTopScreens();$('#'+id)?.classList.remove('hidden');$('.bottom-nav').classList.toggle('hidden',FULL_SCREENS.includes(id));}
 function goBack(){const previous=screenStack.pop();if(!previous)return home();if(previous==='homeScreen')return home();if(previous==='profileScreen')return profile();if(previous==='settingsScreen')return settings();if(previous==='moreScreen')return more();hideTopScreens();$('#'+previous)?.classList.remove('hidden');$('.bottom-nav').classList.toggle('hidden',FULL_SCREENS.includes(previous));}
-function showPremium(reason='general'){const cur=currentScreenId();if(cur!=='premiumScreen')screenStack.push(cur);['#datingScreen','#homeScreen','#profileScreen','#settingsScreen','#moreScreen','#transferScreen','#paymentMethodScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#premiumScreen').classList.remove('hidden');$('.bottom-nav').classList.add('hidden');if(reason==='limit')$('#premiumReason').textContent=t('no_more');else if(reason==='locked')$('#premiumReason').textContent=t('premium_only');else $('#premiumReason').textContent='';updatePremiumView()}
-function hidePremium(){['#premiumScreen','#paymentFlow','#transferScreen','#paymentMethodScreen'].forEach(s=>$(s)?.classList.add('hidden'));goBack()}
+function showPremium(reason='general'){const cur=currentScreenId();if(cur!=='premiumScreen')screenStack.push(cur);['#datingScreen','#homeScreen','#profileScreen','#settingsScreen','#moreScreen','#transferScreen','#paymentMethodScreen','#proofScreen','#supportScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#premiumScreen').classList.remove('hidden');$('.bottom-nav').classList.add('hidden');if(reason==='limit')$('#premiumReason').textContent=t('no_more');else if(reason==='locked')$('#premiumReason').textContent=t('premium_only');else $('#premiumReason').textContent='';updatePremiumView()}
+function hidePremium(){['#premiumScreen','#paymentFlow','#transferScreen','#paymentMethodScreen','#proofScreen','#supportScreen'].forEach(s=>$(s)?.classList.add('hidden'));goBack()}
 function updatePremiumView(){const active=state.premium;$('#premiumActive').classList.toggle('hidden',!active);$('#premiumPlans').classList.toggle('hidden',active);if(active){$('#premiumUntil').textContent=state.premiumUntil?formatCubaDate(state.premiumUntil):'—'}}
 function showPaymentMethods(skipCurrentProfile=false){const cur=currentScreenId();if(cur!=='paymentMethodScreen'&&!(skipCurrentProfile===true&&cur==='profileScreen'))screenStack.push(cur);hideTopScreens();$('#paymentMethodScreen').classList.remove('hidden');$('.bottom-nav').classList.add('hidden');}
-async function createPayment(){
-  if(state.operationId){
-    $("#premiumScreen").classList.add("hidden");
-    $("#paymentMethodScreen").classList.add("hidden");
-    $("#transferScreen").classList.remove("hidden");
-    $(".bottom-nav").classList.add("hidden");
-    return;
-  }
-  try{
-    const method=state.paymentMethod||"BANDEC";
-    const r=await fetch("/api/payments/pending",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({user_id:state.userId,plan:state.plan,language:state.language,payment_method:method})});
-    const d=await r.json();
-    if(!r.ok){
-      const detail=String(d.detail||"");
-      if(r.status===400 && detail.includes("Configura tu número de teléfono en Perfil")){
-        state.pendingPaymentMethod=method;
-        toast(state.language==="es"
-          ?"Configura tu número de teléfono en Perfil antes de continuar."
-          :"Add your phone number in Profile before continuing.");
-        profile();
-        return;
-      }
-      throw new Error(detail||"Error");
+function stopPaymentPolling(){if(state.paymentTimer){clearInterval(state.paymentTimer);state.paymentTimer=null}}
+function hideProofEntry(){$('#proofEntry')?.classList.add('hidden');$('#proofSubmission')?.classList.add('hidden')}
+function showProofEntry(){$('#proofEntry')?.classList.remove('hidden');$('#proofSubmission')?.classList.remove('hidden');if($('#paymentProofFile'))$('#paymentProofFile').value='';if($('#paymentProofText'))$('#paymentProofText').value='';if($('#proofFileName'))$('#proofFileName').textContent=state.language==='es'?'Opcional · JPG/PNG':'Optional · JPG/PNG'}
+function methodName(m){return m==='SALDO_MOVIL'?(state.language==='es'?'Saldo móvil':'Mobile balance'):m}
+// Pide el crear/recuperar la operación. Devuelve null si hubo que redirigir al perfil (falta el teléfono).
+async function requestPending(method){
+  const r=await fetch('/api/payments/pending',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId,plan:state.plan,language:state.language,payment_method:method})});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok){
+    const detail=String(d.detail||'');
+    if(r.status===400&&detail.includes('Configura tu número de teléfono en Perfil')){
+      state.pendingPaymentMethod=method;
+      toast(state.language==='es'?'Configura tu número de teléfono en Perfil antes de continuar.':'Add your phone number in Profile before continuing.');
+      profile();return null;
     }
-    state.operationId=d.operation_id;
-    $('#proofSubmission')?.classList.remove('hidden');$('#cancelPayment')?.classList.remove('hidden');$('#restartPayment')?.classList.add('hidden');if($('#paymentProofFile'))$('#paymentProofFile').value='';if($('#paymentProofText'))$('#paymentProofText').value='';if($('#proofFileName'))$('#proofFileName').textContent=state.language==='es'?'Opcional · JPG/PNG':'Optional · JPG/PNG';
-    // Keep the UI aligned with the operation returned by the backend.
-    const actualMethod=d.payment_method||method;
-    if(["BANDEC","BPA","SALDO_MOVIL"].includes(actualMethod))state.paymentMethod=actualMethod;
-    else if(method==="BANDEC"||method==="BPA")state.paymentMethod=method;
-    $$(".payment-method[data-method]").forEach(b=>b.classList.toggle("selected",b.dataset.method===state.paymentMethod));
-    state.paymentPhone=d.payment_phone||state.paymentPhone||"";
-    if($("#paymentPhone")&&!$("#paymentPhone").value)$("#paymentPhone").value=state.paymentPhone;
-    $("#paymentStatus").textContent=(state.language==="es"?"Operación ":"Operation ")+d.operation_id+" · "+d.amount;
-    $("#paymentMethodLabel").textContent=state.paymentMethod==="SALDO_MOVIL"?"Saldo móvil":state.paymentMethod;
-    $("#paymentAmount").textContent=d.amount;
-    $("#paymentDestination").textContent=state.paymentMethod==="SALDO_MOVIL"?"52677163":(d.destination_account||"").replace(/(\d{4})(?=\d)/g,"$1 ");
-    $("#paymentConfirmNumberRow").classList.toggle(
-      "hidden",
-      !["BANDEC", "BPA"].includes(state.paymentMethod)
-    );
-    $("#paymentFlow").classList.remove("hidden");
-    $("#startPayment").classList.add("hidden");
-    const transferScreen=$("#transferScreen");
-    if(transferScreen && $("#paymentFlow").parentElement!==transferScreen) transferScreen.appendChild($("#paymentFlow"));
-    $("#premiumScreen").classList.add("hidden");
-    $("#paymentMethodScreen").classList.add("hidden");
-    $("#transferScreen").classList.remove("hidden");
-    $(".bottom-nav").classList.add("hidden");
-    if(screenStack[screenStack.length-1]!=="paymentMethodScreen")screenStack.push("paymentMethodScreen");
-    startPaymentStatusPolling();
+    throw new Error(detail||'Error');
+  }
+  return d;
+}
+// Aviso con dos opciones. Devuelve 'resume', 'new' o null (si se cierra tocando fuera).
+function askActivePayment(d){
+  return new Promise(resolve=>{
+    const modal=$('#activePaymentModal');
+    $('#activePaymentText').textContent=(state.language==='es'
+      ?`Operación ${d.operation_id} · ${methodName(d.payment_method)} · ${d.amount}. Puedes retomarla o borrarla para crear una nueva.`
+      :`Operation ${d.operation_id} · ${methodName(d.payment_method)} · ${d.amount}. You can resume it or delete it to create a new one.`);
+    const done=v=>{modal.classList.add('hidden');$('#resumePayment').onclick=null;$('#replacePayment').onclick=null;modal.querySelector('.crop-backdrop').onclick=null;resolve(v)};
+    $('#resumePayment').onclick=()=>done('resume');
+    $('#replacePayment').onclick=()=>done('new');
+    modal.querySelector('.crop-backdrop').onclick=()=>done(null);
+    modal.classList.remove('hidden');
+  });
+}
+async function createPayment(){
+  const btn=$('#continuePaymentMethod');if(btn)btn.disabled=true;
+  try{
+    const method=state.paymentMethod||'BANDEC';
+    let d=await requestPending(method);
+    if(!d)return;
+    if(d.existing_operation){
+      const choice=await askActivePayment(d);
+      if(choice===null)return;
+      if(choice==='new'){
+        const r=await fetch('/api/payments/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:d.operation_id,user_id:state.userId})});
+        const c=await r.json().catch(()=>({}));
+        if(!r.ok)throw new Error(c.detail||'Error');
+        stopPaymentPolling();state.operationId=null;
+        d=await requestPending(method);
+        if(!d)return;
+        if(d.existing_operation)throw new Error(state.language==='es'?'No se pudo crear la nueva operación. Inténtalo de nuevo.':'Could not create the new operation. Try again.');
+      }
+    }
+    showOperation(d);
   }catch(e){toast(e.message)}
+  finally{if(btn)btn.disabled=false}
+}
+function showOperation(d){
+  state.operationId=d.operation_id;
+  $('#cancelPayment')?.classList.remove('hidden');$('#restartPayment')?.classList.add('hidden');showProofEntry();
+  const actualMethod=d.payment_method||state.paymentMethod||'BANDEC';
+  if(['BANDEC','BPA','SALDO_MOVIL'].includes(actualMethod))state.paymentMethod=actualMethod;
+  $$('.payment-method[data-method]').forEach(b=>b.classList.toggle('selected',b.dataset.method===state.paymentMethod));
+  state.paymentPhone=d.payment_phone||state.paymentPhone||'';
+  $('#paymentStatus').textContent=(state.language==='es'?'Operación ':'Operation ')+d.operation_id+' · '+d.amount;
+  $('#paymentMethodLabel').textContent=methodName(state.paymentMethod);
+  $('#paymentAmount').textContent=d.amount;
+  $('#paymentDestination').textContent=state.paymentMethod==='SALDO_MOVIL'?'52677163':(d.destination_account||'').replace(/(\d{4})(?=\d)/g,'$1 ');
+  $('#paymentConfirmNumberRow').classList.toggle('hidden',!['BANDEC','BPA'].includes(state.paymentMethod));
+  $('#paymentFlow').classList.remove('hidden');
+  $('#startPayment').classList.add('hidden');
+  const transferScreen=$('#transferScreen');
+  if(transferScreen&&$('#paymentFlow').parentElement!==transferScreen)transferScreen.appendChild($('#paymentFlow'));
+  hideTopScreens();
+  $('#transferScreen').classList.remove('hidden');
+  $('.bottom-nav').classList.add('hidden');
+  if(screenStack[screenStack.length-1]!=='paymentMethodScreen')screenStack.push('paymentMethodScreen');
+  startPaymentStatusPolling();
 }
 
 async function submitProof(){
@@ -133,7 +181,9 @@ async function submitProof(){
     const d=await r.json().catch(()=>({detail:'Respuesta inválida'}));
     if(!r.ok)throw new Error(d.detail||'No se pudo enviar el comprobante');
     $('#paymentStatus').textContent=state.language==='es'?'Comprobante enviado. Pendiente de revisión administrativa.':'Proof submitted. Waiting for administrator review.';
-    $('#proofSubmission')?.classList.add('hidden');
+    hideProofEntry();
+    if(currentScreenId()==='proofScreen')goBack();
+    toast(state.language==='es'?'Comprobante enviado':'Proof submitted');
     startPaymentStatusPolling();
   }catch(e){toast(e.message||'Error al enviar el comprobante')}
   finally{if(button)button.disabled=false}
@@ -146,40 +196,60 @@ async function pollPayment(){
     if(d.status==='verified'){
       state.premium=true;state.premiumUntil=d.premium_until||null;
       $('#paymentStatus').textContent=state.language==='es'?'Premium activado.':'Premium activated.';
-      $('#proofSubmission')?.classList.add('hidden');$('#cancelPayment')?.classList.add('hidden');
+      hideProofEntry();$('#cancelPayment')?.classList.add('hidden');
       if(state.paymentTimer){clearInterval(state.paymentTimer);state.paymentTimer=null}
       updatePremiumView();refreshUsage();
     }else if(d.status==='proof_submitted'){
       $('#paymentStatus').textContent=state.language==='es'?'Comprobante enviado. Pendiente de revisión administrativa.':'Proof submitted. Waiting for administrator review.';
-      $('#proofSubmission')?.classList.add('hidden');
+      hideProofEntry();
     }else if(d.status==='rejected'){
       $('#paymentStatus').textContent=state.language==='es'?'Pago rechazado. Puedes iniciar una nueva operación.':'Payment rejected. You can start a new operation.';
-      $('#proofSubmission')?.classList.add('hidden');$('#cancelPayment')?.classList.add('hidden');$('#restartPayment')?.classList.remove('hidden');
+      hideProofEntry();$('#cancelPayment')?.classList.add('hidden');$('#restartPayment')?.classList.remove('hidden');
       if(state.paymentTimer){clearInterval(state.paymentTimer);state.paymentTimer=null}
     }else if(d.status==='cancelled'){
       $('#paymentStatus').textContent=state.language==='es'?'Operación cancelada.':'Operation cancelled.';
-      $('#proofSubmission')?.classList.add('hidden');$('#cancelPayment')?.classList.add('hidden');$('#restartPayment')?.classList.remove('hidden');
+      hideProofEntry();$('#cancelPayment')?.classList.add('hidden');$('#restartPayment')?.classList.remove('hidden');
       if(state.paymentTimer){clearInterval(state.paymentTimer);state.paymentTimer=null}
     }
   }catch(_){/* Temporary network errors are retried on the next poll. */}
 }
 function startPaymentStatusPolling(){if(state.paymentTimer)clearInterval(state.paymentTimer);pollPayment();state.paymentTimer=setInterval(pollPayment,10000)}
-async function cancelPayment(){if(!state.operationId)return;const r=await fetch('/api/payments/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:state.operationId,user_id:state.userId})});const d=await r.json();if(!r.ok)throw new Error(d.detail||'Error');if(state.paymentTimer){clearInterval(state.paymentTimer);state.paymentTimer=null}state.operationId=null;$('#paymentStatus').textContent=state.language==='es'?'Operación cancelada.':'Operation cancelled.';$('#startPayment').classList.remove('hidden');$('#paymentFlow').classList.add('hidden');$('#transferScreen').classList.add('hidden');$('#premiumScreen').classList.add('hidden');$('#paymentMethodScreen').classList.remove('hidden');if(screenStack[screenStack.length-1]==='paymentMethodScreen')screenStack.pop();$('.bottom-nav').classList.add('hidden');toast(state.language==='es'?'Operación cancelada':'Operation cancelled')}
-async function savePhone(input){try{const phone=String(input?.value||'').trim();const r=await fetch('/api/payment-phone',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone})});const d=await r.json().catch(()=>({detail:'Respuesta inválida'}));if(!r.ok)throw new Error(d.detail||'No se pudo guardar el teléfono');state.paymentPhone=d.payment_phone||phone;if($('#profilePhone'))$('#profilePhone').value=state.paymentPhone;if($('#paymentPhone'))$('#paymentPhone').value=state.paymentPhone;toast(state.language==='es'?'Número guardado correctamente':'Phone number saved');if(state.pendingPaymentMethod){state.paymentMethod=state.pendingPaymentMethod;state.pendingPaymentMethod=null;$$('.payment-method[data-method]').forEach(b=>b.classList.toggle('selected',b.dataset.method===state.paymentMethod));showPaymentMethods(true)}return true}catch(e){toast(e.message||'Error al guardar el número');return false}}
-async function loadProfile(){try{const r=await fetch('/api/profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId})});const d=await r.json();if(!r.ok)return;$('#profileName').textContent=d.first_name||d.username||'LiggaCuba';$('#profileUsername').textContent=d.username?`@${d.username}`:'LiggaCuba';$('#statChats').textContent=d.chats||0;$('#statStories').textContent=d.stories||0;$('#statAnalyses').textContent=d.analyses||0;$('#profilePhone').value=d.payment_phone||'';$('#profileBenefits').classList.toggle('hidden',!d.premium);state.premium=!!d.premium;state.premiumUntil=d.premium_until||null;$('#profilePlan').textContent=state.premium?t('premium_active'):t('free_plan');$('#profilePlanHelp').textContent=state.premium&&state.premiumUntil?`${t('premium_until')}: ${formatCubaDate(state.premiumUntil)} · ${Math.max(0,Math.ceil((new Date(state.premiumUntil)-Date.now())/86400000))} ${state.language==='es'?'días restantes':'days left'}`:t('free_help');$('#profilePremiumButton').textContent=state.premium?t('premium_active'):t('go_premium');updatePremiumView()}catch(e){}}
-function profile(){['#datingScreen','#homeScreen','#settingsScreen','#premiumScreen','#moreScreen','#transferScreen','#paymentMethodScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#profileScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden');$$('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.nav==='profile'));loadProfile()}
-function home(){['#datingScreen','#profileScreen','#settingsScreen','#premiumScreen','#moreScreen','#transferScreen','#paymentMethodScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#homeScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden');$$('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.nav==='home'));setModule(state.module)}
-function settings(){['#datingScreen','#homeScreen','#profileScreen','#premiumScreen','#moreScreen','#transferScreen','#paymentMethodScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#settingsScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden');}
-function more(){['#datingScreen','#homeScreen','#profileScreen','#settingsScreen','#premiumScreen','#transferScreen','#paymentMethodScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#moreScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden')}
+async function cancelPayment(){if(!state.operationId)return;const r=await fetch('/api/payments/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:state.operationId,user_id:state.userId})});const d=await r.json();if(!r.ok)throw new Error(d.detail||'Error');stopPaymentPolling();state.operationId=null;$('#paymentStatus').textContent=state.language==='es'?'Operación cancelada.':'Operation cancelled.';$('#startPayment').classList.remove('hidden');$('#paymentFlow').classList.add('hidden');$('#transferScreen').classList.add('hidden');$('#premiumScreen').classList.add('hidden');$('#paymentMethodScreen').classList.remove('hidden');if(screenStack[screenStack.length-1]==='paymentMethodScreen')screenStack.pop();$('.bottom-nav').classList.add('hidden');toast(state.language==='es'?'Operación cancelada':'Operation cancelled')}
+function setPhoneUI(phone,editing=false){
+  const has=!!phone;
+  state.paymentPhone=phone||'';
+  $('#phoneSaved').classList.toggle('hidden',!has||editing);
+  $('#phoneEdit').classList.toggle('hidden',has&&!editing);
+  $('#cancelPhoneEdit').classList.toggle('hidden',!(has&&editing));
+  $('#phoneSavedValue').textContent=has?'+53 '+phone:'—';
+  $('#profilePhone').value=editing||!has?(has&&editing?phone:''):'';
+}
+function askConfirm(message){
+  return new Promise(resolve=>{
+    if(tg?.showConfirm){try{return tg.showConfirm(message,ok=>resolve(!!ok))}catch(_){}}
+    resolve(window.confirm(message));
+  });
+}
+async function deletePhone(){
+  if(!await askConfirm(t('phone_delete_confirm')))return;
+  try{
+    const r=await fetch('/api/payment-phone/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(d.detail||'Error');
+    setPhoneUI('');toast(t('phone_deleted'));
+  }catch(e){toast(e.message||'Error')}
+}
+async function savePhone(input){try{const phone=String(input?.value||'').trim();const r=await fetch('/api/payment-phone',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone})});const d=await r.json().catch(()=>({detail:'Respuesta inválida'}));if(!r.ok)throw new Error(d.detail||'No se pudo guardar el teléfono');state.paymentPhone=d.payment_phone||phone;setPhoneUI(state.paymentPhone);toast(state.language==='es'?'Número guardado correctamente':'Phone number saved');if(state.pendingPaymentMethod){state.paymentMethod=state.pendingPaymentMethod;state.pendingPaymentMethod=null;$$('.payment-method[data-method]').forEach(b=>b.classList.toggle('selected',b.dataset.method===state.paymentMethod));showPaymentMethods(true)}return true}catch(e){toast(e.message||'Error al guardar el número');return false}}
+async function loadProfile(){try{const r=await fetch('/api/profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId})});const d=await r.json();if(!r.ok)return;$('#profileName').textContent=d.first_name||d.username||'LiggaCuba';$('#profileUsername').textContent=d.username?`@${d.username}`:'LiggaCuba';$('#statChats').textContent=d.chats||0;$('#statStories').textContent=d.stories||0;$('#statAnalyses').textContent=d.analyses||0;setPhoneUI(d.payment_phone||'');$('#profileBenefits').classList.toggle('hidden',!d.premium);state.premium=!!d.premium;state.premiumUntil=d.premium_until||null;$('#profilePlan').textContent=state.premium?t('premium_active'):t('free_plan');$('#profilePlanHelp').textContent=state.premium&&state.premiumUntil?`${t('premium_until')}: ${formatCubaDate(state.premiumUntil)} · ${Math.max(0,Math.ceil((new Date(state.premiumUntil)-Date.now())/86400000))} ${state.language==='es'?'días restantes':'days left'}`:t('free_help');$('#profilePremiumButton').textContent=state.premium?t('premium_active'):t('go_premium');updatePremiumView()}catch(e){}}
+function profile(){['#datingScreen','#homeScreen','#settingsScreen','#premiumScreen','#moreScreen','#transferScreen','#paymentMethodScreen','#proofScreen','#supportScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#profileScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden');$$('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.nav==='profile'));loadProfile()}
+function home(){['#datingScreen','#profileScreen','#settingsScreen','#premiumScreen','#moreScreen','#transferScreen','#paymentMethodScreen','#proofScreen','#supportScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#homeScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden');$$('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.nav==='home'));setModule(state.module)}
+function settings(){['#datingScreen','#homeScreen','#profileScreen','#premiumScreen','#moreScreen','#transferScreen','#paymentMethodScreen','#proofScreen','#supportScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#settingsScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden');}
+function more(){['#datingScreen','#homeScreen','#profileScreen','#settingsScreen','#premiumScreen','#transferScreen','#paymentMethodScreen','#proofScreen','#supportScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#moreScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden')}
 const paymentMethodsElement=$('.payment-methods');if(paymentMethodsElement&&$('#paymentMethodsHost'))$('#paymentMethodsHost').appendChild(paymentMethodsElement);
 $$('.payment-method[data-method]').forEach(b=>b.onclick=async()=>{
   const next=b.dataset.method;
   if(next==='IPHONE'){
     toast(state.language==='es'?'La opción para iPhone estará disponible en futuras actualizaciones.':'The iPhone option will be available in a future update.');
-    return;
-  }
-  if(state.operationId){
-    toast(t('payment_method_locked'));
     return;
   }
   try{
@@ -200,9 +270,48 @@ $$('.payment-method[data-method]').forEach(b=>b.onclick=async()=>{
   }
 });
 if($('#saveProfilePhone'))$('#saveProfilePhone').onclick=()=>savePhone($('#profilePhone'));
-$('#copyPaymentValue').onclick=async()=>{
-  try{await navigator.clipboard.writeText($('#paymentDestination').textContent.replace(/\s/g,''));toast(state.language==='es'?'Destino copiado':'Destination copied')}
+$('#replacePhone').onclick=()=>{setPhoneUI(state.paymentPhone,true);$('#profilePhone').focus()};
+$('#cancelPhoneEdit').onclick=()=>setPhoneUI(state.paymentPhone);
+$('#deletePhone').onclick=deletePhone;
+state.supportReason=null;
+function renderSupportReasons(){
+  const box=$('#supportReasons');box.innerHTML='';
+  supportReasons.forEach(r=>{
+    const b=document.createElement('button');b.type='button';b.className='support-reason'+(state.supportReason===r.id?' on':'');b.setAttribute('aria-pressed',state.supportReason===r.id?'true':'false');
+    b.innerHTML='<i class="fa-solid '+r.icon+'"></i><span></span><i class="fa-solid fa-circle-check tick"></i>';
+    b.querySelector('span').textContent=r[state.language]||r.es;
+    b.onclick=()=>{state.supportReason=r.id;renderSupportReasons()};
+    box.appendChild(b);
+  });
+  const ready=!!state.supportReason;
+  $('#supportTelegram').disabled=!ready;$('#supportWhatsapp').disabled=!ready;
+  $('#supportHint').textContent=ready?t('support_ready'):t('support_pick_reason');
+}
+function supportMessage(){
+  const r=supportReasons.find(x=>x.id===state.supportReason)||supportReasons[supportReasons.length-1];
+  const es=state.language==='es';
+  let msg=es?`Hola, buenas. Soy cliente de LiggaCuba y ${r.msg_es}.`:`Hi there. I'm a LiggaCuba customer and ${r.msg_en}.`;
+  if(r.id==='payment'&&state.operationId)msg+=es?` Mi operación es ${state.operationId}.`:` My operation is ${state.operationId}.`;
+  return msg;
+}
+function contactSupport(channel){
+  if(!state.supportReason)return toast(t('support_pick_reason'));
+  const text=encodeURIComponent(supportMessage());
+  const url=channel==='telegram'?`https://t.me/pedritoficial?text=${text}`:`https://wa.me/5352677163?text=${text}`;
+  try{
+    if(channel==='telegram'&&tg?.openTelegramLink)return tg.openTelegramLink(url);
+    if(tg?.openLink)return tg.openLink(url);
+  }catch(_){}
+  window.open(url,'_blank','noopener');
+}
+function openSupport(){state.supportReason=null;renderSupportReasons();showScreen('supportScreen')}
+async function copyValue(text,message){
+  try{await navigator.clipboard.writeText(String(text).replace(/\s/g,''));toast(message)}
   catch(e){toast(state.language==='es'?'No se pudo copiar':'Could not copy')}
-};
-$('#imageInput').onchange=()=>openFile($('#imageInput'));$('#storyInput').onchange=()=>openFile($('#storyInput'));$('#uploadCard').onclick=e=>{if(!e.target.closest('button'))$('#imageInput').click()};$('#storyAdd').onclick=()=>$('#storyInput').click();$('#replaceImage').onclick=()=>$('#imageInput').click();$('#storyReplace').onclick=()=>$('#storyInput').click();$('#deleteImage').onclick=clearImage;$('#storyDelete').onclick=clearImage;$('#cropCancel').onclick=closeCrop;$('#cropClose').onclick=closeCrop;$('#cropUse').onclick=useCrop;$('#cropViewport').addEventListener('pointerdown',beginCrop);window.addEventListener('pointermove',moveCrop);window.addEventListener('pointerup',endCrop);window.addEventListener('resize',syncCrop);$('#analyzeButton').onclick=analyze;$('#storyAnalyze').onclick=analyze;$('#refreshUsage').onclick=refreshUsage;$('#storyRefreshUsage').onclick=refreshUsage;$('#settingsButton').onclick=settings;$('#backFromSettings').onclick=goBack;$('#profilePremiumButton').onclick=()=>showPremium();$('#backFromPremium').onclick=goBack;$('#backFromTransfers').onclick=goBack;$('#startPayment').onclick=()=>showPaymentMethods();$('#continuePaymentMethod').onclick=createPayment;$('#backFromPaymentMethods').onclick=goBack;$('#restartPayment').onclick=()=>createPayment();$('#submitProof').onclick=submitProof;$('#paymentProofFile').onchange=()=>{const f=$('#paymentProofFile').files?.[0];if($('#proofFileName'))$('#proofFileName').textContent=f?f.name:(state.language==='es'?'Opcional · JPG/PNG':'Optional · JPG/PNG')};$('#cancelPayment').onclick=()=>cancelPayment().catch(e=>toast(e.message));$('#resultClose').onclick=()=>$('#resultModal').classList.add('hidden');$('#anotherAnalysis').onclick=()=>{$('#resultModal').classList.add('hidden');clearImage()};async function copyText(text,label){try{await navigator.clipboard.writeText(text);$('#copyStatus').textContent=label+' copiada'}catch(e){toast(state.language==='es'?'No se pudo copiar':'Copy failed')}}$('#copyResponse').onclick=()=>copyText($('#replyOutput').textContent,'Respuesta #1');$('#copyAllResponse').onclick=()=>copyText($('#replyOutput').textContent,'Respuesta #1');$('#copyResponse2').onclick=()=>copyText($('#replyOutput2').textContent,'Respuesta #2');$('#copyRetryResponse1').onclick=()=>copyText($('#retryReplyOutput1').textContent,'Respuesta #3');$('#copyRetryResponse2').onclick=()=>copyText($('#retryReplyOutput2').textContent,'Respuesta #4');$('#retryAnalysis').onclick=async()=>{if(state.retryUsed)return toast('Ya utilizaste el reintento de este análisis');if(!state.lastAnalysisId||!state.lastAnalysisImage)return toast('No hay un análisis válido para reintentar');const b=$('#retryAnalysis');b.disabled=true;b.textContent='🔄 Generando…';try{const check=await fetch('/api/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({analysis_id:state.lastAnalysisId,text:state.lastAnalysisText})});const data=await check.json();if(!check.ok){state.retryUsed=true;b.textContent='Reintento no disponible';throw new Error(data.detail||'No se pudo validar el reintento')}state.retryUsed=true;state.lastGenerationKey=null;const next=await generate(state.lastAnalysisText,state.lastAnalysisImage);const next2=state.lastReply2||makeAlternative(next);$('#retryReplyOutput1').textContent=next||'—';$('#retryReplyOutput2').textContent=next2||'—';$('#retryProviderOutput1').textContent=state.lastProvider||'Proveedor no informado';$('#retryProviderOutput2').textContent=state.lastProvider||'Proveedor no informado';$('#retryAnswerBlock1').classList.remove('hidden');$('#retryAnswerBlock2').classList.remove('hidden');b.textContent='Reintento utilizado';b.disabled=true;$('#copyStatus').textContent='Se añadieron dos respuestas nuevas; las originales se conservaron.'}catch(e){state.retryUsed=true;b.disabled=true;b.textContent='Reintento utilizado';toast(e.message||'Error')}};$$('.segment').forEach(b=>b.onclick=()=>setModule(b.dataset.module));$$('.nav-item').forEach(b=>b.onclick=()=>b.dataset.nav==='profile'?profile():home());$$('.plan').forEach(b=>b.onclick=()=>{$$('.plan').forEach(x=>x.classList.remove('selected'));b.classList.add('selected');state.plan=b.dataset.plan});$('#languageButton').onclick=()=>{state.language=state.language==='es'?'en':'es';localStorage.setItem('liggacuba_lang',state.language);applyLanguage();loadPaymentPricing();loadProfile()};$('#contactButton').onclick=()=>$('#supportModal').classList.remove('hidden');$('#supportClose').onclick=()=>$('#supportModal').classList.add('hidden');$$('.support-link').forEach(b=>b.onclick=()=>window.open(b.dataset.support==='telegram'?'https://t.me/pedritoficial':'https://wa.me/5352677163','_blank'));$('#moreButton').onclick=more;$('#moreBack').onclick=goBack;
+}
+$('#copyPaymentValue').onclick=()=>copyValue($('#paymentDestination').textContent,t('destination_copied')+': '+$('#paymentDestination').textContent.trim());
+$('#copyConfirmNumber').onclick=()=>copyValue($('#paymentConfirmNumber').textContent,t('number_copied')+': '+$('#paymentConfirmNumber').textContent.trim());
+$('#openProof').onclick=()=>showScreen('proofScreen');
+$('#backFromProof').onclick=goBack;
+$('#imageInput').onchange=()=>openFile($('#imageInput'));$('#storyInput').onchange=()=>openFile($('#storyInput'));$('#uploadCard').onclick=e=>{if(!e.target.closest('button'))$('#imageInput').click()};$('#storyAdd').onclick=()=>$('#storyInput').click();$('#replaceImage').onclick=()=>$('#imageInput').click();$('#storyReplace').onclick=()=>$('#storyInput').click();$('#deleteImage').onclick=clearImage;$('#storyDelete').onclick=clearImage;$('#cropCancel').onclick=closeCrop;$('#cropClose').onclick=closeCrop;$('#cropUse').onclick=useCrop;$('#cropViewport').addEventListener('pointerdown',beginCrop);window.addEventListener('pointermove',moveCrop);window.addEventListener('pointerup',endCrop);window.addEventListener('resize',syncCrop);$('#analyzeButton').onclick=analyze;$('#storyAnalyze').onclick=analyze;$('#refreshUsage').onclick=refreshUsage;$('#storyRefreshUsage').onclick=refreshUsage;$('#settingsButton').onclick=settings;$('#backFromSettings').onclick=goBack;$('#profilePremiumButton').onclick=()=>showPremium();$('#backFromPremium').onclick=goBack;$('#backFromTransfers').onclick=goBack;$('#startPayment').onclick=()=>showPaymentMethods();$('#continuePaymentMethod').onclick=createPayment;$('#backFromPaymentMethods').onclick=goBack;$('#restartPayment').onclick=()=>createPayment();$('#submitProof').onclick=submitProof;$('#paymentProofFile').onchange=()=>{const f=$('#paymentProofFile').files?.[0];if($('#proofFileName'))$('#proofFileName').textContent=f?f.name:(state.language==='es'?'Opcional · JPG/PNG':'Optional · JPG/PNG')};$('#cancelPayment').onclick=()=>cancelPayment().catch(e=>toast(e.message));$('#resultClose').onclick=()=>$('#resultModal').classList.add('hidden');$('#anotherAnalysis').onclick=()=>{$('#resultModal').classList.add('hidden');clearImage()};async function copyText(text,label){try{await navigator.clipboard.writeText(text);$('#copyStatus').textContent=label+' copiada'}catch(e){toast(state.language==='es'?'No se pudo copiar':'Copy failed')}}$('#copyResponse').onclick=()=>copyText($('#replyOutput').textContent,'Respuesta #1');$('#copyAllResponse').onclick=()=>copyText($('#replyOutput').textContent,'Respuesta #1');$('#copyResponse2').onclick=()=>copyText($('#replyOutput2').textContent,'Respuesta #2');$('#copyRetryResponse1').onclick=()=>copyText($('#retryReplyOutput1').textContent,'Respuesta #3');$('#copyRetryResponse2').onclick=()=>copyText($('#retryReplyOutput2').textContent,'Respuesta #4');$('#retryAnalysis').onclick=async()=>{if(state.retryUsed)return toast('Ya utilizaste el reintento de este análisis');if(!state.lastAnalysisId||!state.lastAnalysisImage)return toast('No hay un análisis válido para reintentar');const b=$('#retryAnalysis');b.disabled=true;b.textContent='🔄 Generando…';try{const check=await fetch('/api/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({analysis_id:state.lastAnalysisId,text:state.lastAnalysisText})});const data=await check.json();if(!check.ok){state.retryUsed=true;b.textContent='Reintento no disponible';throw new Error(data.detail||'No se pudo validar el reintento')}state.retryUsed=true;state.lastGenerationKey=null;const next=await generate(state.lastAnalysisText,state.lastAnalysisImage);const next2=state.lastReply2||makeAlternative(next);$('#retryReplyOutput1').textContent=next||'—';$('#retryReplyOutput2').textContent=next2||'—';$('#retryProviderOutput1').textContent=state.lastProvider||'Proveedor no informado';$('#retryProviderOutput2').textContent=state.lastProvider||'Proveedor no informado';$('#retryAnswerBlock1').classList.remove('hidden');$('#retryAnswerBlock2').classList.remove('hidden');b.textContent='Reintento utilizado';b.disabled=true;$('#copyStatus').textContent='Se añadieron dos respuestas nuevas; las originales se conservaron.'}catch(e){state.retryUsed=true;b.disabled=true;b.textContent='Reintento utilizado';toast(e.message||'Error')}};$$('.segment').forEach(b=>b.onclick=()=>setModule(b.dataset.module));$$('.nav-item').forEach(b=>b.onclick=()=>b.dataset.nav==='profile'?profile():home());$$('.plan').forEach(b=>b.onclick=()=>{$$('.plan').forEach(x=>x.classList.remove('selected'));b.classList.add('selected');state.plan=b.dataset.plan});$('#languageButton').onclick=()=>{state.language=state.language==='es'?'en':'es';localStorage.setItem('liggacuba_lang',state.language);applyLanguage();loadPaymentPricing();loadProfile();if(!$('#supportScreen').classList.contains('hidden'))renderSupportReasons()};$('#contactButton').onclick=openSupport;$('#supportBack').onclick=goBack;$('#supportTelegram').onclick=()=>contactSupport('telegram');$('#supportWhatsapp').onclick=()=>contactSupport('whatsapp');$('#moreButton').onclick=more;$('#moreBack').onclick=goBack;
 applyLanguage();loadPaymentPricing();auth();setTimeout(()=>{$('#splash').classList.add('hidden');$('#app').classList.remove('hidden')},650);

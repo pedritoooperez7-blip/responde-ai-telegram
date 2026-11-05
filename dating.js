@@ -17,10 +17,10 @@
       intro_title: 'Conoce gente nueva', intro_text: 'Dale like a quien te guste. Si hay match, hablan por Telegram o WhatsApp: en LiggaCuba no hay chat interno.',
       intro_1: 'Solo mayores de 18 años', intro_2: 'Tu contacto lo ven únicamente tus matches', intro_3: 'Todas las fotos se revisan antes de publicarse',
       create_profile: 'Crear mi perfil', edit_profile: 'Editar perfil', save: 'Guardar', saving: 'Guardando…', cancel: 'Cancelar', back: 'Atrás',
-      name: 'Nombre', birth: 'Fecha de nacimiento', gender: 'Soy', looking: 'Quiero conocer', province: 'Provincia', municipality: 'Municipio (opcional)',
+      name: 'Nombre', birth: 'Fecha de nacimiento', gender: 'Soy', looking: 'Quiero conocer', province: 'Provincia', province_ph: 'Selecciona tu provincia', municipality: 'Municipio (opcional)',
       bio: 'Sobre mí', bio_help: 'Sin enlaces ni usuarios. Máximo 300 caracteres.', interests: 'Intereses (separados por comas)', age_range: 'Rango de edad que buscas',
       contact_title: 'Cómo te escriben tus matches', share_tg: 'Compartir mi usuario de Telegram', tg_missing: 'Tu cuenta de Telegram no tiene @usuario. Créalo en Ajustes de Telegram para poder compartirlo.',
-      whatsapp: 'WhatsApp (opcional, con código de país)', adult: 'Confirmo que soy mayor de 18 años', terms: 'Acepto los términos de Citas',
+      whatsapp: 'WhatsApp (opcional)', whatsapp_abroad: 'WhatsApp (opcional, con código de país)', retry: 'Reintentar', adult: 'Confirmo que soy mayor de 18 años', terms: 'Acepto los términos de Citas',
       terms_link: 'Ver términos', hombre: 'Hombre', mujer: 'Mujer', otro: 'Otro', hombres: 'Hombres', mujeres: 'Mujeres', todos: 'Todos',
       pick: 'Selecciona…', profile_saved: 'Perfil guardado', need_photo: 'Sube al menos una foto para ver perfiles.',
       photos: 'Mis fotos', add_photo: 'Agregar foto', photo_pending: 'En revisión', photo_approved: 'Aprobada', photo_rejected: 'Rechazada', photo_delete: 'Eliminar foto',
@@ -47,10 +47,10 @@
       intro_title: 'Meet new people', intro_text: 'Like the people you want to meet. On a match you talk on Telegram or WhatsApp: LiggaCuba has no in-app chat.',
       intro_1: 'Adults 18+ only', intro_2: 'Only your matches can see your contact', intro_3: 'Every photo is reviewed before it goes live',
       create_profile: 'Create my profile', edit_profile: 'Edit profile', save: 'Save', saving: 'Saving…', cancel: 'Cancel', back: 'Back',
-      name: 'Name', birth: 'Date of birth', gender: 'I am', looking: 'I want to meet', province: 'Province', municipality: 'Municipality (optional)',
+      name: 'Name', birth: 'Date of birth', gender: 'I am', looking: 'I want to meet', province: 'Province', province_ph: 'Select your province', municipality: 'Municipality (optional)',
       bio: 'About me', bio_help: 'No links or usernames. 300 characters max.', interests: 'Interests (comma separated)', age_range: 'Age range you are looking for',
       contact_title: 'How your matches reach you', share_tg: 'Share my Telegram username', tg_missing: 'Your Telegram account has no @username. Create one in Telegram settings to share it.',
-      whatsapp: 'WhatsApp (optional, with country code)', adult: 'I confirm I am 18 or older', terms: 'I accept the Dating terms',
+      whatsapp: 'WhatsApp (optional)', whatsapp_abroad: 'WhatsApp (optional, with country code)', retry: 'Retry', adult: 'I confirm I am 18 or older', terms: 'I accept the Dating terms',
       terms_link: 'View terms', hombre: 'Man', mujer: 'Woman', otro: 'Other', hombres: 'Men', mujeres: 'Women', todos: 'Everyone',
       pick: 'Select…', profile_saved: 'Profile saved', need_photo: 'Upload at least one photo to see profiles.',
       photos: 'My photos', add_photo: 'Add photo', photo_pending: 'In review', photo_approved: 'Approved', photo_rejected: 'Rejected', photo_delete: 'Delete photo',
@@ -77,7 +77,10 @@
     return s;
   };
 
-  const D = { cfg: null, me: null, tab: 'discover', feed: [], photoIdx: 0, busy: false, likesInfo: null, lastSwiped: false };
+  const ABROAD = 'Fuera de Cuba';
+  // Móvil cubano: 8 dígitos (el +53 se pone solo). Acepta pegar el número con 53 delante.
+  const cubaLocal = (v) => { let d = String(v || '').replace(/\D/g, ''); if (d.length > 8 && d.startsWith('53')) d = d.slice(2); return d.slice(0, 8); };
+  const D = { cfg: null, warm: null, me: null, tab: 'discover', feed: [], photoIdx: 0, busy: false, likesInfo: null, lastSwiped: false };
   const root = () => $('#datingBody');
   // replaceChildren() convierte null y arreglos en texto ("null", "[object HTMLDivElement]"): se aplanan y filtran antes.
   const setBody = (...kids) => root().replaceChildren(...kids.flat(Infinity).filter(k => k != null && k !== false));
@@ -123,20 +126,48 @@
 
   // ---- navegación -------------------------------------------------------
   function hideOthers() {
-    ['#homeScreen', '#profileScreen', '#settingsScreen', '#moreScreen', '#premiumScreen', '#transferScreen', '#paymentMethodScreen'].forEach(s => $(s)?.classList.add('hidden'));
+    ['#homeScreen', '#profileScreen', '#settingsScreen', '#moreScreen', '#premiumScreen', '#transferScreen', '#paymentMethodScreen', '#proofScreen', '#supportScreen'].forEach(s => $(s)?.classList.add('hidden'));
     $('#datingScreen').classList.remove('hidden');
     $('.bottom-nav').classList.remove('hidden');
     $$('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.nav === 'dating'));
   }
+  // Las peticiones base se hacen en paralelo (antes eran 4 en cadena: config → me → feed → likes).
+  function startBase() {
+    const cfgP = D.cfg ? Promise.resolve(D.cfg)
+      : fetch('/api/dating/config').then(r => r.ok ? r.json() : Promise.reject(new Error(T('error'))));
+    return Promise.all([cfgP, jpost('/api/dating/me')]).then(([cfg, me]) => { D.cfg = cfg; D.me = me; return me; });
+  }
+  async function fetchFeedBundle() {
+    const [d, likes] = await Promise.all([jpost('/api/dating/feed'), jpost('/api/dating/likes').catch(() => null)]);
+    (d.profiles || []).slice(0, 2).forEach(p => { const u = safePhoto((p.photos || [])[0]); if (u) { const i = new Image(); i.src = u; } });  // precarga fotos
+    return { d, likes };
+  }
+  // Se llama al iniciar sesión: deja listos config, perfil y feed antes de que la persona abra Citas.
+  function warmDating() {
+    if (D.warm && Date.now() - D.warm.at < 60000) return;
+    const base = startBase();
+    const feed = base.then(me => (me.profile && me.profile.status !== 'suspended') ? fetchFeedBundle() : null).catch(() => null);
+    D.warm = { at: Date.now(), base, feed };
+    base.catch(() => { D.warm = null; });
+  }
+  const entryTab = () => { D.tab = D.me.profile ? (['intro', 'form'].includes(D.tab) ? 'discover' : D.tab) : 'intro'; };
   async function openDating() {
     hideOthers();
+    const warm = D.warm && Date.now() - D.warm.at < 60000 ? D.warm : null;
+    if (D.cfg && D.me) {           // ya hay datos: se pinta al instante y se refresca en segundo plano
+      entryTab(); render();
+      if (!warm) startBase().catch(() => {});
+      return;
+    }
     setBody(el('p', { class: 'd-muted', text: T('loading') }));
     try {
-      if (!D.cfg) D.cfg = await (await fetch('/api/dating/config')).json();
-      D.me = await jpost('/api/dating/me');
-      D.tab = D.me.profile ? (['intro', 'form'].includes(D.tab) ? 'discover' : D.tab) : 'intro';
-      render();
-    } catch (e) { setBody(el('p', { class: 'd-muted', text: e.message || T('error') })); }
+      await (warm ? warm.base : startBase());
+      entryTab(); render();
+    } catch (e) {
+      D.warm = null;
+      setBody(el('p', { class: 'd-muted', text: e.message || T('error') }),
+        el('button', { class: 'secondary', type: 'button', text: T('retry'), onclick: openDating }));
+    }
   }
   function render() {
     $('#datingScreen').classList.remove('wz-on');
@@ -214,7 +245,7 @@
       ages_t: '¿Qué rango de edad te interesa?', ages_s: 'Solo verás personas dentro de este rango (y ellas deben encajar con tu edad).', ages_bad: 'La edad mínima no puede ser mayor que la máxima (entre 18 y 99).',
       loc_t: '¿Dónde vives?', loc_s: 'Mostramos primero a quienes viven cerca de ti.', loc_pick: 'Elige tu provincia.',
       about_t: 'Cuéntanos algo de ti', about_s: 'Opcional. Sin enlaces ni @usuarios: tu contacto solo lo ven tus matches.',
-      contact_t: '¿Cómo te escriben tus matches?', contact_s: 'Solo lo verán las personas con las que hagas match. Elige al menos un canal.', contact_bad: 'Elige Telegram o escribe un WhatsApp válido (con código de país).',
+      contact_t: '¿Cómo te escriben tus matches?', contact_s: 'Solo lo verán las personas con las que hagas match. Elige al menos un canal.', contact_bad: 'Elige Telegram o escribe un WhatsApp válido (con código de país).', contact_bad_cu: 'Escribe un número de WhatsApp cubano válido: 8 dígitos, empieza por 5.',
       legal_t: 'Último paso', legal_s: 'Confirma estas dos cosas para crear tu perfil.', legal_bad: 'Debes confirmar las dos casillas.',
       sum_t: 'Tu perfil de Citas', sum_s: 'Toca una sección para cambiarla.', n_answers: '{n} respuestas', cancel: 'Cancelar',
       done_t: '¡Tu perfil está listo!', done_s: 'Último paso: sube tus fotos. Se revisan antes de que tu perfil aparezca para otras personas.', add_photos: 'Agregar fotos',
@@ -232,7 +263,7 @@
       ages_t: 'What age range interests you?', ages_s: 'You will only see people in this range (and they must fit your age).', ages_bad: 'Minimum age cannot be higher than maximum (18 to 99).',
       loc_t: 'Where do you live?', loc_s: 'We show people who live near you first.', loc_pick: 'Choose your province.',
       about_t: 'Tell us about yourself', about_s: 'Optional. No links or @usernames: only your matches see your contact.',
-      contact_t: 'How should your matches reach you?', contact_s: 'Only people you match with will see it. Pick at least one channel.', contact_bad: 'Pick Telegram or enter a valid WhatsApp number (with country code).',
+      contact_t: 'How should your matches reach you?', contact_s: 'Only people you match with will see it. Pick at least one channel.', contact_bad: 'Pick Telegram or enter a valid WhatsApp number (with country code).', contact_bad_cu: 'Enter a valid Cuban WhatsApp number: 8 digits, starting with 5.',
       legal_t: 'Last step', legal_s: 'Confirm these two things to create your profile.', legal_bad: 'You must tick both boxes.',
       sum_t: 'Your Dating profile', sum_s: 'Tap a section to change it.', n_answers: '{n} answers', cancel: 'Cancel',
       done_t: 'Your profile is ready!', done_s: 'Last step: add your photos. They are reviewed before your profile shows to other people.', add_photos: 'Add photos',
@@ -352,8 +383,9 @@
       }
       case 'ages': { const lo = Number(a.min_age), hi = Number(a.max_age); return lo >= 18 && hi <= 99 && lo <= hi ? { ok: true } : { ok: false, msg: X('ages_bad') }; }
       case 'location': return a.province ? { ok: true } : { ok: false, msg: '' };
-      case 'contact': { const digits = String(a.whatsapp || '').replace(/\D/g, ''); const wa = digits.length >= 8 && digits.length <= 15;
-        return (a.share_telegram && tgUser()) || wa ? { ok: true } : { ok: false, msg: (a.whatsapp || a.share_telegram) ? X('contact_bad') : '' }; }
+      case 'contact': { const digits = String(a.whatsapp || '').replace(/\D/g, ''); const abroad = a.province === ABROAD;
+        const wa = abroad ? (digits.length >= 8 && digits.length <= 15) : /^535\d{7}$/.test(digits);
+        return (a.share_telegram && tgUser()) || wa ? { ok: true } : { ok: false, msg: (a.whatsapp || a.share_telegram) ? X(abroad ? 'contact_bad' : 'contact_bad_cu') : '' }; }
       case 'legal': return a.confirm_adult && a.accept_terms ? { ok: true } : { ok: false, msg: '' };
       default: return { ok: true };
     }
@@ -412,11 +444,13 @@
     if (s.kind === 'location') {
       const muni = el('input', { type: 'text', maxlength: 60, placeholder: T('municipality_ph'), value: a.municipality || '' });
       muni.oninput = () => { a.municipality = muni.value; wzPersist(); };
-      const chips = el('div', { class: 'df-chips', role: 'radiogroup' });
-      const paint = () => chips.querySelectorAll('button').forEach(b => { const on = b.dataset.v === a.province; b.classList.toggle('on', on); b.setAttribute('aria-pressed', on ? 'true' : 'false'); });
-      D.cfg.provinces.forEach(pv => chips.append(el('button', { class: 'df-chip', type: 'button', 'data-v': pv, text: pv, onclick: () => { a.province = pv; paint(); refresh(); wzPersist(); } })));
-      paint();
-      return el('div', { class: 'wz-stack' }, chips, el('label', { class: 'df-field wz-field' }, el('span', { class: 'df-label', text: T('municipality') }), muni));
+      const sel = el('select', { 'aria-label': T('province') }, el('option', { value: '', text: T('province_ph') }));
+      D.cfg.provinces.forEach(pv => sel.append(el('option', { value: pv, text: pv })));
+      sel.value = a.province || '';
+      sel.onchange = () => { a.province = sel.value; refresh(); wzPersist(); };
+      return el('div', { class: 'wz-stack' },
+        el('label', { class: 'df-field wz-field' }, el('span', { class: 'df-label', text: T('province') }), el('div', { class: 'df-select' }, sel)),
+        el('label', { class: 'df-field wz-field' }, el('span', { class: 'df-label', text: T('municipality') }), muni));
     }
     if (s.kind === 'about') {
       const maxBio = D.cfg.max_bio; const counter = el('small', { class: 'df-counter' });
@@ -435,12 +469,22 @@
       const username = tgUser();
       const tgCheck = el('input', { type: 'checkbox', checked: !!(a.share_telegram && username), disabled: !username });
       tgCheck.onchange = () => { a.share_telegram = tgCheck.checked; refresh(); wzPersist(); };
-      const wa = el('input', { type: 'tel', inputmode: 'tel', placeholder: '+53 5xxxxxxx', value: a.whatsapp || '' });
-      wa.oninput = () => { a.whatsapp = wa.value; refresh(); wzPersist(); };
+      const abroad = a.province === ABROAD;
+      let waField;
+      if (abroad) {
+        const wa = el('input', { type: 'tel', inputmode: 'tel', placeholder: '+1 305 555 0100', value: a.whatsapp || '' });
+        wa.oninput = () => { a.whatsapp = wa.value; refresh(); wzPersist(); };
+        waField = el('label', { class: 'df-field wz-field' }, el('span', { class: 'df-label', text: T('whatsapp_abroad') }), wa);
+      } else {
+        const wa = el('input', { type: 'tel', inputmode: 'numeric', placeholder: '5xxxxxxx', autocomplete: 'tel-national', value: cubaLocal(a.whatsapp) });
+        wa.oninput = () => { const local = cubaLocal(wa.value); if (wa.value !== local) wa.value = local; a.whatsapp = local ? '53' + local : ''; refresh(); wzPersist(); };
+        waField = el('label', { class: 'df-field wz-field' }, el('span', { class: 'df-label', text: T('whatsapp') }),
+          el('div', { class: 'wa-input' }, el('span', { class: 'wa-prefix', text: '🇨🇺 +53' }), wa));
+      }
       return el('div', { class: 'wz-stack' },
         el('label', { class: 'd-check wz-card' }, tgCheck, el('span', { text: T('share_tg') + (username ? ' (@' + username + ')' : '') })),
         username ? null : el('small', { class: 'd-muted', text: T('tg_missing') }),
-        el('label', { class: 'df-field wz-field' }, el('span', { class: 'df-label', text: T('whatsapp') }), wa));
+        waField);
     }
     if (s.kind === 'legal') {
       const adult = el('input', { type: 'checkbox', checked: !!a.confirm_adult }); adult.onchange = () => { a.confirm_adult = adult.checked; refresh(); };
@@ -639,9 +683,13 @@
 
   // ---- descubrir --------------------------------------------------------
   async function loadFeed() {
-    const d = await jpost('/api/dating/feed');
+    let bundle = null;
+    if (D.warm && D.warm.feed && Date.now() - D.warm.at < 60000) { bundle = await D.warm.feed; }   // feed precargado (se usa una sola vez)
+    if (D.warm) D.warm.feed = null;
+    if (!bundle) bundle = await fetchFeedBundle();
+    const d = bundle.d;
     D.feed = d.profiles || []; D.photoIdx = 0; D.premium = !!d.premium; D.likesLeft = d.likes_left;
-    try { D.likesInfo = await jpost('/api/dating/likes'); } catch (_) { D.likesInfo = null; }
+    D.likesInfo = bundle.likes;
   }
   async function renderDiscover() {
     if (!D.feed.length) {
@@ -780,4 +828,5 @@
   const nav = $('[data-nav="dating"]');
   if (nav) nav.onclick = openDating;
   window.openDating = openDating;
+  window.warmDating = warmDating;
 })();

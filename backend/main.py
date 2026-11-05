@@ -39,6 +39,18 @@ def _default_cors_origins() -> list:
     return found
 
 
+from starlette.middleware.gzip import GZipMiddleware
+
+
+class _SelectiveGZip(GZipMiddleware):
+    """Comprime JS/CSS/JSON; las fotos JPEG ya vienen comprimidas y se sirven tal cual."""
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and str(scope.get("path", "")).startswith("/api/dating/photo/"):
+            return await self.app(scope, receive, send)
+        await super().__call__(scope, receive, send)
+
+
+app.add_middleware(_SelectiveGZip, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins or _default_cors_origins() or ["*"],
@@ -1487,14 +1499,40 @@ def normalize_payment_phone(value: str) -> str:
     return digits
 
 
+def _active_payment_operation(uid: str):
+    c = db()
+    try:
+        return c.execute(
+            "SELECT operation_id FROM payment_operations WHERE user_id=? AND status IN ('pending','proof_submitted') LIMIT 1",
+            (uid,),
+        ).fetchone()
+    finally:
+        c.close()
+
+
+_PHONE_LOCKED_MSG = "Tienes una operación de pago activa. Cancélala antes de cambiar o borrar tu número."
+
+
 @app.post("/api/payment-phone")
 def payment_phone(p: PaymentPhone, request: Request):
     uid = current_user(request)
     phone = normalize_payment_phone(p.phone or "")
     if len(phone) < 8 or len(phone) > 15:
         raise HTTPException(400, "Número de teléfono inválido")
+    current = str(user(uid).get("payment_phone") or "")
+    if phone != current and _active_payment_operation(uid):
+        raise HTTPException(409, _PHONE_LOCKED_MSG)
     user(uid, {"payment_phone": phone})
     return {"success": True, "payment_phone": phone}
+
+
+@app.post("/api/payment-phone/delete")
+def payment_phone_delete(request: Request):
+    uid = current_user(request)
+    if _active_payment_operation(uid):
+        raise HTTPException(409, _PHONE_LOCKED_MSG)
+    user(uid, {"payment_phone": ""})
+    return {"success": True, "payment_phone": ""}
 
 
 @app.post("/api/atajo-pago")

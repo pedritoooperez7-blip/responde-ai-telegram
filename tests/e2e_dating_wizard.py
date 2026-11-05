@@ -84,15 +84,19 @@ with sync_playwright() as p:
     pg.click('.wz-foot .primary'); pg.wait_for_timeout(200)
     print('stage:',pg.inner_text('.wz-top strong'),'|',pg.inner_text('.wz-title'))
     assert pg.is_disabled('.wz-foot .primary')
-    pg.click('.df-chip[data-v=Artemisa]'); pg.screenshot(path='/tmp/citas_shots/06_location.png')
+    pg.select_option('.df-select select','Artemisa'); pg.screenshot(path='/tmp/citas_shots/06_location.png')
     pg.click('.wz-foot .primary'); pg.wait_for_timeout(200)   # about omitir
     pg.fill('textarea','Me gusta el mar'); pg.click('.wz-foot .primary'); pg.wait_for_timeout(200)
-    pg.fill('input[type=tel]','+53 52677163'); pg.wait_for_timeout(100); pg.screenshot(path='/tmp/citas_shots/07_contact.png')
+    assert pg.inner_text('.wa-prefix').endswith('+53')
+    pg.fill('input[type=tel]','4123'); pg.wait_for_timeout(100); assert pg.is_disabled('.wz-foot .primary')   # no empieza por 5 / incompleto
+    pg.fill('input[type=tel]','5352677163'); pg.wait_for_timeout(100); assert pg.input_value('input[type=tel]')=='52677163'   # pegar con 53 -> se recorta
+    pg.screenshot(path='/tmp/citas_shots/07_contact.png')
     pg.click('.wz-foot .primary'); pg.wait_for_timeout(200)
     assert pg.is_disabled('.wz-foot .primary'); print('legal btn:',pg.inner_text('.wz-foot .primary'))
     for cb in pg.query_selector_all('.wz-card input[type=checkbox]'): cb.check()
     pg.screenshot(path='/tmp/citas_shots/08_legal.png')
     pg.click('.wz-foot .primary'); pg.wait_for_timeout(500)
+    assert state['posted']['whatsapp']=='5352677163', state['posted']['whatsapp']
     print('POST prefs:',state["posted"]["prefs"]); print('POST rest:',{k:v for k,v in state["posted"].items() if k!='prefs'})
     pg.screenshot(path='/tmp/citas_shots/09_done.png')
     assert 'listo' in pg.inner_text('.wz-title')

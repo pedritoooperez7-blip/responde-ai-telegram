@@ -115,3 +115,57 @@
 .wz-foot{position:sticky;bottom:calc(10px + env(safe-area-inset-bottom));z-index:5;margin-top:10px;padding:10px 0 4px;background:linear-gradient(to top,var(--bg) 75%,rgba(246,244,255,0))}.wz-foot .secondary{width:100%;margin-top:8px}
 .wz-sum{display:flex;align-items:center;gap:12px;background:#fff;border-radius:18px;padding:14px 16px;margin-top:10px;box-shadow:var(--shadow)}.wz-sum .grow{flex:1;min-width:0}.wz-sum strong,.wz-sum small{display:block}.wz-sum small{color:#5f5a6b;font-size:12px;margin-top:3px}.wz-sum .mini-btn{flex:none;padding:10px 16px}
 .wz-done{text-align:center;padding:10px 0 4px}.chip.match{background:#ffe6ef;color:#a3174c}
+
+/* ---- Selector de provincia (Citas) ---- */
+.df-select{position:relative}
+.df-select select{appearance:none;-webkit-appearance:none;padding-right:44px!important;cursor:pointer}
+.df-select::after{content:"";position:absolute;right:18px;top:50%;width:8px;height:8px;margin-top:-6px;border-right:2px solid var(--purple);border-bottom:2px solid var(--purple);transform:rotate(45deg);pointer-events:none}
+
+/* ---- WhatsApp con +53 fijo ---- */
+.wa-input{display:flex;align-items:stretch;border:1.5px solid var(--line);border-radius:14px;background:#faf9ff;overflow:hidden;transition:border-color .15s,box-shadow .15s}
+.wa-input:focus-within{border-color:var(--purple);background:#fff;box-shadow:0 0 0 4px rgba(77,53,255,.12)}
+.wa-prefix{display:flex;align-items:center;padding:0 12px;background:#eeeaff;color:var(--purple);font-weight:800;font-size:14px;white-space:nowrap}
+.df-field .wa-input input:not([type=checkbox]){border:0!important;border-radius:0!important;background:transparent!important;box-shadow:none!important;min-width:0;flex:1}
+
+/* ---- Filas copiables ---- */
+.payment-row.copyable{flex-direction:column;align-items:stretch;gap:6px}
+.payment-row.copyable .copy-row{justify-content:space-between}
+.payment-row.copyable .copy-row strong{font-size:14px;text-align:left;letter-spacing:.02em}
+.copy-btn i{margin-right:3px}
+
+/* ---- Entrada al envío de comprobante ---- */
+.proof-entry{margin-top:12px;padding:12px;border-radius:15px;background:#fff;border:1px solid var(--line)}
+.proof-entry p{margin:0 0 8px;font-size:12px;line-height:1.5;color:#51477b}
+.proof-entry .secondary{margin-top:0;color:var(--purple)}
+#proofScreen #proofSubmission{margin-top:4px}
+
+/* ---- Teléfono del perfil ---- */
+.phone-saved{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.phone-value{display:flex;align-items:center;gap:9px;font-size:15px}
+.phone-value i{color:var(--purple)}
+.phone-actions{display:flex;gap:7px}
+.copy-btn.danger{background:#fdecef;color:var(--danger)}
+
+/* ---- Soporte en pantalla completa ---- */
+.support-reasons{display:flex;flex-direction:column;gap:9px;margin-bottom:6px}
+.support-reason{width:100%;display:flex;align-items:center;gap:13px;padding:15px;border-radius:16px;background:#fff;border:1.5px solid transparent;box-shadow:var(--shadow);color:var(--text);font-weight:700;font-size:14px;text-align:left}
+.support-reason>span{flex:1}
+.support-reason>i:first-child{color:var(--purple);width:20px;text-align:center}
+.support-reason .tick{color:transparent;font-size:18px}
+.support-reason.on{border-color:var(--purple);background:#f4f1ff}
+.support-reason.on .tick{color:var(--purple)}
+.support-channels{display:flex;flex-direction:column;gap:9px}
+.support-channel{width:100%;display:flex;align-items:center;gap:13px;padding:14px 15px;border-radius:16px;background:#fff;box-shadow:var(--shadow);color:var(--text);text-align:left;font-weight:800;font-size:14px}
+.support-channel>span{flex:1;display:flex;flex-direction:column}
+.support-channel small{font-weight:500;color:var(--muted);font-size:12px}
+.support-channel>i:first-child{font-size:24px}
+.support-channel.tg>i:first-child{color:#229ed9}.support-channel.wa>i:first-child{color:#25d366}
+.support-channel>i:last-child{color:var(--muted);font-size:12px}
+.support-channel:disabled{opacity:.45}
+#supportScreen .payment-note{text-align:center;margin-top:12px}
+#supportScreen .subheading{margin:18px 0 8px}
+
+/* ---- Aviso de operación activa ---- */
+#activePaymentModal{z-index:130}
+#activePaymentModal .result-sheet{display:flex;flex-direction:column;gap:12px}
+#activePaymentModal .primary,#activePaymentModal .secondary{margin-top:0}
