@@ -23,13 +23,36 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CURRENCY = "CUP"
 DEFAULT_PRICES = {"weekly": 2500.0, "annual": 15500.0}
-VALID_PLANS = tuple(DEFAULT_PRICES)
+PREMIUM_PLANS = tuple(DEFAULT_PRICES)
 _PRICE_ENV = {"weekly": "PAYMENT_PRICE_WEEKLY", "annual": "PAYMENT_PRICE_ANNUAL"}
+
+# Planes de anuncio para negocios (se pagan igual que Premium, pero activan un
+# anuncio propio en lugar de Premium). Todos los importes salen de variables de
+# entorno ``AD_PRICE_*`` y estos son solo los valores por defecto.
+AD_PLAN_PREFIX = "ad_"
+AD_PLAN_DAYS = {"ad_daily": 1, "ad_weekly": 7, "ad_monthly": 30, "ad_annual": 365}
+AD_DEFAULT_PRICES = {"ad_daily": 750.0, "ad_weekly": 4500.0, "ad_monthly": 9000.0, "ad_annual": 17500.0}
+_PRICE_ENV.update({
+    "ad_daily": "AD_PRICE_DAILY", "ad_weekly": "AD_PRICE_WEEKLY",
+    "ad_monthly": "AD_PRICE_MONTHLY", "ad_annual": "AD_PRICE_ANNUAL",
+})
+PREMIUM_PLAN_DAYS = {"weekly": 7, "annual": 365}
+DEFAULT_PRICES_ALL = {**DEFAULT_PRICES, **AD_DEFAULT_PRICES}
+VALID_PLANS = tuple(DEFAULT_PRICES_ALL)
+
+
+def is_ad_plan(plan: str) -> bool:
+    return (plan or "").strip().lower() in AD_PLAN_DAYS
+
+
+def plan_days(plan: str) -> int:
+    plan = validate_plan(plan)
+    return AD_PLAN_DAYS.get(plan) or PREMIUM_PLAN_DAYS[plan]
 
 
 def validate_plan(plan: str) -> str:
     value = (plan or "").strip().lower()
-    if value not in DEFAULT_PRICES:
+    if value not in DEFAULT_PRICES_ALL:
         raise ValueError("Plan inválido")
     return value
 
@@ -48,15 +71,15 @@ def payment_price(plan: str) -> float:
     plan = validate_plan(plan)
     raw = (os.getenv(_PRICE_ENV[plan]) or "").strip()
     if not raw:
-        return DEFAULT_PRICES[plan]
+        return DEFAULT_PRICES_ALL[plan]
     try:
         value = round(float(raw.replace(",", ".")), 2)
     except (TypeError, ValueError):
         logger.warning("Invalid price configuration for %s; using the default", plan)
-        return DEFAULT_PRICES[plan]
+        return DEFAULT_PRICES_ALL[plan]
     if value <= 0:
         logger.warning("Non-positive price configuration for %s; using the default", plan)
-        return DEFAULT_PRICES[plan]
+        return DEFAULT_PRICES_ALL[plan]
     return value
 
 
@@ -116,3 +139,30 @@ def expected_values(operation: Mapping[str, Any], currency: str | None = None) -
     suffix = display.strip().split()[-1].upper() if display.strip() else ""
     legacy_currency = suffix if len(suffix) == 3 and suffix.isalpha() else configured
     return value, legacy_currency
+
+
+def ad_pricing() -> dict:
+    """Precios de anuncios con el ahorro frente a pagar solo planes diarios.
+
+    El ahorro se calcula contra ``ad_daily * días``: es lo que costaría cubrir
+    el mismo periodo comprando día a día. El plan diario no tiene ahorro.
+    """
+    daily = payment_price("ad_daily")
+    currency = payment_currency()
+    out = {}
+    for plan, days in AD_PLAN_DAYS.items():
+        price = payment_price(plan)
+        baseline = round(daily * days, 2)
+        saved = max(0.0, round(baseline - price, 2))
+        percent = int(round(saved / baseline * 100)) if baseline > 0 and saved > 0 else 0
+        out[plan] = {
+            "amount_value": price,
+            "amount": format_amount(price, currency),
+            "days": days,
+            "per_day": format_amount(round(price / days, 2), currency),
+            "baseline_value": baseline,
+            "saved_value": saved,
+            "saved": format_amount(saved, currency) if saved else "",
+            "saved_percent": percent,
+        }
+    return out
