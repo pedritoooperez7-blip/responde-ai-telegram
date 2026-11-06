@@ -393,6 +393,30 @@ class TestPremiumAndRetries(unittest.TestCase):
         self.assertEqual(client.post('/api/retry',headers=headers,json=payload).status_code,409)
 
 
+    def test_four_replies_in_one_call_and_retry_serves_the_rest_without_ai(self):
+        from unittest.mock import patch
+        uid = 'four-replies-one-call'
+        headers = auth(uid)
+        created = client.post('/api/analyze', headers=headers, json={'user_id': uid, 'module': 'chat', 'mode': 'coquetear'})
+        self.assertEqual(created.status_code, 200, created.text)
+        aid = created.json()['analysis_id']
+        payload = {'user_id': uid, 'module': 'chat', 'mode': 'coquetear', 'text': '¿Qué haces hoy?', 'analysis_id': aid}
+        four = ['Podríamos hablar un rato.', '¿Tienes algún plan para hoy?', 'Cuéntame cómo va tu día', 'Me quedé con ganas de saber más']
+        with patch.object(main, 'ai_generate_reply', return_value={
+            'reply': four[0], 'alternative': four[1], 'replies': four, 'provider': 'test-provider',
+        }) as provider:
+            first = client.post('/api/generate-reply', headers=headers, json=payload)
+            self.assertEqual(first.status_code, 200, first.text)
+            body = first.json()
+            self.assertEqual((body['reply'], body['alternative']), (four[0], four[1]))
+            self.assertNotIn('replies', body)  # las respuestas 3 y 4 no viajan al cliente todavía
+            retry = client.post('/api/retry', headers=headers, json={'analysis_id': aid, 'text': payload['text']})
+            self.assertEqual(retry.status_code, 200, retry.text)
+            self.assertEqual(retry.json()['replies'], four[2:4])
+            self.assertFalse(retry.json()['needs_generation'])
+            self.assertEqual(provider.call_count, 1)  # el reintento no llamó otra vez a la IA
+        self.assertEqual(client.post('/api/retry', headers=headers, json={'analysis_id': aid, 'text': payload['text']}).status_code, 409)
+
     def test_retry_release_cannot_reset_a_successful_retry(self):
         from unittest.mock import patch
         uid = 'retry-release-abuse'
@@ -673,16 +697,29 @@ class TestAIReplyQualityHelpers(unittest.TestCase):
         prompt = ai_providers._build_prompt("coquetear", "chat")
         self.assertIn("mensajes más recientes", prompt)
         self.assertIn("No reinicies una conversación", prompt)
-        self.assertIn("DOS alternativas realmente distintas", prompt)
+        self.assertIn("CUATRO alternativas realmente distintas", prompt)
+        self.assertIn('{"replies":[', prompt)
 
     def test_parser_rejects_duplicate_replies(self):
         import ai_providers
         self.assertIsNone(ai_providers._parse_replies('{"reply":"Hola","alternative":"Hola"}'))
 
-    def test_parser_accepts_two_distinct_replies(self):
+    def test_parser_accepts_legacy_two_reply_format(self):
         import ai_providers
         result = ai_providers._parse_replies('{"reply":"¿A qué hora sales?","alternative":"¿Qué planes tienes después?"}')
         self.assertEqual(result, {"reply":"¿A qué hora sales?","alternative":"¿Qué planes tienes después?"})
+
+    def test_parser_accepts_four_distinct_replies(self):
+        import ai_providers
+        raw = '{"replies":["¿A qué hora sales?","¿Qué planes tienes después?","Cuéntame cómo te fue hoy","Me debes una salida, ¿cuándo?"]}'
+        result = ai_providers._parse_replies(raw)
+        self.assertEqual(len(result["replies"]), 4)
+        self.assertEqual(result["reply"], "¿A qué hora sales?")
+        self.assertEqual(result["alternative"], "¿Qué planes tienes después?")
+
+    def test_parser_rejects_extra_fields(self):
+        import ai_providers
+        self.assertIsNone(ai_providers._parse_replies('{"replies":["¿A qué hora sales?","¿Qué planes tienes después?"],"debug":"x"}'))
 
 
 class TestAIMonitorSecurity(unittest.TestCase):

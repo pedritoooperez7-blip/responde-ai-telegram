@@ -126,7 +126,7 @@
 
   // ---- navegación -------------------------------------------------------
   function hideOthers() {
-    ['#homeScreen', '#profileScreen', '#settingsScreen', '#moreScreen', '#premiumScreen', '#transferScreen', '#paymentMethodScreen', '#proofScreen', '#supportScreen'].forEach(s => $(s)?.classList.add('hidden'));
+    ['#homeScreen', '#profileScreen', '#settingsScreen', '#moreScreen', '#premiumScreen', '#transferScreen', '#paymentMethodScreen', '#proofScreen', '#supportScreen','#businessAdScreen'].forEach(s => $(s)?.classList.add('hidden'));
     $('#datingScreen').classList.remove('hidden');
     $('.bottom-nav').classList.remove('hidden');
     $$('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.nav === 'dating'));

@@ -10,11 +10,11 @@ from typing import Any, Dict, Optional
 from urllib.parse import parse_qs
 from starlette.concurrency import run_in_threadpool
 try:
-    from . import db as _db, limits as _limits, payments as _payments, dating as _dating, telegram_backup as _tgbackup
+    from . import db as _db, limits as _limits, payments as _payments, dating as _dating, telegram_backup as _tgbackup, ads as _ads
     from .ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
     from .telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo, send_document
 except ImportError:  # Support running uvicorn with backend/ as the working directory.
-    import db as _db, limits as _limits, payments as _payments, dating as _dating, telegram_backup as _tgbackup
+    import db as _db, limits as _limits, payments as _payments, dating as _dating, telegram_backup as _tgbackup, ads as _ads
     from ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
     from telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo, send_document
 logger = logging.getLogger(__name__)
@@ -408,6 +408,7 @@ def init_db():
             c.execute(sql)
         except sqlite3.OperationalError:
             pass
+    _ads.ensure_schema(c)
     # Safe additive migrations: SQLite ignores duplicate-column errors.
     for sql in (
         "ALTER TABLE analysis_attempts ADD COLUMN quota_log_id INTEGER",
@@ -415,6 +416,7 @@ def init_db():
         "ALTER TABLE analysis_attempts ADD COLUMN generation_calls INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE analysis_attempts ADD COLUMN updated_at TEXT",
         "ALTER TABLE analysis_attempts ADD COLUMN analysis_date TEXT",
+        "ALTER TABLE analysis_attempts ADD COLUMN replies_json TEXT",
         "ALTER TABLE ai_generation_events ADD COLUMN error_code TEXT",
         "ALTER TABLE ai_generation_events ADD COLUMN quality_score REAL",
         "ALTER TABLE ai_generation_events ADD COLUMN retry_number INTEGER NOT NULL DEFAULT 0",
@@ -594,7 +596,7 @@ def admin_identity(request: Request):
         raise HTTPException(503, "ADMIN_KEY no configurado en Railway")
     key = request.headers.get("x-admin-key", "")
     if key and hmac.compare_digest(key, ADMIN_KEY):
-        return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics", "dating"]}
+        return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics", "dating", "ads"]}
     auth = request.headers.get("authorization", "")
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
     if not token or "." not in token:
@@ -619,7 +621,7 @@ def admin_identity(request: Request):
             if int(session["expires_at"] or 0) < int(time.time()):
                 raise HTTPException(401, "Sesión administrativa expirada")
             if data.get("role") == "owner" and username == "owner":
-                return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics", "dating"]}
+                return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics", "dating", "ads"]}
             row = c.execute("SELECT * FROM admin_users WHERE username=? AND is_active=1", (username,)).fetchone()
             if not row:
                 raise HTTPException(401, "Administrador desactivado")
@@ -899,6 +901,8 @@ def admin_telegram_access(p: Usage, request: Request):
     return {"allowed": bool(uid in allowed), "url": "/admin.html" if uid in allowed else None}
 @app.get("/app.js")
 def js(): return FileResponse(os.path.join(ROOT,"app.js"),media_type="application/javascript")
+@app.get("/ads.js")
+def ads_js(): return FileResponse(os.path.join(ROOT,"ads.js"),media_type="application/javascript")
 @app.get("/dating.js")
 def dating_js(): return FileResponse(os.path.join(ROOT,"dating.js"),media_type="application/javascript")
 @app.get("/style.css")
@@ -907,6 +911,8 @@ def css(): return FileResponse(os.path.join(ROOT,"style.css"),media_type="text/c
 def logo(): return FileResponse(os.path.join(ROOT,"liggacuba-logo.jpg"),media_type="image/jpeg")
 @app.get("/privacy.html")
 def privacy(): return FileResponse(os.path.join(ROOT,"privacy.html"),media_type="text/html")
+@app.get("/rules.html")
+def content_rules(): return FileResponse(os.path.join(ROOT,"rules.html"),media_type="text/html")
 @app.get("/terms.html")
 def terms(): return FileResponse(os.path.join(ROOT,"terms.html"),media_type="text/html")
 @app.get("/health")
@@ -1158,6 +1164,8 @@ def generate(p: Generate, request: Request):
         reply_text = str(result.get("reply", ""))
         alternative_text = str(result.get("alternative", ""))
         quality_score = max(1, min(5, round((min(len(reply_text), 160) + min(len(alternative_text), 160)) / 64)))
+        all_replies=[str(x) for x in (result.get("replies") or [reply_text, alternative_text]) if str(x).strip()]
+        result={k:v for k,v in result.items() if k!="replies"}
         result={"success":True,**result,"model":result.get("model") or validate_provider_configuration().get(result.get("provider", ""), {}).get("model", "unknown"),"ocr_text":recognized,"ocr_fallback":bool(recognized),"quality_score":quality_score,"cache_hit":bool(cache_hit),"timings_ms":{**timings,"total_backend_ms":int((time.monotonic()-started)*1000)}}
         c=db(); c.execute("BEGIN IMMEDIATE")
         attempt=c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?",(aid,uid)).fetchone()
@@ -1175,6 +1183,8 @@ def generate(p: Generate, request: Request):
             c.execute("UPDATE users SET usage_today=?,last_reset_date=?,updated_at=? WHERE user_id=?", (used + 1, today(), now(), uid))
             quota_cursor = c.execute("INSERT INTO usage_logs(user_id,used_at,module,mode,premium_used) VALUES(?,?,?,?,0)", (uid, now(), module, mode))
             c.execute("UPDATE analysis_attempts SET quota_charged=1,quota_log_id=? WHERE id=? AND user_id=?", (quota_cursor.lastrowid, aid, uid))
+        if attempt and int(attempt["generation_count"] or 0)==0 and len(all_replies)>2:
+            c.execute("UPDATE analysis_attempts SET replies_json=? WHERE id=?",(json.dumps(all_replies,ensure_ascii=False),aid))
         c.execute("UPDATE analysis_attempts SET generation_count=generation_count+1,generation_in_progress=0,generation_started_at=NULL,updated_at=? WHERE id=?",(now(),aid))
         c.execute("UPDATE ai_idempotency SET status='completed',result_json=?,updated_at=? WHERE user_id=? AND idempotency_key=?",(json.dumps(result,ensure_ascii=False),now(),uid,key))
         c.commit(); c.close()
@@ -1225,7 +1235,15 @@ def reserve_retry(p: dict, request: Request):
         c.execute("BEGIN IMMEDIATE"); row=c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?",(aid,uid)).fetchone()
         if not row: raise HTTPException(404,"Análisis no encontrado")
         if int(row["retry_used"] or 0) or int(row["generation_in_progress"] or 0): raise HTTPException(409,"El reintento ya fue utilizado o hay una generación en curso")
-        c.execute("UPDATE analysis_attempts SET retry_used=1,updated_at=? WHERE id=?",(now(),aid)); c.commit(); return {"reserved":True,"analysis_id":aid}
+        extra=[]
+        try: stored=json.loads(row["replies_json"] or "[]")
+        except (TypeError, ValueError): stored=[]
+        if isinstance(stored,list): extra=[str(x) for x in stored[2:4] if str(x).strip()]
+        if len(extra)>=2:
+            # Las respuestas 3 y 4 ya llegaron en la llamada principal: no se vuelve a llamar a la IA.
+            c.execute("UPDATE analysis_attempts SET retry_used=1,retry_call_started=1,updated_at=? WHERE id=?",(now(),aid)); c.commit()
+            return {"reserved":True,"analysis_id":aid,"replies":extra,"needs_generation":False}
+        c.execute("UPDATE analysis_attempts SET retry_used=1,updated_at=? WHERE id=?",(now(),aid)); c.commit(); return {"reserved":True,"analysis_id":aid,"needs_generation":True}
     except HTTPException: c.rollback(); raise
     finally: c.close()
 
@@ -1668,7 +1686,7 @@ def atajo_pago(p: AtajoPayment, request: Request):
             }
 
         matched = candidates[0]
-        if matched["plan"] not in {"weekly", "annual"}:
+        if matched["plan"] not in _payments.VALID_PLANS:
             c.rollback()
             logger.error("Payment operation has invalid plan operation_id=%s", matched["operation_id"])
             return {"success": False, "status": "invalid_operation"}
@@ -1688,37 +1706,48 @@ def atajo_pago(p: AtajoPayment, request: Request):
             c.rollback()
             return {"success": False, "status": "already_processed"}
 
-        # Actualización de pago y Premium en la misma transacción.
-        user_row = c.execute(
-            "SELECT premium_until FROM users WHERE user_id=?",
-            (matched["user_id"],),
-        ).fetchone()
-        days = 7 if matched["plan"] == "weekly" else 365
-        base_time = datetime.now(timezone.utc)
-        current = user_row["premium_until"] if user_row else None
-        if current:
-            try:
-                base_time = max(base_time, _utc_datetime(current))
-            except (ValueError, TypeError):
-                pass
-        until = (base_time + timedelta(days=days)).isoformat()
-        c.execute(
-            "UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?",
-            (until, t, matched["user_id"]),
-        )
+        # Actualización de pago y Premium/anuncio en la misma transacción.
+        until = _apply_paid_plan(c, matched["user_id"], matched["plan"], t)
         c.commit()
-        return {
+        result = {
             "success": True,
             "status": "verified",
             "operation_id": matched["operation_id"],
             "user_id": matched["user_id"],
             "premium_until": until,
         }
+        if _payments.is_ad_plan(matched["plan"]):
+            result.pop("premium_until")
+            result["ad_paid_until"] = until
+            result["plan"] = matched["plan"]
+        return result
     except sqlite3.IntegrityError:
         c.rollback()
         return {"success": False, "status": "duplicate"}
     finally:
         c.close()
+
+def _apply_paid_plan(c, user_id, plan, t):
+    """Aplica un pago verificado dentro de la transacción ``c`` y devuelve la fecha de fin.
+
+    Premium suma días a ``users.premium_until``; un plan de anuncio suma días al
+    anuncio del negocio. En ambos casos se conservan los días ya pagados.
+    """
+    days = _payments.plan_days(plan)
+    if _payments.is_ad_plan(plan):
+        u = c.execute("SELECT first_name,username FROM users WHERE user_id=?", (str(user_id),)).fetchone()
+        name = ((u["first_name"] or u["username"] or "") if u else "")
+        return _ads.extend_business_subscription(c, str(user_id), days, name)
+    row = c.execute("SELECT premium_until FROM users WHERE user_id=?", (user_id,)).fetchone()
+    base = datetime.now(timezone.utc)
+    current = row["premium_until"] if row else None
+    if current:
+        try: base = max(base, _utc_datetime(current))
+        except (ValueError, TypeError): pass
+    until = (base + timedelta(days=days)).isoformat()
+    c.execute("UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?", (until, t, user_id))
+    return until
+
 
 @app.get("/api/payments/pricing")
 def payment_pricing():
@@ -1730,13 +1759,14 @@ def payment_pricing():
             "weekly": {"amount_value": _payments.verification_amount("weekly"), "amount": amount("weekly", "es"), "days": 7},
             "annual": {"amount_value": _payments.verification_amount("annual"), "amount": amount("annual", "es"), "days": 365},
         },
+        "ad_plans": _payments.ad_pricing(),
     }
 
 
 @app.post("/api/payments/pending")
 def pending(p: Pending, request: Request):
     uid = current_user(request)
-    if p.plan not in {"weekly", "annual"}:
+    if p.plan not in _payments.VALID_PLANS:
         raise HTTPException(400, "Plan inválido")
     method = (p.payment_method or "BANDEC").strip().upper()
     if method not in {"BANDEC", "BPA", "SALDO_MOVIL"}:
@@ -1921,7 +1951,7 @@ def admin_login(p: AdminLogin, request: Request):
         # be locked out by failed attempts from a shared or spoofed address.
         ADMIN_LOGIN_IP_LIMITER.reset(ip_key)
         username = "owner"
-        permissions = ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics", "dating"]
+        permissions = ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics", "dating", "ads"]
         ttl = OWNER_SESSION_TTL
     else:
         username_input = p.username.strip()
@@ -2020,7 +2050,7 @@ def admin_list(request:Request):
 def admin_create(p:AdminCreate, request:Request):
     ident=admin(request,"admins"); username=re.sub(r"[^a-zA-Z0-9_.-]","",p.username.strip())
     if len(username)<3 or len(p.password)<10: raise HTTPException(400,"Usuario mínimo 3 caracteres y contraseña mínimo 10")
-    allowed={"users","premium","payments","stats","audit","ai_analytics","dating"}; perms=sorted(set(p.permissions)&allowed)
+    allowed={"users","premium","payments","stats","audit","ai_analytics","dating","ads"}; perms=sorted(set(p.permissions)&allowed)
     if not perms: raise HTTPException(400,"Selecciona al menos un permiso")
     salt=os.urandom(16); digest=salt.hex()+":"+hashlib.pbkdf2_hmac("sha256",p.password.encode(),salt,180000).hex(); t=now(); c=db()
     try: c.execute("INSERT INTO admin_users(username,password_hash,permissions,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?)",(username,digest,json.dumps(perms),1,t,t)); c.commit()
@@ -2052,7 +2082,7 @@ def verify_payment(p:PaymentId, request:Request):
         if row["status"] not in {"pending","proof_submitted"}:
             c.rollback()
             raise HTTPException(409,"Operación no verificable o ya procesada")
-        if row["plan"] not in {"weekly", "annual"}:
+        if row["plan"] not in _payments.VALID_PLANS:
             c.rollback()
             raise HTTPException(409,"El plan de esta operación no es válido")
         # Reserve the operation atomically so a concurrent request cannot grant Premium twice.
@@ -2061,15 +2091,7 @@ def verify_payment(p:PaymentId, request:Request):
         if cur.rowcount != 1:
             c.rollback()
             raise HTTPException(409,"La operación ya está siendo procesada")
-        current_row=c.execute("SELECT premium_until FROM users WHERE user_id=?",(row["user_id"],)).fetchone()
-        current=current_row["premium_until"] if current_row else None
-        base=datetime.now(timezone.utc)
-        if current:
-            try: base=max(base,_utc_datetime(current))
-            except ValueError: pass
-        days=7 if row["plan"]=="weekly" else 365
-        until=(base+timedelta(days=days)).isoformat()
-        c.execute("UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?",(until,t,row["user_id"]))
+        until=_apply_paid_plan(c,row["user_id"],row["plan"],t)
         c.execute("UPDATE payment_operations SET status='verified',verified_at=?,updated_at=? WHERE operation_id=? AND status='processing'",(t,t,p.operation_id))
         c.commit()
     except HTTPException:
@@ -2079,8 +2101,10 @@ def verify_payment(p:PaymentId, request:Request):
         raise HTTPException(500,"No se pudo verificar el pago")
     finally:
         c.close()
-    audit(ident["username"],"payment_verified",p.operation_id,{"user_id":row["user_id"],"premium_until":until})
-    return {"success":True,"status":"verified","premium_until":until}
+    is_ad=_payments.is_ad_plan(row["plan"])
+    key="ad_paid_until" if is_ad else "premium_until"
+    audit(ident["username"],"payment_verified",p.operation_id,{"user_id":row["user_id"],key:until})
+    return {"success":True,"status":"verified",key:until,"plan":row["plan"]}
 
 @app.post("/api/admin/payments/reject")
 def reject_payment(p: PaymentReview, request:Request):
@@ -2356,4 +2380,9 @@ app.include_router(_dating.build_router(
     current_user=current_user, connect=db, is_premium=lambda uid: premium(uid), admin=admin, audit=audit,
     notify=_dating_notify, secret=_dating_secret, photos_dir=_dating_photos_dir,
     free_daily_likes=_env_int("DATING_FREE_DAILY_LIKES", 20),
+))
+
+app.include_router(_ads.build_router(
+    current_user=current_user, connect=db, is_premium=lambda uid: premium(uid), admin=admin, audit=audit,
+    payments=_payments,
 ))
