@@ -10,7 +10,7 @@ COPY backend/requirements.txt backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
 COPY backend/ backend/
-COPY index.html admin.html app.js dating.js ads.js style.css liggacuba-logo.jpg privacy.html terms.html rules.html ./
+COPY index.html admin.html app.js dating.js ads.js style.css liggacuba-logo.jpg privacy.html terms.html rules.html image-guide.html ./
 
 RUN rm -rf backend/__pycache__
 

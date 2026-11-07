@@ -10,11 +10,11 @@ from typing import Any, Dict, Optional
 from urllib.parse import parse_qs
 from starlette.concurrency import run_in_threadpool
 try:
-    from . import db as _db, limits as _limits, payments as _payments, dating as _dating, telegram_backup as _tgbackup, ads as _ads
+    from . import db as _db, limits as _limits, payments as _payments, dating as _dating, telegram_backup as _tgbackup, ads as _ads, cleanup as _cleanup
     from .ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
     from .telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo, send_document
 except ImportError:  # Support running uvicorn with backend/ as the working directory.
-    import db as _db, limits as _limits, payments as _payments, dating as _dating, telegram_backup as _tgbackup, ads as _ads
+    import db as _db, limits as _limits, payments as _payments, dating as _dating, telegram_backup as _tgbackup, ads as _ads, cleanup as _cleanup
     from ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
     from telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo, send_document
 logger = logging.getLogger(__name__)
@@ -182,7 +182,26 @@ def current_user(request: Request) -> str:
     auth = request.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         raise HTTPException(401, "Sesión requerida")
-    return verify_session(auth[7:].strip())
+    uid = verify_session(auth[7:].strip())
+    _reject_if_banned(uid)
+    return uid
+
+
+BANNED_MESSAGE = "Tu cuenta fue suspendida por administración."
+
+
+def _reject_if_banned(uid: str) -> None:
+    """403 si el usuario está baneado. Si la consulta falla, no bloquea (nunca tumbar el servicio por esto)."""
+    try:
+        c = db()
+        try:
+            banned = _cleanup.is_banned(c, uid)
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return
+    if banned:
+        raise HTTPException(403, BANNED_MESSAGE)
 
 
 def db():
@@ -409,6 +428,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
     _ads.ensure_schema(c)
+    _cleanup.ensure_schema(c)
     # Safe additive migrations: SQLite ignores duplicate-column errors.
     for sql in (
         "ALTER TABLE analysis_attempts ADD COLUMN quota_log_id INTEGER",
@@ -680,6 +700,29 @@ def purge_expired_records():
         raise
     finally:
         c.close()
+    _run_user_cleanup()
+
+
+def _admin_telegram_ids() -> set:
+    return {x.strip() for x in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if x.strip()}
+
+
+def _run_user_cleanup() -> None:
+    """Limpieza de usuarios inactivos/baneados/bots. Falla en silencio: la purga clásica no debe verse afectada."""
+    c = None
+    try:
+        c = db()
+        result = _cleanup.run_cleanup(
+            c, _dating_photos_dir(), protected=_admin_telegram_ids(),
+            on_delete=lambda uid, reason, counts: audit("sistema", "auto_delete_user", uid, {"reason": reason, **counts}),
+        )
+        if any(result.get(k) for k in ("inactive", "ghost", "banned", "payments_cancelled", "usage_logs")):
+            logger.warning("User cleanup result: %s", result)  # warning para que se vea en los logs de Railway
+    except Exception:
+        logger.warning("User cleanup failed; it will be retried on the next cycle", exc_info=True)
+    finally:
+        if c is not None:
+            c.close()
 
 def check_operational_configuration() -> list[str]:
     """Log-only warnings about operational settings; never aborts startup."""
@@ -911,6 +954,8 @@ def css(): return FileResponse(os.path.join(ROOT,"style.css"),media_type="text/c
 def logo(): return FileResponse(os.path.join(ROOT,"liggacuba-logo.jpg"),media_type="image/jpeg")
 @app.get("/privacy.html")
 def privacy(): return FileResponse(os.path.join(ROOT,"privacy.html"),media_type="text/html")
+@app.get("/image-guide.html")
+def image_guide(): return FileResponse(os.path.join(ROOT,"image-guide.html"),media_type="text/html")
 @app.get("/rules.html")
 def content_rules(): return FileResponse(os.path.join(ROOT,"rules.html"),media_type="text/html")
 @app.get("/terms.html")
@@ -1009,7 +1054,8 @@ def auth_telegram(p:TelegramAuth):
     if not u or not u.get("id"): raise HTTPException(401,"Autenticación requerida")
     if p.user_id and str(p.user_id) != str(u.get("id")):
         raise HTTPException(401,"El usuario no coincide con Telegram")
-    uid=str(u["id"]); user(uid,{"username":u.get("username"),"first_name":u.get("first_name"),"last_name":u.get("last_name")}); x=usage(uid)
+    uid=str(u["id"]); _reject_if_banned(uid)
+    user(uid,{"username":u.get("username"),"first_name":u.get("first_name"),"last_name":u.get("last_name")}); x=usage(uid)
     return {"success":True,"user_id":uid,"token":session_token(uid),**x}
 
 @app.post("/api/usage")
@@ -2022,8 +2068,41 @@ def admin_logout(request: Request):
 @app.get("/api/admin/users")
 def admin_users(request:Request, q:str=""):
     ident=admin(request,"users"); c=db(); term=f"%{q.strip()}%"
-    rows=c.execute("SELECT user_id,username,first_name,last_name,premium_until,payment_phone,created_at FROM users WHERE user_id LIKE ? OR username LIKE ? OR first_name LIKE ? ORDER BY created_at DESC LIMIT 200",(term,term,term)).fetchall(); c.close()
-    return {"items":[{**dict(r),"premium":bool(r["premium_until"] and _utc_datetime(r["premium_until"]) > _utc_datetime())} for r in rows]}
+    rows=c.execute("SELECT u.user_id,u.username,u.first_name,u.last_name,u.premium_until,u.payment_phone,u.created_at,b.banned_at FROM users u LEFT JOIN user_bans b ON b.user_id=u.user_id WHERE u.user_id LIKE ? OR u.username LIKE ? OR u.first_name LIKE ? ORDER BY u.created_at DESC LIMIT 200",(term,term,term)).fetchall(); c.close()
+    return {"items":[{**dict(r),"premium":bool(r["premium_until"] and _utc_datetime(r["premium_until"]) > _utc_datetime()),"banned":bool(r["banned_at"])} for r in rows]}
+
+class BanRequest(BaseModel): reason:str=""
+
+def _protected_target(uid:str):
+    if str(uid) in _admin_telegram_ids(): raise HTTPException(400,"No puedes banear ni borrar a un administrador")
+
+@app.post("/api/admin/users/{user_id}/ban")
+def admin_ban_user(user_id:str, p:BanRequest, request:Request):
+    ident=admin(request,"users"); _protected_target(user_id); c=db()
+    try:
+        res=_cleanup.ban_user(c,user_id,ident["username"],p.reason)
+    finally: c.close()
+    audit(ident["username"],"ban_user",user_id,{"reason":p.reason[:300]})
+    return {"success":True,**res}
+
+@app.post("/api/admin/users/{user_id}/unban")
+def admin_unban_user(user_id:str, request:Request):
+    ident=admin(request,"users"); c=db()
+    try:
+        was=_cleanup.unban_user(c,user_id)
+    finally: c.close()
+    if not was: raise HTTPException(404,"El usuario no está baneado")
+    audit(ident["username"],"unban_user",user_id,{})
+    return {"success":True,"user_id":str(user_id)}
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(user_id:str, request:Request):
+    ident=admin(request,"users"); _protected_target(user_id); c=db()
+    try:
+        counts=_cleanup.delete_user_data(c,user_id,_dating_photos_dir())
+    finally: c.close()
+    audit(ident["username"],"delete_user",user_id,counts)
+    return {"success":True,"user_id":str(user_id),"deleted":counts}
 
 @app.post("/api/admin/premium")
 def admin_premium(p:PremiumChange, request:Request):

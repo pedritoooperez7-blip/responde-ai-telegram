@@ -35,8 +35,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 try:
     from . import limits as _limits
+    from . import storage as _storage
 except ImportError:  # uvicorn ejecutado con backend/ como directorio de trabajo
     import limits as _limits
+    import storage as _storage
 
 logger = logging.getLogger(__name__)
 
@@ -424,10 +426,13 @@ def add_photo(c: sqlite3.Connection, uid: str, photos_dir: str, jpeg: bytes, now
     position = c.execute("SELECT COALESCE(MAX(position),-1)+1 FROM dating_photos WHERE user_id=?", (uid,)).fetchone()[0]
     if count >= MAX_PHOTOS:
         raise DatingError(f"Máximo {MAX_PHOTOS} fotos.", 409, "photo_limit")
-    os.makedirs(photos_dir, exist_ok=True)
     filename = uuid.uuid4().hex + ".jpg"
-    with open(os.path.join(photos_dir, filename), "wb") as handle:
-        handle.write(jpeg)
+    # Con R2 configurado la foto va a la nube; si R2 falla o no está configurado, se guarda en disco
+    # (el servidor busca primero en disco y luego en R2, así que ambas ubicaciones conviven).
+    if not _storage.put(filename, jpeg):
+        os.makedirs(photos_dir, exist_ok=True)
+        with open(os.path.join(photos_dir, filename), "wb") as handle:
+            handle.write(jpeg)
     cur = c.execute(
         "INSERT INTO dating_photos(user_id,filename,position,status,created_at) VALUES(?,?,?,?,?)",
         (uid, filename, position, "pending", now or _now()),
@@ -446,6 +451,7 @@ def delete_photo(c: sqlite3.Connection, uid: str, photos_dir: str, photo_id: int
 
 
 def _remove_file(photos_dir: str, filename: str) -> None:
+    """Borra la foto de disco y de R2 (donde esté). Nunca lanza errores."""
     safe = os.path.basename(filename or "")
     if not safe:
         return
@@ -453,6 +459,19 @@ def _remove_file(photos_dir: str, filename: str) -> None:
         os.remove(os.path.join(photos_dir, safe))
     except OSError:
         pass
+    _storage.delete(safe)  # no-op si R2 no está configurado
+
+
+def read_photo_bytes(photos_dir: str, filename: str) -> Optional[bytes]:
+    """Lee una foto: primero disco (fotos antiguas), luego R2."""
+    safe = os.path.basename(filename or "")
+    if not safe:
+        return None
+    path = os.path.join(photos_dir, safe)
+    if os.path.isfile(path):
+        with open(path, "rb") as handle:
+            return handle.read()
+    return _storage.get(safe)
 
 
 def photo_signature(secret: str, photo_id: int, expires: int) -> str:
@@ -874,7 +893,7 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
                  free_daily_likes: int = 20):
     """Crea el APIRouter. ``main.py`` inyecta autenticación, base de datos y Telegram."""
     from fastapi import APIRouter, HTTPException, Request
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, Response
     from pydantic import BaseModel
 
     router = APIRouter()
@@ -1004,10 +1023,14 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
             c.close()
         if not row:
             raise HTTPException(404, "Foto no encontrada")
+        headers = {"Cache-Control": "private, max-age=3000"}
         path = os.path.join(photos_dir(), os.path.basename(row["filename"]))
-        if not os.path.isfile(path):
+        if os.path.isfile(path):
+            return FileResponse(path, media_type="image/jpeg", headers=headers)
+        data = _storage.get(row["filename"])  # foto guardada en Cloudflare R2
+        if data is None:
             raise HTTPException(404, "Foto no encontrada")
-        return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3000"})
+        return Response(content=data, media_type="image/jpeg", headers=headers)
 
     @router.post("/api/dating/feed")
     def dating_feed(request: Request):

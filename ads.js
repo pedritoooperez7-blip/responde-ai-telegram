@@ -62,16 +62,23 @@
   }
 
   /* start() se llama al pulsar Analizar. Si el usuario no es Premium y hay un
-   * anuncio vigente, lo muestra mientras se genera la respuesta; finish() espera
-   * a que pasen unos segundos y el usuario pulse "Ver respuestas". Cualquier
-   * fallo se ignora: sin anuncio, el flujo es el de siempre. */
+   * anuncio vigente, lo muestra mientras se genera la respuesta. El countdown
+   * empieza en cuanto llega el anuncio (en paralelo con la IA); finish() solo
+   * espera el tiempo que falte, si es que falta algo. Así el usuario no espera
+   * segundos extra después de que la IA ya terminó. Cualquier fallo se ignora:
+   * sin anuncio, el flujo es el de siempre. */
   function start() {
     if (state.premium) return { finish: async () => {}, cancel: () => {} };
     const host = $('#adInterstitial');
     if (!host) return { finish: async () => {}, cancel: () => {} };
     let shown = false;
+    // minDone se resuelve cuando el countdown termina Y el usuario pulsa el botón.
+    // Se crea en cuanto llega el anuncio, para que el tiempo corra en paralelo con la IA.
     let minDone = null;
-    const adPromise = api('/api/ads/next').then(d => d.ad ? { ad: d.ad, min: Math.max(2, Math.min(8, Number(d.min_seconds) || 4)) } : null).catch(() => null);
+    const adPromise = api('/api/ads/next')
+      .then(d => d.ad ? { ad: d.ad, min: Math.max(2, Math.min(8, Number(d.min_seconds) || 4)) } : null)
+      .catch(() => null);
+
     adPromise.then(info => {
       if (!info) return;
       shown = true;
@@ -82,6 +89,7 @@
       let left = info.min;
       btn.textContent = `Ver respuestas (${left})`;
       host.classList.remove('hidden');
+      // El countdown arranca aquí, en paralelo con la llamada a la IA.
       minDone = new Promise(resolve => {
         const timer = setInterval(() => {
           left -= 1;
@@ -93,12 +101,16 @@
         }, 1000);
       });
     });
+
     return {
-      // Se llama cuando la respuesta ya está lista.
+      // Se llama cuando la respuesta de la IA ya está lista.
+      // Si el countdown ya terminó (porque la IA tardó más que min_seconds),
+      // minDone ya está resuelto y finish() retorna de inmediato.
+      // Si la IA fue más rápida, solo espera el tiempo restante del countdown.
       finish: async () => {
-        const info = await adPromise;
-        if (!info || !shown) return;
-        await minDone;
+        await adPromise; // garantiza que el anuncio tuvo oportunidad de mostrarse
+        if (!shown) return;
+        if (minDone) await minDone;
       },
       cancel: () => host.classList.add('hidden'),
     };
@@ -168,18 +180,32 @@
       err, save));
   }
 
+  /* Un usuario con plan vigente va directo al editor y NUNCA ve la pantalla de planes.
+   * Sin plan (o con el plan vencido) ve solo los planes. */
   async function openBusiness() {
+    let info = null, failed = false;
+    try { info = await api('/api/business-ad'); } catch (_) { failed = true; }
+    if (info && info.has_plan && info.plan_active) return openEditor(info);
+    return openPlans(info, failed);
+  }
+
+  async function openPlans(info, failed) {
     showScreen('businessAdScreen');
-    const plans = $('#businessAdPlans'), editor = $('#businessAdEditor');
+    const plans = $('#businessAdPlans'), notice = $('#businessAdNotice'), buyBtn = $('#businessAdBuy');
+    notice.textContent = failed
+      ? 'No pudimos comprobar si ya tienes un plan activo. Revisa tu conexión antes de contratar.'
+      : (info && info.has_plan ? `Tu plan venció el ${fmtDate(info.paid_until)}. Elige uno para volver a mostrar tu anuncio.` : '');
     plans.replaceChildren(el('p', { class: 'd-muted', text: 'Cargando…' }));
-    editor.replaceChildren();
+    if (buyBtn) buyBtn.classList.add('hidden');
     if (!pricing) await loadPricing();
     if (!pricing) { plans.replaceChildren(el('p', { class: 'd-muted', text: 'No se pudieron cargar los precios. Inténtalo de nuevo.' })); return; }
     renderPlans(plans);
-    try {
-      const info = await api('/api/business-ad');
-      if (info.has_plan) renderEditor(editor, info);
-    } catch (_) { /* sin plan todavía */ }
+    if (buyBtn) buyBtn.classList.remove('hidden');
+  }
+
+  function openEditor(info) {
+    showScreen('businessAdEditorScreen');
+    renderEditor($('#businessAdEditor'), info);
   }
 
   function buy() {
@@ -192,6 +218,8 @@
   if (open) open.onclick = openBusiness;
   const back = $('#businessAdBack');
   if (back) back.onclick = goBack;
+  const editorBack = $('#businessAdEditorBack');
+  if (editorBack) editorBack.onclick = goBack;
   const buyBtn = $('#businessAdBuy');
   if (buyBtn) buyBtn.onclick = buy;
   window.LCAds = { start, openBusiness, refreshBusiness: openBusiness };

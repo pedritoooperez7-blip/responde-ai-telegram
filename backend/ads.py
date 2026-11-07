@@ -252,7 +252,7 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
                 return {"ad": None}
             conn.execute("UPDATE ads SET impressions=impressions+1 WHERE id=?", (row["id"],))
             conn.commit()
-            return {"ad": public_view(row), "min_seconds": 4}
+            return {"ad": public_view(row), "min_seconds": 2}
         finally:
             conn.close()
 
