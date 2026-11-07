@@ -180,18 +180,32 @@
       err, save));
   }
 
+  /* Un usuario con plan vigente va directo al editor y NUNCA ve la pantalla de planes.
+   * Sin plan (o con el plan vencido) ve solo los planes. */
   async function openBusiness() {
+    let info = null, failed = false;
+    try { info = await api('/api/business-ad'); } catch (_) { failed = true; }
+    if (info && info.has_plan && info.plan_active) return openEditor(info);
+    return openPlans(info, failed);
+  }
+
+  async function openPlans(info, failed) {
     showScreen('businessAdScreen');
-    const plans = $('#businessAdPlans'), editor = $('#businessAdEditor');
+    const plans = $('#businessAdPlans'), notice = $('#businessAdNotice'), buyBtn = $('#businessAdBuy');
+    notice.textContent = failed
+      ? 'No pudimos comprobar si ya tienes un plan activo. Revisa tu conexión antes de contratar.'
+      : (info && info.has_plan ? `Tu plan venció el ${fmtDate(info.paid_until)}. Elige uno para volver a mostrar tu anuncio.` : '');
     plans.replaceChildren(el('p', { class: 'd-muted', text: 'Cargando…' }));
-    editor.replaceChildren();
+    if (buyBtn) buyBtn.classList.add('hidden');
     if (!pricing) await loadPricing();
     if (!pricing) { plans.replaceChildren(el('p', { class: 'd-muted', text: 'No se pudieron cargar los precios. Inténtalo de nuevo.' })); return; }
     renderPlans(plans);
-    try {
-      const info = await api('/api/business-ad');
-      if (info.has_plan) renderEditor(editor, info);
-    } catch (_) { /* sin plan todavía */ }
+    if (buyBtn) buyBtn.classList.remove('hidden');
+  }
+
+  function openEditor(info) {
+    showScreen('businessAdEditorScreen');
+    renderEditor($('#businessAdEditor'), info);
   }
 
   function buy() {
@@ -204,6 +218,8 @@
   if (open) open.onclick = openBusiness;
   const back = $('#businessAdBack');
   if (back) back.onclick = goBack;
+  const editorBack = $('#businessAdEditorBack');
+  if (editorBack) editorBack.onclick = goBack;
   const buyBtn = $('#businessAdBuy');
   if (buyBtn) buyBtn.onclick = buy;
   window.LCAds = { start, openBusiness, refreshBusiness: openBusiness };
