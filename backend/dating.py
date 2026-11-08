@@ -649,7 +649,7 @@ SHARE_EARN_BONUS = 10  # likes extra al compartir estado
 
 def share_earn_today(c: sqlite3.Connection, uid: str, today: Optional[str] = None) -> int:
     """Devuelve el bonus de likes ganado hoy por compartir estado (0 si no ha compartido)."""
-    today = today or _cuba_today()
+    today = today or _cuba_today().isoformat()
     row = c.execute(
         "SELECT bonus FROM dating_share_earn WHERE user_id=? AND earn_date=?", (str(uid), today)
     ).fetchone()
@@ -666,7 +666,7 @@ def grant_share_earn(c: sqlite3.Connection, uid: str, today: Optional[str] = Non
 
     Idempotente: si ya compartió hoy devuelve already_granted=True sin doblar el bonus.
     """
-    today = today or _cuba_today()
+    today = today or _cuba_today().isoformat()
     now_ts = _now()
     existing = c.execute(
         "SELECT bonus FROM dating_share_earn WHERE user_id=? AND earn_date=?", (str(uid), today)
@@ -681,26 +681,16 @@ def grant_share_earn(c: sqlite3.Connection, uid: str, today: Optional[str] = Non
     return {"granted": True, "already_granted": False, "bonus": SHARE_EARN_BONUS, "earn_date": today}
 
 
-def _cuba_today() -> str:
-    """Fecha de hoy en zona horaria de Cuba (UTC-5 sin DST como respaldo)."""
-    try:
-        from zoneinfo import ZoneInfo
-        from datetime import timezone as _tz
-        return date.today().isoformat()  # fast path; replaced below when zoneinfo works
-    except Exception:
-        pass
-    utc_now = datetime.utcnow()
-    cuba = utc_now - timedelta(hours=5)
-    return cuba.strftime("%Y-%m-%d")
+
 
 
 # Override with proper Cuba timezone when available
 try:
     from zoneinfo import ZoneInfo as _ZI
     _CUBA_TZ = _ZI("America/Havana")
-    def _cuba_today() -> str:  # noqa: F811
+    def _cuba_today() -> date:  # noqa: F811
         from datetime import timezone as _tz
-        return datetime.now(_tz.utc).astimezone(_CUBA_TZ).strftime("%Y-%m-%d")
+        return datetime.now(_tz.utc).astimezone(_CUBA_TZ).date()
 except Exception:
     pass  # already defined above
 
