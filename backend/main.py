@@ -75,9 +75,9 @@ async def _security_headers(request: Request, call_next):
 
 FREE_DAILY_LIMIT = 3
 FREE_CHAT_MODES = {"gracioso", "coquetear", "enamorar"}
-PREMIUM_CHAT_MODES = {"provocativo", "salvar"}
+PREMIUM_CHAT_MODES = {"provocativo", "salvar", "reactivar"}
 FREE_STORY_MODES = {"gracioso", "coquetear"}
-PREMIUM_STORY_MODES = {"provocativo", "enamorar"}
+PREMIUM_STORY_MODES = {"provocativo", "enamorar", "reactivar"}
 DB_PATH = os.getenv("DB_PATH", os.path.join(ROOT, "liggacuba.db"))
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
@@ -206,6 +206,17 @@ def _reject_if_banned(uid: str) -> None:
 
 def db():
     return _db.connect(DB_PATH)
+
+
+def notify_user(user_id: str, text: str) -> None:
+    """Send a Telegram message to a user. Fails silently — never breaks the caller."""
+    import threading
+    def _send():
+        try:
+            send_message(str(user_id), text)
+        except Exception as exc:
+            logger.debug("notify_user to %s failed: %s", user_id, exc)
+    threading.Thread(target=_send, daemon=True).start()
 
 
 def now(): return datetime.utcnow().isoformat()
@@ -460,7 +471,60 @@ def init_db():
         except sqlite3.IntegrityError:
             logger.error("Could not create %s because legacy payment duplicates exist; runtime duplicate checks remain enabled", index_name)
     _dating.init_schema(c)
+    # New tables for price overrides and referral system
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS price_overrides(
+      plan TEXT PRIMARY KEY,
+      price REAL NOT NULL,
+      updated_at TEXT NOT NULL,
+      updated_by TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS referrals(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      referrer_id TEXT NOT NULL,
+      referred_id TEXT NOT NULL UNIQUE,
+      rewarded INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    """)
+    for sql in (
+        "ALTER TABLE users ADD COLUMN refer_code TEXT",
+        "ALTER TABLE users ADD COLUMN referred_by TEXT",
+    ):
+        try:
+            c.execute(sql)
+        except sqlite3.OperationalError:
+            pass
     c.commit(); c.close()
+
+
+def _ensure_refer_code(uid: str) -> str:
+    """Return (creating if needed) a unique 8-char referral code for uid."""
+    import hashlib
+    c = db()
+    row = c.execute("SELECT refer_code FROM users WHERE user_id=?", (uid,)).fetchone()
+    if row and row["refer_code"]:
+        c.close()
+        return row["refer_code"]
+    code = hashlib.sha256(f"ref-{uid}-liggacuba".encode()).hexdigest()[:8].upper()
+    c.execute("UPDATE users SET refer_code=?,updated_at=? WHERE user_id=?", (code, now(), uid))
+    c.commit(); c.close()
+    return code
+
+
+def _db_get_price_override(plan: str) -> Optional[float]:
+    try:
+        c = db()
+        row = c.execute("SELECT price FROM price_overrides WHERE plan=?", (plan,)).fetchone()
+        c.close()
+        return float(row["price"]) if row else None
+    except Exception:
+        return None
+
+
+# Register price override getter with payments module
+_payments.set_db_price_getter(_db_get_price_override)
+
 init_db()
 
 
@@ -576,6 +640,8 @@ class PaymentReview(BaseModel): operation_id:str; action:str; reason:str=""
 class Proof(BaseModel): operation_id:str; user_id:str=""; proof_text:str=""; proof_image:str=""
 class SaveSituation(BaseModel): user_id:str; ocr_text:str=""; reply:str=""
 class OCR(BaseModel): image:str
+class ReferralApply(BaseModel): refer_code:str
+class PriceUpdate(BaseModel): plan:str; price:float
 
 
 def parse_init(s):
@@ -758,12 +824,62 @@ def _log_operational_configuration():
         _tgbackup.start_backup_worker(DB_PATH, send_document)
     except Exception:
         logger.warning("Could not start the Telegram backup worker", exc_info=True)
+    # Expose photos_dir on app.state so ads router can use it for disk fallback
+    app.state.photos_dir = _dating_photos_dir()
 
 
 PURGE_INTERVAL_SECONDS = 6 * 60 * 60
 PURGE_START_DELAY_SECONDS = 300
 _background_purge_started = False
 _background_purge_lock = threading.Lock()
+
+
+def _run_premium_expiry_reminders() -> None:
+    """Envía notificación a usuarios cuyo Premium vence en las próximas 24 h.
+
+    Se ejecuta en el mismo ciclo que la purga (cada 6 h). Usa una tabla de
+    control para no mandar más de un recordatorio por periodo de vencimiento.
+    """
+    try:
+        c = db()
+        try:
+            c.execute("""CREATE TABLE IF NOT EXISTS premium_expiry_reminders(
+                user_id TEXT PRIMARY KEY,
+                reminded_at TEXT NOT NULL,
+                premium_until TEXT NOT NULL
+            )""")
+            c.commit()
+            window_start = datetime.now(timezone.utc).isoformat()
+            window_end   = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+            rows = c.execute(
+                """SELECT user_id, premium_until FROM users
+                   WHERE premium_until > ? AND premium_until <= ?""",
+                (window_start, window_end)
+            ).fetchall()
+            for row in rows:
+                uid, until = row["user_id"], row["premium_until"]
+                already = c.execute(
+                    "SELECT 1 FROM premium_expiry_reminders WHERE user_id=? AND premium_until=?",
+                    (uid, until)
+                ).fetchone()
+                if already:
+                    continue
+                notify_user(uid,
+                    "⏰ <b>Tu Premium vence pronto.</b>\n\n"
+                    "Tienes menos de 24 horas de acceso Premium. Renuévalo desde la app para no perder el acceso. 💜")
+                c.execute(
+                    "INSERT OR REPLACE INTO premium_expiry_reminders(user_id, reminded_at, premium_until) VALUES(?,?,?)",
+                    (uid, datetime.now(timezone.utc).isoformat(), until)
+                )
+                c.commit()
+            # Limpiar recordatorios de periodos ya expirados (>7 días)
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            c.execute("DELETE FROM premium_expiry_reminders WHERE reminded_at < ?", (cutoff,))
+            c.commit()
+        finally:
+            c.close()
+    except Exception:
+        logger.warning("Premium expiry reminder failed; will retry next cycle", exc_info=True)
 
 
 def _run_retention_purge() -> None:
@@ -780,6 +896,7 @@ def _run_retention_purge() -> None:
         _tg_purge()
     except Exception:
         logger.warning("Telegram update retention purge failed; it will be retried on the next cycle", exc_info=True)
+    _run_premium_expiry_reminders()
 
 
 def start_background_purge() -> bool:
@@ -1534,6 +1651,116 @@ def profile(p:Usage, request:Request):
     u=user(uid); c=db(); rows=c.execute("SELECT module,COUNT(*) n FROM usage_logs WHERE user_id=? GROUP BY module",(uid,)).fetchall(); c.close(); counts={r["module"]:r["n"] for r in rows}
     return {"user_id":uid,"username":u.get("username"),"first_name":u.get("first_name"),"payment_phone":u.get("payment_phone") or "","premium":premium(uid),"premium_until":u.get("premium_until"),"chats":counts.get("chat",0),"stories":counts.get("story",0),"analyses":sum(counts.values())}
 
+@app.get("/api/stats")
+def user_stats(request: Request):
+    """Estadísticas personales del usuario: análisis por modo, racha y referidos."""
+    uid = current_user(request)
+    c = db()
+    # Usage by mode (last 30 days and all time)
+    rows_all = c.execute(
+        "SELECT mode, COUNT(*) n FROM usage_logs WHERE user_id=? GROUP BY mode", (uid,)
+    ).fetchall()
+    rows_week = c.execute(
+        "SELECT mode, COUNT(*) n FROM usage_logs WHERE user_id=? AND used_at>=? GROUP BY mode",
+        (uid, (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S"))
+    ).fetchall()
+    rows_days = c.execute(
+        """SELECT date(used_at) d, COUNT(*) n FROM usage_logs
+           WHERE user_id=? AND used_at>=?
+           GROUP BY date(used_at) ORDER BY d""",
+        (uid, (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S"))
+    ).fetchall()
+    # Best mode
+    all_modes = {r["mode"]: r["n"] for r in rows_all if r["mode"]}
+    best_mode = max(all_modes, key=all_modes.get) if all_modes else None
+    total = sum(all_modes.values())
+    # Referrals
+    ref_code = _ensure_refer_code(uid)
+    ref_rows = c.execute(
+        "SELECT COUNT(*) total, SUM(rewarded) rewarded FROM referrals WHERE referrer_id=?", (uid,)
+    ).fetchone()
+    c.close()
+    return {
+        "total_analyses": total,
+        "by_mode": all_modes,
+        "best_mode": best_mode,
+        "this_week": sum(r["n"] for r in rows_week),
+        "daily_activity": [{"day": r["d"], "count": r["n"]} for r in rows_days],
+        "refer_code": ref_code,
+        "referrals_total": int(ref_rows["total"] or 0),
+        "referrals_rewarded": int(ref_rows["rewarded"] or 0),
+    }
+
+
+@app.post("/api/referral/apply")
+def apply_referral(p: ReferralApply, request: Request):
+    """Registra que el usuario actual fue invitado por refer_code."""
+    uid = current_user(request)
+    code = str(p.refer_code or "").strip().upper()
+    if not code:
+        raise HTTPException(400, "Código de referido requerido")
+    c = db()
+    # Find referrer
+    referrer = c.execute("SELECT user_id FROM users WHERE refer_code=?", (code,)).fetchone()
+    if not referrer:
+        c.close()
+        raise HTTPException(404, "Código de referido no válido")
+    referrer_id = referrer["user_id"]
+    if referrer_id == uid:
+        c.close()
+        raise HTTPException(400, "No puedes usar tu propio código")
+    # Check if already referred
+    existing = c.execute("SELECT id FROM referrals WHERE referred_id=?", (uid,)).fetchone()
+    if existing:
+        c.close()
+        raise HTTPException(409, "Ya tienes un referido registrado")
+    # Check if already referred by someone
+    already = c.execute("SELECT referred_by FROM users WHERE user_id=?", (uid,)).fetchone()
+    if already and already["referred_by"]:
+        c.close()
+        raise HTTPException(409, "Ya tienes un referido registrado")
+    c.execute("INSERT INTO referrals(referrer_id,referred_id,rewarded,created_at) VALUES(?,?,0,?)",
+              (referrer_id, uid, now()))
+    c.execute("UPDATE users SET referred_by=?,updated_at=? WHERE user_id=?", (referrer_id, now(), uid))
+    c.commit(); c.close()
+    return {"success": True, "message": "Referido registrado. ¡Cuando actives Premium, tu amigo gana 3 días!"}
+
+
+def _reward_referrer(user_id: str) -> None:
+    """Give 3 days Premium to the referrer when referred user pays for the first time."""
+    try:
+        c = db()
+        ref = c.execute(
+            "SELECT id, referrer_id FROM referrals WHERE referred_id=? AND rewarded=0", (user_id,)
+        ).fetchone()
+        if not ref:
+            c.close()
+            return
+        referrer_id = ref["referrer_id"]
+        t = now()
+        # Grant 3 days to referrer
+        row = c.execute("SELECT premium_until FROM users WHERE user_id=?", (referrer_id,)).fetchone()
+        current = row["premium_until"] if row else None
+        if current:
+            try:
+                base = _utc_datetime(current)
+                if base < datetime.utcnow():
+                    base = datetime.utcnow()
+            except Exception:
+                base = datetime.utcnow()
+        else:
+            base = datetime.utcnow()
+        until = (base + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S")
+        c.execute("UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?", (until, t, referrer_id))
+        c.execute("UPDATE referrals SET rewarded=1 WHERE id=?", (ref["id"],))
+        c.commit(); c.close()
+        notify_user(referrer_id,
+            "🎁 <b>¡Recompensa de referido!</b>\nUno de tus amigos activó Premium gracias a tu código. "
+            "Te regalamos <b>3 días de Premium</b> extra. ¡Gracias por recomendar LiggaCuba!")
+    except Exception as exc:
+        logger.warning("_reward_referrer failed for %s: %s", user_id, exc)
+
+
 @app.post("/api/situations/save")
 def save_situation(p:SaveSituation, request:Request):
     uid=current_user(request)
@@ -1766,6 +1993,11 @@ def atajo_pago(p: AtajoPayment, request: Request):
             result.pop("premium_until")
             result["ad_paid_until"] = until
             result["plan"] = matched["plan"]
+            notify_user(matched["user_id"], "✅ <b>¡Tu anuncio fue activado!</b>\nYa puedes editar tu anuncio desde <b>Más → Anunciar mi negocio</b>.")
+        else:
+            days = _payments.plan_days(matched["plan"])
+            notify_user(matched["user_id"], f"🎉 <b>¡Premium activado!</b>\nTienes <b>{days} días</b> de acceso Premium en LiggaCuba. ¡Disfrútalo!")
+            _reward_referrer(matched["user_id"])
         return result
     except sqlite3.IntegrityError:
         c.rollback()
@@ -1802,11 +2034,78 @@ def payment_pricing():
     return {
         "currency": currency,
         "plans": {
-            "weekly": {"amount_value": _payments.verification_amount("weekly"), "amount": amount("weekly", "es"), "days": 7},
-            "annual": {"amount_value": _payments.verification_amount("annual"), "amount": amount("annual", "es"), "days": 365},
+            "weekly":  {"amount_value": _payments.verification_amount("weekly"),  "amount": amount("weekly",  "es"), "days": 7},
+            "monthly": {"amount_value": _payments.verification_amount("monthly"), "amount": amount("monthly", "es"), "days": 30},
+            "annual":  {"amount_value": _payments.verification_amount("annual"),  "amount": amount("annual",  "es"), "days": 365},
         },
         "ad_plans": _payments.ad_pricing(),
     }
+
+
+@app.get("/api/admin/pricing")
+def admin_get_pricing(request: Request):
+    """Devuelve todos los precios actuales (con origen: db/env/default)."""
+    admin(request, "settings")
+    c = db()
+    overrides = {r["plan"]: r["price"] for r in c.execute("SELECT plan, price FROM price_overrides").fetchall()}
+    c.close()
+    result = {}
+    for plan in _payments.VALID_PLANS:
+        db_val = overrides.get(plan)
+        env_key = _payments._PRICE_ENV.get(plan, "")
+        env_val = (os.getenv(env_key) or "").strip()
+        default_val = _payments.DEFAULT_PRICES_ALL[plan]
+        if db_val is not None:
+            source = "db"
+            current = float(db_val)
+        elif env_val:
+            source = "env"
+            current = float(env_val.replace(",", "."))
+        else:
+            source = "default"
+            current = default_val
+        result[plan] = {
+            "current": current,
+            "source": source,
+            "default": default_val,
+            "days": _payments.plan_days(plan),
+            "is_ad": _payments.is_ad_plan(plan),
+        }
+    return {"currency": _payments.payment_currency(), "plans": result}
+
+
+@app.post("/api/admin/pricing")
+def admin_set_pricing(p: PriceUpdate, request: Request):
+    """Guarda un precio override en la DB."""
+    ident = admin(request, "settings")
+    plan = (p.plan or "").strip().lower()
+    if plan not in _payments.VALID_PLANS:
+        raise HTTPException(400, "Plan inválido")
+    if p.price <= 0:
+        raise HTTPException(400, "El precio debe ser mayor que cero")
+    c = db()
+    c.execute(
+        "INSERT INTO price_overrides(plan,price,updated_at,updated_by) VALUES(?,?,?,?) "
+        "ON CONFLICT(plan) DO UPDATE SET price=excluded.price,updated_at=excluded.updated_at,updated_by=excluded.updated_by",
+        (plan, round(p.price, 2), now(), ident["username"])
+    )
+    c.commit(); c.close()
+    audit(ident["username"], "price_update", plan, {"price": p.price})
+    return {"success": True, "plan": plan, "price": round(p.price, 2)}
+
+
+@app.delete("/api/admin/pricing/{plan}")
+def admin_reset_pricing(plan: str, request: Request):
+    """Elimina el override de DB y vuelve al valor de env/default."""
+    ident = admin(request, "settings")
+    plan = plan.strip().lower()
+    if plan not in _payments.VALID_PLANS:
+        raise HTTPException(400, "Plan inválido")
+    c = db()
+    c.execute("DELETE FROM price_overrides WHERE plan=?", (plan,))
+    c.commit(); c.close()
+    audit(ident["username"], "price_reset", plan, {})
+    return {"success": True, "plan": plan}
 
 
 @app.post("/api/payments/pending")
@@ -1946,6 +2245,7 @@ def proof(p:Proof, request:Request):
         raise
     finally:
         c.close()
+    notify_user(uid, "📋 <b>Comprobante recibido.</b>\n\nLo estamos revisando. Te avisaremos cuando tu Premium esté activo. Puede tardar unos minutos.")
     return {"success":True,"status":"proof_submitted","archive_status":archive_status,
             "message":"Comprobante recibido; el archivo se procesa en segundo plano." if archive_status=='queued' else "Comprobante guardado. El archivo de Telegram no está configurado."}
 
@@ -2083,6 +2383,8 @@ def admin_ban_user(user_id:str, p:BanRequest, request:Request):
         res=_cleanup.ban_user(c,user_id,ident["username"],p.reason)
     finally: c.close()
     audit(ident["username"],"ban_user",user_id,{"reason":p.reason[:300]})
+    reason_text = f"\n\nMotivo: {p.reason}" if p.reason else ""
+    notify_user(user_id, f"🚫 <b>Tu cuenta ha sido suspendida.</b>{reason_text}\n\nTus datos se conservarán 48 horas. Si crees que es un error, contacta a soporte.")
     return {"success":True,**res}
 
 @app.post("/api/admin/users/{user_id}/unban")
@@ -2093,6 +2395,7 @@ def admin_unban_user(user_id:str, request:Request):
     finally: c.close()
     if not was: raise HTTPException(404,"El usuario no está baneado")
     audit(ident["username"],"unban_user",user_id,{})
+    notify_user(user_id, "✅ <b>Tu cuenta ha sido reactivada.</b>\n\nYa puedes usar LiggaCuba con normalidad. ¡Bienvenido de nuevo! 💜")
     return {"success":True,"user_id":str(user_id)}
 
 @app.delete("/api/admin/users/{user_id}")
@@ -2119,7 +2422,12 @@ def admin_premium(p:PremiumChange, request:Request):
             pass
         until = (base + timedelta(days=max(1, min(int(p.days), 3650)))).isoformat()
     else: raise HTTPException(400,"Acción inválida")
-    c=db(); c.execute("UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?",(until,t,uid)); c.commit(); c.close(); audit(ident["username"],"premium_"+p.action,uid,{"days":p.days,"premium_until":until}); return {"success":True,"user_id":uid,"premium_until":until,"premium":bool(until and _utc_datetime(until) > _utc_datetime())}
+    c=db(); c.execute("UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?",(until,t,uid)); c.commit(); c.close(); audit(ident["username"],"premium_"+p.action,uid,{"days":p.days,"premium_until":until})
+    if p.action == "revoke":
+        notify_user(uid, "⚠️ <b>Tu Premium ha sido desactivado.</b>\n\nSi tienes dudas, contacta a soporte.")
+    elif p.action in {"grant", "extend"}:
+        notify_user(uid, f"🎁 <b>¡Premium activado!</b>\n\nTienes <b>{p.days} días</b> de acceso Premium en LiggaCuba. ¡Disfrútalo! 💜")
+    return {"success":True,"user_id":uid,"premium_until":until,"premium":bool(until and _utc_datetime(until) > _utc_datetime())}
 
 @app.get("/api/admin/admins")
 def admin_list(request:Request):
@@ -2183,6 +2491,12 @@ def verify_payment(p:PaymentId, request:Request):
     is_ad=_payments.is_ad_plan(row["plan"])
     key="ad_paid_until" if is_ad else "premium_until"
     audit(ident["username"],"payment_verified",p.operation_id,{"user_id":row["user_id"],key:until})
+    if is_ad:
+        notify_user(row["user_id"], "✅ <b>¡Tu anuncio fue activado!</b>\nYa puedes editar tu anuncio desde <b>Más → Anunciar mi negocio</b>.")
+    else:
+        days = _payments.plan_days(row["plan"])
+        notify_user(row["user_id"], f"🎉 <b>¡Premium activado!</b>\nTienes <b>{days} días</b> de acceso Premium en LiggaCuba. ¡Disfrútalo!")
+        _reward_referrer(row["user_id"])
     return {"success":True,"status":"verified",key:until,"plan":row["plan"]}
 
 @app.post("/api/admin/payments/reject")
@@ -2212,6 +2526,8 @@ def reject_payment(p: PaymentReview, request:Request):
     finally:
         c.close()
     audit(ident["username"],"payment_rejected",p.operation_id,{"reason":p.reason,"user_id":row["user_id"]})
+    reason_text = f"\n\nMotivo: {p.reason}" if p.reason else ""
+    notify_user(row["user_id"], f"❌ <b>Tu pago no pudo ser verificado.</b>{reason_text}\n\nSi crees que es un error, contacta a soporte por Telegram o WhatsApp.")
     return {"success":True,"status":"rejected"}
 
 @app.get("/api/admin/payments/{operation_id}/proof")
@@ -2232,8 +2548,109 @@ def admin_payment_proof(operation_id: str, request: Request):
 
 
 @app.get("/api/admin/stats")
-def admin_stats(request:Request):
-    admin(request,"stats"); c=db(); out={"total_users":c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"],"premium_users":c.execute("SELECT COUNT(*) n FROM users WHERE premium_until>?",(now(),)).fetchone()["n"],"today_usage":c.execute("SELECT COUNT(*) n FROM usage_logs WHERE used_at>=?",(cuba_day_start_utc(),)).fetchone()["n"],"pending_payments":c.execute("SELECT COUNT(*) n FROM payment_operations WHERE status IN ('pending','proof_submitted')").fetchone()["n"]}; c.close(); return out
+def admin_stats(request: Request):
+    admin(request, "stats")
+    c = db()
+    try:
+        # ── Contadores base ──────────────────────────────────────────────────
+        total_users     = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+        premium_users   = c.execute("SELECT COUNT(*) n FROM users WHERE premium_until>?", (now(),)).fetchone()["n"]
+        today_usage     = c.execute("SELECT COUNT(*) n FROM usage_logs WHERE used_at>=?", (cuba_day_start_utc(),)).fetchone()["n"]
+        pending_payments= c.execute("SELECT COUNT(*) n FROM payment_operations WHERE status IN ('pending','proof_submitted')").fetchone()["n"]
+
+        # ── Nuevos usuarios por día (últimos 14 días) ────────────────────────
+        cutoff_14 = (datetime.now(timezone.utc) - timedelta(days=13)).date().isoformat()
+        new_by_day_rows = c.execute(
+            """SELECT substr(created_at,1,10) day, COUNT(*) n
+               FROM users WHERE substr(created_at,1,10) >= ?
+               GROUP BY substr(created_at,1,10) ORDER BY day""",
+            (cutoff_14,)
+        ).fetchall()
+        new_users_by_day = [{"day": r["day"], "count": r["n"]} for r in new_by_day_rows]
+
+        # ── Conversión free → premium (usuarios que pagaron al menos 1 vez) ──
+        # Base de conversión: usuarios creados hace más de 1 día (tuvieron tiempo de pagar)
+        eligible_users = c.execute(
+            "SELECT COUNT(*) n FROM users WHERE created_at < ?",
+            ((datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),)
+        ).fetchone()["n"]
+        ever_premium = c.execute(
+            "SELECT COUNT(DISTINCT user_id) n FROM payment_operations WHERE status='verified'"
+        ).fetchone()["n"]
+        conversion_rate = round(ever_premium * 100 / eligible_users, 1) if eligible_users > 0 else 0.0
+
+        # Nuevas conversiones últimos 7 días
+        conversions_7d = c.execute(
+            "SELECT COUNT(DISTINCT user_id) n FROM payment_operations WHERE status='verified' AND verified_at>=?",
+            ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(),)
+        ).fetchone()["n"]
+
+        # ── Retención a 7 días ───────────────────────────────────────────────
+        # Usuarios registrados hace 7-14 días que volvieron a usar en los últimos 7 días
+        cohort_start = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+        cohort_end   = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        active_start = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        cohort_size = c.execute(
+            "SELECT COUNT(*) n FROM users WHERE created_at>=? AND created_at<?",
+            (cohort_start, cohort_end)
+        ).fetchone()["n"]
+        retained = c.execute(
+            """SELECT COUNT(DISTINCT u.user_id) n FROM users u
+               JOIN usage_logs ul ON ul.user_id=u.user_id
+               WHERE u.created_at>=? AND u.created_at<? AND ul.used_at>=?""",
+            (cohort_start, cohort_end, active_start)
+        ).fetchone()["n"]
+        retention_7d = round(retained * 100 / cohort_size, 1) if cohort_size > 0 else None
+
+        # ── Uso diario últimos 14 días (para gráfica de actividad) ───────────
+        usage_by_day_rows = c.execute(
+            """SELECT substr(used_at,1,10) day, COUNT(*) n
+               FROM usage_logs WHERE substr(used_at,1,10) >= ?
+               GROUP BY substr(used_at,1,10) ORDER BY day""",
+            (cutoff_14,)
+        ).fetchall()
+        usage_by_day = [{"day": r["day"], "count": r["n"]} for r in usage_by_day_rows]
+
+        # ── Resumen de Citas ─────────────────────────────────────────────────
+        try:
+            dating_profiles = c.execute("SELECT COUNT(*) n FROM dating_profiles WHERE status='active'").fetchone()["n"]
+            dating_matches  = c.execute("SELECT COUNT(*) n FROM dating_matches WHERE status='active'").fetchone()["n"]
+            dating_pending_photos = c.execute("SELECT COUNT(*) n FROM dating_photos WHERE status='pending'").fetchone()["n"]
+        except Exception:
+            dating_profiles = dating_matches = dating_pending_photos = None
+
+    finally:
+        c.close()
+
+    out = {
+        # Contadores base (retrocompatibles)
+        "total_users":      total_users,
+        "premium_users":    premium_users,
+        "today_usage":      today_usage,
+        "pending_payments": pending_payments,
+        # Nuevas métricas
+        "new_users_by_day": new_users_by_day,
+        "usage_by_day":     usage_by_day,
+        "conversion": {
+            "ever_premium":    ever_premium,
+            "eligible_users":  eligible_users,
+            "rate_pct":        conversion_rate,
+            "last_7d":         conversions_7d,
+        },
+        "retention_7d": {
+            "cohort_size": cohort_size,
+            "retained":    retained,
+            "rate_pct":    retention_7d,
+            "note":        "Usuarios registrados hace 7-14 días que volvieron a usar en los últimos 7 días",
+        },
+    }
+    if dating_profiles is not None:
+        out["dating"] = {
+            "active_profiles":  dating_profiles,
+            "active_matches":   dating_matches,
+            "pending_photos":   dating_pending_photos,
+        }
+    return out
 
 @app.get("/api/admin/ai-monitor")
 def admin_ai_monitor(request: Request):

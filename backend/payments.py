@@ -3,32 +3,33 @@
 Display strings and verification values are deliberately separate:
 
 * ``amount()`` builds the human-readable text shown by the Mini App.
-* ``verification_amount()`` returns the numeric value actually transferred.
+* ``verification_amount()`` returns the numeric value actually charged.
 * ``expected_values()`` reads a stored operation and returns what the bank/SMS
   matcher must compare, so a display currency can never be compared against a
   payment in another currency.
 
-The commercial currency and prices come from the environment. Defaults match the
-values that were already hard-coded for Spanish users. The owner must confirm
-whether English users should see a converted USD price; without an explicit
-exchange rate this module never converts or invents rates.
+Prices are read in this priority order:
+  1. Database overrides (set via admin panel)
+  2. Environment variables (PAYMENT_PRICE_WEEKLY, etc.)
+  3. Compiled-in defaults
 """
 from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Mapping, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CURRENCY = "CUP"
-DEFAULT_PRICES = {"weekly": 2500.0, "annual": 15500.0}
+DEFAULT_PRICES = {"weekly": 2500.0, "monthly": 7500.0, "annual": 15500.0}
 PREMIUM_PLANS = tuple(DEFAULT_PRICES)
-_PRICE_ENV = {"weekly": "PAYMENT_PRICE_WEEKLY", "annual": "PAYMENT_PRICE_ANNUAL"}
+_PRICE_ENV = {
+    "weekly": "PAYMENT_PRICE_WEEKLY",
+    "monthly": "PAYMENT_PRICE_MONTHLY",
+    "annual": "PAYMENT_PRICE_ANNUAL",
+}
 
-# Planes de anuncio para negocios (se pagan igual que Premium, pero activan un
-# anuncio propio en lugar de Premium). Todos los importes salen de variables de
-# entorno ``AD_PRICE_*`` y estos son solo los valores por defecto.
 AD_PLAN_PREFIX = "ad_"
 AD_PLAN_DAYS = {"ad_daily": 1, "ad_weekly": 7, "ad_monthly": 30, "ad_annual": 365}
 AD_DEFAULT_PRICES = {"ad_daily": 750.0, "ad_weekly": 4500.0, "ad_monthly": 9000.0, "ad_annual": 17500.0}
@@ -36,9 +37,18 @@ _PRICE_ENV.update({
     "ad_daily": "AD_PRICE_DAILY", "ad_weekly": "AD_PRICE_WEEKLY",
     "ad_monthly": "AD_PRICE_MONTHLY", "ad_annual": "AD_PRICE_ANNUAL",
 })
-PREMIUM_PLAN_DAYS = {"weekly": 7, "annual": 365}
+PREMIUM_PLAN_DAYS = {"weekly": 7, "monthly": 30, "annual": 365}
 DEFAULT_PRICES_ALL = {**DEFAULT_PRICES, **AD_DEFAULT_PRICES}
 VALID_PLANS = tuple(DEFAULT_PRICES_ALL)
+
+# DB override hook — set by main.py at startup to avoid circular imports
+_db_price_getter: Optional[Any] = None
+
+
+def set_db_price_getter(fn) -> None:
+    """Register the function that reads price overrides from the database."""
+    global _db_price_getter
+    _db_price_getter = fn
 
 
 def is_ad_plan(plan: str) -> bool:
@@ -58,7 +68,6 @@ def validate_plan(plan: str) -> str:
 
 
 def payment_currency() -> str:
-    """Commercial currency used to create and verify payments (default CUP)."""
     raw = (os.getenv("PAYMENT_CURRENCY") or DEFAULT_CURRENCY).strip().upper()
     if len(raw) != 3 or not raw.isalpha():
         logger.warning("PAYMENT_CURRENCY is invalid; falling back to %s", DEFAULT_CURRENCY)
@@ -67,20 +76,27 @@ def payment_currency() -> str:
 
 
 def payment_price(plan: str) -> float:
-    """Configured price for a plan, in ``payment_currency()``."""
+    """Price for a plan. Checks DB overrides first, then env vars, then defaults."""
     plan = validate_plan(plan)
+    # 1) DB override
+    if _db_price_getter is not None:
+        try:
+            db_val = _db_price_getter(plan)
+            if db_val is not None:
+                return float(db_val)
+        except Exception:
+            pass
+    # 2) Env var
     raw = (os.getenv(_PRICE_ENV[plan]) or "").strip()
-    if not raw:
-        return DEFAULT_PRICES_ALL[plan]
-    try:
-        value = round(float(raw.replace(",", ".")), 2)
-    except (TypeError, ValueError):
-        logger.warning("Invalid price configuration for %s; using the default", plan)
-        return DEFAULT_PRICES_ALL[plan]
-    if value <= 0:
-        logger.warning("Non-positive price configuration for %s; using the default", plan)
-        return DEFAULT_PRICES_ALL[plan]
-    return value
+    if raw:
+        try:
+            value = round(float(raw.replace(",", ".")), 2)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            logger.warning("Invalid price configuration for %s; using the default", plan)
+    # 3) Default
+    return DEFAULT_PRICES_ALL[plan]
 
 
 def format_amount(value: float, currency: str | None = None) -> str:
@@ -90,30 +106,16 @@ def format_amount(value: float, currency: str | None = None) -> str:
 
 
 def amount(plan: str, lang: str | None = None) -> str:
-    """Human-readable amount.
-
-    ``lang`` is accepted for backwards compatibility but no longer changes the
-    currency: showing USD while charging CUP made payments impossible to match.
-    """
     return format_amount(payment_price(plan), payment_currency())
 
 
 def verification_amount(plan: str) -> float:
-    """Numeric amount that a real payment must match, in ``payment_currency()``."""
     return payment_price(plan)
 
 
 def expected_values(operation: Mapping[str, Any], currency: str | None = None) -> Tuple[float, str]:
-    """Return (amount, currency) to compare for a stored payment operation.
-
-    New rows carry ``amount_value`` and ``amount_currency``. Legacy rows only have
-    the display string, so the numeric part and its suffix are parsed without
-    converting anything.
-    """
     configured = (currency or payment_currency()).strip().upper()
 
-    # sqlite3.Row implements keyed access but does not expose Mapping.get().
-    # Payment matching receives both sqlite rows and plain dictionaries.
     def field(name: str, default: Any = None) -> Any:
         try:
             return operation[name]
@@ -142,11 +144,6 @@ def expected_values(operation: Mapping[str, Any], currency: str | None = None) -
 
 
 def ad_pricing() -> dict:
-    """Precios de anuncios con el ahorro frente a pagar solo planes diarios.
-
-    El ahorro se calcula contra ``ad_daily * días``: es lo que costaría cubrir
-    el mismo periodo comprando día a día. El plan diario no tiene ahorro.
-    """
     daily = payment_price("ad_daily")
     currency = payment_currency()
     out = {}

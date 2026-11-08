@@ -132,6 +132,16 @@ def init_schema(connection: sqlite3.Connection) -> None:
     if "prefs" not in columns:
         connection.execute("ALTER TABLE dating_profiles ADD COLUMN prefs TEXT NOT NULL DEFAULT '{}'")
         connection.commit()
+    # Share-to-earn: tabla de bonus de likes por compartir estado
+    connection.executescript("""
+    CREATE TABLE IF NOT EXISTS dating_share_earn(
+        user_id   TEXT NOT NULL,
+        earn_date TEXT NOT NULL,          -- fecha YYYY-MM-DD (hora Cuba)
+        bonus     INTEGER NOT NULL DEFAULT 10,
+        granted_at TEXT NOT NULL,
+        PRIMARY KEY(user_id, earn_date)
+    );
+    """)
 
 
 def _utcnow() -> datetime:
@@ -634,6 +644,67 @@ def likes_today(c: sqlite3.Connection, uid: str, today: Optional[date] = None) -
     ).fetchone()[0]
 
 
+SHARE_EARN_BONUS = 10  # likes extra al compartir estado
+
+
+def share_earn_today(c: sqlite3.Connection, uid: str, today: Optional[str] = None) -> int:
+    """Devuelve el bonus de likes ganado hoy por compartir estado (0 si no ha compartido)."""
+    today = today or _cuba_today()
+    row = c.execute(
+        "SELECT bonus FROM dating_share_earn WHERE user_id=? AND earn_date=?", (str(uid), today)
+    ).fetchone()
+    return int(row["bonus"]) if row else 0
+
+
+def effective_daily_limit(c: sqlite3.Connection, uid: str, base_limit: int, today: Optional[str] = None) -> int:
+    """Límite diario efectivo = base + bonus de share-to-earn del día."""
+    return base_limit + share_earn_today(c, uid, today)
+
+
+def grant_share_earn(c: sqlite3.Connection, uid: str, today: Optional[str] = None) -> Dict[str, Any]:
+    """Registra que el usuario compartió su estado hoy y le da SHARE_EARN_BONUS likes extra.
+
+    Idempotente: si ya compartió hoy devuelve already_granted=True sin doblar el bonus.
+    """
+    today = today or _cuba_today()
+    now_ts = _now()
+    existing = c.execute(
+        "SELECT bonus FROM dating_share_earn WHERE user_id=? AND earn_date=?", (str(uid), today)
+    ).fetchone()
+    if existing:
+        return {"granted": False, "already_granted": True, "bonus": int(existing["bonus"]), "earn_date": today}
+    c.execute(
+        "INSERT INTO dating_share_earn(user_id,earn_date,bonus,granted_at) VALUES(?,?,?,?)",
+        (str(uid), today, SHARE_EARN_BONUS, now_ts),
+    )
+    c.commit()
+    return {"granted": True, "already_granted": False, "bonus": SHARE_EARN_BONUS, "earn_date": today}
+
+
+def _cuba_today() -> str:
+    """Fecha de hoy en zona horaria de Cuba (UTC-5 sin DST como respaldo)."""
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import timezone as _tz
+        return date.today().isoformat()  # fast path; replaced below when zoneinfo works
+    except Exception:
+        pass
+    utc_now = datetime.utcnow()
+    cuba = utc_now - timedelta(hours=5)
+    return cuba.strftime("%Y-%m-%d")
+
+
+# Override with proper Cuba timezone when available
+try:
+    from zoneinfo import ZoneInfo as _ZI
+    _CUBA_TZ = _ZI("America/Havana")
+    def _cuba_today() -> str:  # noqa: F811
+        from datetime import timezone as _tz
+        return datetime.now(_tz.utc).astimezone(_CUBA_TZ).strftime("%Y-%m-%d")
+except Exception:
+    pass  # already defined above
+
+
 def record_swipe(c: sqlite3.Connection, uid: str, target_public_id: str, action: str, daily_limit: int,
                  is_premium: bool, now: Optional[str] = None) -> Dict[str, Any]:
     uid = str(uid)
@@ -651,8 +722,10 @@ def record_swipe(c: sqlite3.Connection, uid: str, target_public_id: str, action:
             raise DatingError("Perfil no disponible.", 404)
         if c.execute("SELECT 1 FROM dating_swipes WHERE user_id=? AND target_id=?", (uid, tid)).fetchone():
             c.rollback()
-            return {"matched": False, "duplicate": True, "likes_left": _likes_left(c, uid, daily_limit, is_premium)}
-        if action == "like" and not is_premium and likes_today(c, uid) >= daily_limit:
+            eff_limit = effective_daily_limit(c, uid, daily_limit)
+            return {"matched": False, "duplicate": True, "likes_left": _likes_left(c, uid, eff_limit, is_premium)}
+        eff_limit = effective_daily_limit(c, uid, daily_limit)
+        if action == "like" and not is_premium and likes_today(c, uid) >= eff_limit:
             raise DatingError("Llegaste al límite diario de likes. Mejora a Premium para likes ilimitados.", 403, "daily_limit")
         c.execute("INSERT INTO dating_swipes(user_id,target_id,action,created_at) VALUES(?,?,?,?)", (uid, tid, action, now))
         matched = False
@@ -666,7 +739,8 @@ def record_swipe(c: sqlite3.Connection, uid: str, target_public_id: str, action:
     except Exception:
         c.rollback()
         raise
-    result: Dict[str, Any] = {"matched": matched, "duplicate": False, "likes_left": _likes_left(c, uid, daily_limit, is_premium)}
+    eff_limit = effective_daily_limit(c, uid, daily_limit)
+    result: Dict[str, Any] = {"matched": matched, "duplicate": False, "likes_left": _likes_left(c, uid, eff_limit, is_premium)}
     if matched:
         result["notify"] = [uid, tid]
         result["match_public_id"] = target["public_id"]
@@ -1040,7 +1114,34 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
 
         def work(c):
             profiles = candidate_feed(c, uid, secret())
-            return {"profiles": profiles, "premium": premium, "likes_left": _likes_left(c, uid, free_daily_likes, premium)}
+            eff_limit = effective_daily_limit(c, uid, free_daily_likes)
+            bonus = share_earn_today(c, uid)
+            return {
+                "profiles":    profiles,
+                "premium":     premium,
+                "likes_left":  _likes_left(c, uid, eff_limit, premium),
+                "share_earn":  {
+                    "bonus_today":    bonus,
+                    "base_limit":     free_daily_likes,
+                    "effective_limit": eff_limit,
+                    "already_earned": bonus > 0,
+                },
+            }
+        return run(work)
+
+    @router.post("/api/dating/share-earn")
+    def dating_share_earn(request: Request):
+        """El cliente llama a este endpoint después de que el usuario comparte su estado.
+        Registra el bonus del día (idempotente) y devuelve los likes restantes actualizados.
+        """
+        uid = current_user(request)
+
+        def work(c):
+            result = grant_share_earn(c, uid)
+            eff_limit = effective_daily_limit(c, uid, free_daily_likes)
+            result["likes_left"] = _likes_left(c, uid, eff_limit, is_premium(uid))
+            result["effective_limit"] = eff_limit
+            return result
         return run(work)
 
     @router.post("/api/dating/swipe")
@@ -1124,6 +1225,10 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
             raise HTTPException(400, "Acción no válida")
         result = run(lambda c: admin_review_photo(c, photo_id, p.action == "approve", p.reason, ident["username"], photos_dir()))
         audit(ident["username"], "dating_photo_" + p.action, photo_id, {"user_id": result["user_id"]})
+        if p.action == "approve":
+            fire_and_forget(result["user_id"], "📸 <b>¡Tu foto fue aprobada!</b>\nYa aparece en tu perfil de LiggaCuba Citas.")
+        else:
+            fire_and_forget(result["user_id"], f"❌ <b>Tu foto fue rechazada.</b>\nMotivo: {p.reason or 'No cumple las normas de la comunidad'}. Sube una nueva foto.")
         return result
 
     @router.post("/api/admin/dating/reports/{report_id}/resolve")
@@ -1131,6 +1236,9 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
         ident = admin(request, "dating")
         result = run(lambda c: admin_resolve_report(c, report_id, p.action, ident["username"]))
         audit(ident["username"], "dating_report_" + p.action, report_id, {"user_id": result["user_id"]})
+        if p.action == "suspend":
+            fire_and_forget(result["user_id"],
+                "⚠️ <b>Tu perfil de Citas ha sido suspendido.</b>\n\nRecibimos un reporte sobre tu actividad. Si crees que es un error, contacta a soporte.")
         return result
 
     @router.post("/api/admin/dating/profiles/{user_id}/restore")
@@ -1138,6 +1246,8 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
         ident = admin(request, "dating")
         run(lambda c: admin_restore_profile(c, user_id))
         audit(ident["username"], "dating_profile_restored", user_id, {})
+        fire_and_forget(user_id,
+            "✅ <b>Tu perfil de Citas ha sido reactivado.</b>\n\nYa puedes usar Citas con normalidad. ¡Mucho éxito! 💜")
         return {"success": True}
 
     return router

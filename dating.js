@@ -29,6 +29,7 @@
       delete_confirm: '¿Borrar tu perfil, fotos, likes y matches de Citas? No se puede deshacer.', deleted: 'Datos de Citas eliminados',
       under_review: 'Tu perfil está en revisión y no aparece para otras personas por ahora.', suspended: 'Tu perfil de Citas está suspendido. Contacta a soporte.',
       pass: 'Pasar', like: 'Me gusta', undo: 'Deshacer', likes_left: 'Te quedan {n} likes hoy', likes_unlimited: 'Premium · likes ilimitados',
+      share_earn_cta: '🎁 Comparte en tu estado de WhatsApp y gana +10 likes gratis hoy', share_earn_btn: 'Compartir y ganar +10 likes', share_earn_done: '✅ ¡Ganaste +10 likes extra hoy!', share_earn_confirm: 'Confirmando…',
       empty_title: 'No hay más perfiles por ahora', empty_text: 'Vuelve más tarde o amplía tu rango de edad.', refresh: 'Actualizar',
       same_province: 'Tu provincia', report: 'Reportar', block: 'Bloquear', unmatch: 'Deshacer match', matches_empty: 'Aún no tienes matches. ¡Sigue descubriendo!',
       match_title: '¡Es un match!', match_text: 'Ahora puedes escribirle a {n} por:', keep: 'Seguir viendo', write_to: 'Escribir por',
@@ -59,6 +60,7 @@
       delete_confirm: 'Delete your Dating profile, photos, likes and matches? This cannot be undone.', deleted: 'Dating data deleted',
       under_review: 'Your profile is under review and hidden for now.', suspended: 'Your Dating profile is suspended. Contact support.',
       pass: 'Pass', like: 'Like', undo: 'Undo', likes_left: '{n} likes left today', likes_unlimited: 'Premium · unlimited likes',
+      share_earn_cta: '🎁 Share to your WhatsApp status and get +10 free likes today', share_earn_btn: 'Share & get +10 likes', share_earn_done: '✅ You earned +10 extra likes today!', share_earn_confirm: 'Confirming…',
       empty_title: 'No more profiles for now', empty_text: 'Come back later or widen your age range.', refresh: 'Refresh',
       same_province: 'Your province', report: 'Report', block: 'Block', unmatch: 'Remove match', matches_empty: 'No matches yet. Keep discovering!',
       match_title: "It's a match!", match_text: 'You can now message {n} on:', keep: 'Keep browsing', write_to: 'Message on',
@@ -689,7 +691,7 @@
     if (!bundle) bundle = await fetchFeedBundle();
     const d = bundle.d;
     D.feed = d.profiles || []; D.photoIdx = 0; D.premium = !!d.premium; D.likesLeft = d.likes_left;
-    D.likesInfo = bundle.likes;
+    D.likesInfo = bundle.likes; D.shareEarn = d.share_earn || null;
   }
   async function renderDiscover() {
     if (!D.feed.length) {
@@ -713,7 +715,28 @@
       el('button', { class: 'tap left', type: 'button', 'aria-label': '‹', onclick: () => { D.photoIdx = Math.max(0, idx - 1); renderDiscover(); } }),
       el('button', { class: 'tap right', type: 'button', 'aria-label': '›', onclick: () => { D.photoIdx = Math.min(photos.length - 1, idx + 1); renderDiscover(); } }));
     const limitText = D.premium ? T('likes_unlimited') : (D.likesLeft != null ? T('likes_left', { n: D.likesLeft }) : '');
-    setBody(likesBanner(),
+    // Share-to-earn banner: solo para free users que aún no ganaron el bonus hoy
+    const shareEarnBanner = (!D.premium && D.shareEarn && !D.shareEarn.already_earned)
+      ? el('div', { class: 'd-share-earn-banner' },
+          el('span', { text: T('share_earn_cta') }),
+          el('button', { class: 'd-share-earn-btn', type: 'button', text: T('share_earn_btn'),
+            onclick: async (ev) => {
+              const btn = ev.currentTarget;
+              btn.disabled = true; btn.textContent = T('share_earn_confirm');
+              try {
+                const r = await jpost('/api/dating/share-earn', {});
+                if (r.granted || r.already_granted) {
+                  D.shareEarn = { already_earned: true, bonus_today: r.bonus };
+                  D.likesLeft = r.likes_left;
+                  renderDiscover();
+                }
+              } catch (_) { btn.disabled = false; btn.textContent = T('share_earn_btn'); }
+            }
+          }))
+      : ((!D.premium && D.shareEarn && D.shareEarn.already_earned)
+          ? el('div', { class: 'd-share-earn-banner done' }, el('span', { text: T('share_earn_done') }))
+          : null);
+    setBody(likesBanner(), shareEarnBanner,
       el('div', { class: 'd-card profile' }, shot,
         el('div', { class: 'd-info' },
           el('h2', { text: `${p.display_name}, ${p.age}` }),
