@@ -7,6 +7,16 @@
  */
 (function () {
   'use strict';
+  // Helper: usa tg.showConfirm (nativo en Telegram) o window.confirm como fallback.
+  // window.confirm() está bloqueado en iOS Telegram y congela la app.
+  function datingConfirm(msg) {
+    return new Promise(resolve => {
+      if (tg && tg.showConfirm) {
+        try { return tg.showConfirm(msg, ok => resolve(!!ok)); } catch (_) {}
+      }
+      resolve(window.confirm(msg));
+    });
+  }
 
   const TEXT = {
     es: {
@@ -136,8 +146,10 @@
   // Las peticiones base se hacen en paralelo (antes eran 4 en cadena: config → me → feed → likes).
   function startBase() {
     const cfgP = D.cfg ? Promise.resolve(D.cfg)
-      : fetch('/api/dating/config').then(r => r.ok ? r.json() : Promise.reject(new Error(T('error'))));
-    return Promise.all([cfgP, jpost('/api/dating/me')]).then(([cfg, me]) => { D.cfg = cfg; D.me = me; return me; });
+      : fetch('/api/dating/config')
+          .then(r => r.ok ? r.json() : Promise.reject(new Error(T('error'))))
+          .catch(e => Promise.reject(e));
+    return Promise.all([cfgP, jpost('/api/dating/me')]).then(([cfg, me]) => { D.cfg = cfg; D.me = me; return me; }).catch(e => { fail(e); return Promise.reject(e); });
   }
   async function fetchFeedBundle() {
     const [d, likes] = await Promise.all([jpost('/api/dating/feed'), jpost('/api/dating/likes').catch(() => null)]);
@@ -665,7 +677,7 @@
       el('button', { class: 'secondary', type: 'button', text: p.visible ? T('pause') : T('unpause'), onclick: async () => {
         try { await jpost('/api/dating/visibility', { visible: !p.visible }); D.me = await jpost('/api/dating/me'); renderMine(); } catch (e) { fail(e); } } }),
       el('button', { class: 'secondary danger-btn', type: 'button', text: T('delete_data'), onclick: async () => {
-        if (!confirm(T('delete_confirm'))) return;
+        if (!await datingConfirm(T('delete_confirm'))) return;
         try { await jpost('/api/dating/delete'); D.me = { profile: null, photos: [] }; D.feed = []; D.tab = 'intro'; toast(T('deleted')); render(); } catch (e) { fail(e); } } }));
   }
   // Reduce la foto en el dispositivo antes de subirla (ahorra datos móviles).
@@ -829,10 +841,10 @@
   function manageSheet(match) {
     const m = sheet(el('h3', { text: match.display_name }),
       el('button', { class: 'secondary', type: 'button', text: T('unmatch'), onclick: async () => {
-        if (!confirm(T('unmatch_confirm'))) return;
+        if (!await datingConfirm(T('unmatch_confirm'))) return;
         try { await jpost('/api/dating/unmatch', { match_id: match.match_id }); toast(T('unmatched')); m.close(); renderMatches(); } catch (e) { fail(e); } } }),
       el('button', { class: 'secondary', type: 'button', text: T('block'), onclick: async () => {
-        if (!confirm(T('block_confirm'))) return;
+        if (!await datingConfirm(T('block_confirm'))) return;
         try { await jpost('/api/dating/block', { target: match.public_id }); toast(T('blocked')); m.close(); D.feed = []; renderMatches(); } catch (e) { fail(e); } } }),
       el('button', { class: 'secondary danger-btn', type: 'button', text: T('report'), onclick: () => { m.close(); reportSheet(match.public_id); } }),
       el('button', { class: 'cancel-btn', type: 'button', text: T('cancel'), onclick: () => m.close() }));
