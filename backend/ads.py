@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS ads(
   title TEXT NOT NULL DEFAULT '',
   body TEXT NOT NULL DEFAULT '',
   image_url TEXT NOT NULL DEFAULT '',
+  image_filename TEXT NOT NULL DEFAULT '',
   link_url TEXT NOT NULL DEFAULT '',
   cta TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'draft',
@@ -388,5 +389,76 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
             conn.close()
         audit(ident["username"], "ad_deleted", p.id, {})
         return {"success": True}
+
+    class AdImageUpload(BaseModel):
+        image: str  # base64 data-URL or raw base64
+
+    @router.post("/api/ads/upload-image")
+    def upload_ad_image(p: AdImageUpload, request: Request):
+        """Recibe imagen base64, la sube a Tigris (público) o disco. Devuelve la URL."""
+        import base64 as _b64, uuid as _uuid, os as _os
+        try:
+            from . import storage as _storage
+        except ImportError:
+            import storage as _storage
+        uid = current_user(request)
+        b64 = p.image or ""
+        if "," in b64:
+            b64 = b64.split(",", 1)[1]
+        try:
+            img_bytes = _b64.b64decode(b64)
+        except Exception:
+            raise HTTPException(400, "Imagen inválida")
+        if len(img_bytes) > 5 * 1024 * 1024:
+            raise HTTPException(400, "La imagen no puede superar 5 MB")
+        ct = "image/jpeg"
+        if img_bytes[:4] == b'\x89PNG':
+            ct = "image/png"
+        elif img_bytes[:6] in (b'GIF87a', b'GIF89a'):
+            ct = "image/gif"
+        elif img_bytes[:4] == b'RIFF' and img_bytes[8:12] == b'WEBP':
+            ct = "image/webp"
+        ext = {"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp"}.get(ct, "jpg")
+        filename = f"ad_{_uuid.uuid4().hex}.{ext}"
+        if _storage.enabled():
+            try:
+                s = _storage._settings()
+                _storage._get_client().put_object(
+                    Bucket=s["bucket"], Key=f"ads/{filename}",
+                    Body=img_bytes, ContentType=ct,
+                )
+                # Build public URL — Tigris public buckets serve at endpoint/bucket/key
+                endpoint = s["endpoint"].rstrip("/")
+                bucket = s["bucket"]
+                url = f"{endpoint}/{bucket}/ads/{filename}"
+                return {"url": url, "filename": filename}
+            except Exception as exc:
+                logger.warning("Tigris ad upload failed: %s", exc)
+                raise HTTPException(500, "Error subiendo imagen. Inténtalo de nuevo.")
+        else:
+            photos_dir = getattr(request.app.state, "photos_dir", None)
+            if not photos_dir:
+                raise HTTPException(503, "Almacenamiento no configurado. Activa Tigris.")
+            ads_dir = _os.path.join(photos_dir, "ads")
+            _os.makedirs(ads_dir, exist_ok=True)
+            with open(_os.path.join(ads_dir, filename), "wb") as fh:
+                fh.write(img_bytes)
+            return {"url": f"/api/ads/image/{filename}", "filename": filename}
+
+    @router.get("/api/ads/image/{filename}")
+    def serve_ad_image(filename: str, request: Request):
+        """Sirve imágenes de anuncios guardadas en disco (fallback sin Tigris)."""
+        import os as _os
+        from fastapi.responses import FileResponse
+        safe = _os.path.basename(filename or "")
+        if not safe or not safe.startswith("ad_"):
+            raise HTTPException(404, "No encontrada")
+        photos_dir = getattr(request.app.state, "photos_dir", None)
+        if not photos_dir:
+            raise HTTPException(404, "No encontrada")
+        path = _os.path.join(photos_dir, "ads", safe)
+        if not _os.path.isfile(path):
+            raise HTTPException(404, "No encontrada")
+        return FileResponse(path)
 
     return router

@@ -174,3 +174,106 @@
 
 .ad-notice:empty{display:none}.ad-notice{margin:0 4px 12px}
 .guide-card h3{margin:0 0 6px;font-size:17px}.guide-card details{border:1px solid var(--line);border-radius:14px;padding:10px 12px;margin:8px 0;background:#faf9ff}.guide-card summary{cursor:pointer;font-weight:800;font-size:14px}.guide-card ol{margin:10px 0 2px;padding-left:20px;font-size:13px;line-height:1.55;color:#5f5a6b}.guide-card .guide-check{background:#f3f0ff;border-radius:14px;padding:11px 12px;margin:12px 0;font-size:13px;line-height:1.5}
+
+/* ── Stats & Referral ─────────────────────────── */
+.stats-content{padding:4px 0 12px}
+.stats-loading{text-align:center;padding:32px;color:var(--muted)}
+.stats-cards{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}
+.stat-card{background:var(--surface);border-radius:16px;padding:14px 10px;text-align:center;box-shadow:0 4px 14px #2820440a}
+.stat-card span{display:block;font-size:11px;color:var(--muted);margin-bottom:4px}
+.stat-card b{font-size:20px;color:var(--text)}
+.stat-modes{margin-top:8px}
+.stat-modes h4{font-size:13px;font-weight:800;margin:12px 0 6px}
+.stat-mode-row{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border)}
+.day-bars-wrap{display:flex;gap:4px;align-items:flex-end;height:80px;overflow-x:auto;padding:4px 0 8px;margin:8px 0}
+.day-bar{display:flex;flex-direction:column;align-items:center;gap:3px;min-width:28px;flex:1}
+.day-bar-fill{background:var(--accent);border-radius:4px 4px 0 0;width:100%;min-height:4px;transition:height .3s}
+.day-bar span{font-size:9px;color:var(--muted)}
+.stats-section{margin-top:20px;padding-top:16px;border-top:1px solid var(--border)}
+.stats-section h3{font-size:16px;font-weight:800;margin:0 0 6px}
+.refer-code-box{background:var(--surface);border-radius:16px;padding:14px;margin:12px 0}
+.refer-code-box span{font-size:12px;color:var(--muted);display:block;margin-bottom:6px}
+.refer-stats-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:10px 0}
+.refer-stat{background:var(--surface);border-radius:14px;padding:12px;text-align:center}
+.refer-stat span{display:block;font-size:11px;color:var(--muted);margin-bottom:4px}
+.refer-stat b{font-size:22px}
+.refer-apply{margin-top:16px}
+.refer-apply h4{font-size:14px;font-weight:800;margin:0 0 8px}
+.refer-apply-row{display:flex;gap:8px}
+.refer-apply-row input{flex:1;min-width:0}
+/* Monthly plan popular badge */
+.popular-pill{background:linear-gradient(135deg,#ff6b6b,#ff4d35);color:#fff}
+
+/* ── Fullscreen Ad ───────────────────────────────── */
+.ad-fullscreen {
+  position: fixed; inset: 0; z-index: 150;
+  background: #0e0c14;
+  display: flex; align-items: stretch;
+  flex-direction: column;
+}
+.ad-fs-inner {
+  flex: 1; display: flex; flex-direction: column;
+  max-width: 520px; width: 100%; margin: auto;
+  padding: calc(env(safe-area-inset-top, 0px) + 16px) 20px
+           calc(env(safe-area-inset-bottom, 0px) + 16px);
+  gap: 12px; overflow-y: auto;
+}
+.ad-fs-tag-row {
+  display: flex; justify-content: space-between; align-items: center;
+}
+.ad-timer-badge {
+  background: rgba(255,255,255,.12); color: #fff;
+  font-size: 13px; font-weight: 800;
+  padding: 4px 11px; border-radius: 99px; min-width: 36px; text-align: center;
+  transition: background .3s;
+}
+.ad-fs-image { border-radius: 18px; overflow: hidden; max-height: 48vh; }
+.ad-fs-img   { width: 100%; height: 100%; object-fit: cover; display: block; border-radius: 18px; }
+.ad-fs-content { flex: 1; }
+.ad-fs-title  { display: block; font-size: 22px; font-weight: 900; color: #fff; line-height: 1.25; margin-bottom: 8px; }
+.ad-fs-body   { margin: 0; color: rgba(255,255,255,.72); font-size: 15px; line-height: 1.5; }
+.ad-fs-byline { display: block; color: rgba(255,255,255,.45); font-size: 12px; margin-top: 6px; }
+.ad-fs-actions { display: flex; flex-direction: column; gap: 10px; }
+.ad-fs-cta-btn {
+  width: 100%; padding: 15px; border-radius: 16px;
+  background: #fff; color: #0e0c14;
+  font-weight: 800; font-size: 16px; border: 0; cursor: pointer;
+  transition: transform .12s, opacity .12s;
+}
+.ad-fs-cta-btn:active { transform: scale(.97); opacity: .9; }
+.ad-fs-progress-wrap {
+  height: 4px; background: rgba(255,255,255,.15); border-radius: 99px; overflow: hidden;
+}
+.ad-fs-progress {
+  height: 100%; background: var(--purple); border-radius: 99px;
+  width: 0%; transition: width .25s linear;
+}
+.ad-fs-continue {
+  background: rgba(255,255,255,.12) !important;
+  box-shadow: none !important; color: #fff !important;
+  font-size: 14px !important; padding: 13px !important;
+}
+.ad-fs-continue:not(:disabled) {
+  background: rgba(77,53,255,.8) !important;
+}
+body.ad-open { overflow: hidden; }
+
+/* ── Ad image uploader (editor del negocio) ───────── */
+.ad-img-uploader { margin: 8px 0; }
+.ad-img-preview  { margin: 6px 0; }
+.ad-img-thumb    { max-height: 140px; border-radius: 12px; display: block; }
+.ad-upload-btn   { padding: 10px 14px; font-size: 13px; }
+.ad-upload-status { font-size: 11px; color: var(--muted); margin: 4px 0 0; min-height: 16px; }
+.ad-upload-or    {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--muted); font-size: 11px; margin: 8px 0 4px;
+}
+.ad-upload-or::before,.ad-upload-or::after {
+  content: ''; flex: 1; height: 1px; background: var(--line);
+}
+
+/* ── Share-to-earn banner ───────────────────────────────────────────── */
+.d-share-earn-banner{display:flex;align-items:center;justify-content:space-between;gap:10px;background:#e8f9ec;border-radius:16px;padding:13px 15px;margin:4px 0 8px;font-size:13px;font-weight:600;color:#174d20}
+.d-share-earn-banner.done{background:#f0fdf4;color:#2d6a35;justify-content:center;font-weight:700}
+.d-share-earn-btn{flex-shrink:0;background:#22c55e;color:#fff;border-radius:12px;padding:9px 13px;font-size:12px;font-weight:800;cursor:pointer}
+.d-share-earn-btn:disabled{opacity:.6;cursor:default}

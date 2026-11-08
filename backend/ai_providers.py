@@ -428,6 +428,7 @@ def _build_prompt(mode: str, module: str) -> str:
         "enamorar": "cálido, atento y romántico; expresa interés genuino sin exagerar ni fingir intimidad que no existe",
         "provocativo": "atrevido, sugerente y con picardía, sin ser vulgar, explícito ni presionar a la otra persona",
         "salvar": "maduro, tranquilo y empático; reduce la tensión, aclara la intención y evita ponerse a la defensiva",
+        "reactivar": "creativo y directo; rompe el silencio con un mensaje fresco que retoma la conversación de forma natural, sin mencionar el tiempo transcurrido ni que hubo silencio",
     }
     style = styles.get(mode, "natural, atento y apropiado para el contexto")
     if module == "story":
