@@ -56,6 +56,8 @@ function _applyAuthData(d){
   loadProfile();
   updateUsage();
   _hideLoginScreen();
+  // Mostrar la app si estaba oculta (login desde web/Android)
+  $('#app')?.classList.remove('hidden');
 }
 function _hideLoginScreen(){const ls=$('#loginScreen');if(ls)ls.classList.add('hidden');}
 
@@ -424,4 +426,13 @@ $('#statsBack').onclick=goBack;
 // Stats screen button — add to profile screen via more menu
 $('#copyReferCode').onclick=async()=>{const code=$('#myReferCode').textContent;if(!code||code==='—')return;try{await navigator.clipboard.writeText(code);toast(t('refer_copied'))}catch(e){toast(code)}};
 $('#applyReferCode').onclick=async()=>{const code=$('#referCodeInput').value.trim().toUpperCase();if(!code)return;const btn=$('#applyReferCode');btn.disabled=true;try{const r=await fetch('/api/referral/apply',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+state.authToken},body:JSON.stringify({refer_code:code})});const d=await r.json();const msg=$('#referApplyMsg');msg.classList.remove('hidden');msg.textContent=r.ok?t('refer_apply_ok'):d.detail||'Error';if(r.ok){$('#referCodeInput').value='';$('#referCodeInput').disabled=true;btn.style.display='none'}}catch(e){$('#referApplyMsg').classList.remove('hidden');$('#referApplyMsg').textContent='Error de conexión'}finally{btn.disabled=false}};
-applyLanguage();loadPaymentPricing();const _splashTimeout=new Promise(r=>setTimeout(r,5000));Promise.race([auth(),_splashTimeout]).finally(()=>{$('#splash').classList.add('hidden');$('#app').classList.remove('hidden')});
+applyLanguage();loadPaymentPricing();
+// Si hay initData de Telegram (Mini App) mostramos la app directamente al terminar.
+// En web/Android, _applyAuthData o _showLoginScreen se encargan de mostrar lo correcto.
+const _splashTimeout=new Promise(r=>setTimeout(r,5000));
+Promise.race([auth(),_splashTimeout]).finally(()=>{
+  $('#splash').classList.add('hidden');
+  // Solo mostrar #app si ya tenemos sesión (no estamos en la pantalla de login web)
+  const loginVisible=$('#loginScreen')&&!$('#loginScreen').classList.contains('hidden');
+  if(!loginVisible){$('#app').classList.remove('hidden');}
+});
