@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 from PIL import Image
 import base64, hashlib, hmac, io, json, logging, os, re, sqlite3, threading, time, uuid
@@ -1058,8 +1058,19 @@ def start_payment_archive_worker() -> bool:
         return True
 
 
+def _public_base_url() -> str:
+    """Absolute origin for canonical, Open Graph and sitemap links."""
+    configured = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if configured.startswith("https://"):
+        return configured
+    return "https://responde-ai-telegram-production-6cdc.up.railway.app"
+
 @app.get("/")
-def root(): return FileResponse(os.path.join(ROOT,"index.html"))
+def root():
+    with open(os.path.join(ROOT, "index.html"), encoding="utf-8") as handle:
+        html = handle.read().replace("__PUBLIC_BASE_URL__", _public_base_url())
+    return HTMLResponse(html)
+
 @app.get("/admin.html")
 def admin_page(): return FileResponse(os.path.join(ROOT,"admin.html"), media_type="text/html")
 
@@ -1074,6 +1085,8 @@ def js(): return FileResponse(os.path.join(ROOT,"app.js"),media_type="applicatio
 def ads_js(): return FileResponse(os.path.join(ROOT,"ads.js"),media_type="application/javascript")
 @app.get("/dating.js")
 def dating_js(): return FileResponse(os.path.join(ROOT,"dating.js"),media_type="application/javascript")
+@app.get("/chat.js")
+def chat_js(): return FileResponse(os.path.join(ROOT,"chat.js"),media_type="application/javascript")
 @app.get("/style.css")
 def css(): return FileResponse(os.path.join(ROOT,"style.css"),media_type="text/css")
 @app.get("/liggacuba-logo.jpg")
@@ -1086,6 +1099,31 @@ def image_guide(): return FileResponse(os.path.join(ROOT,"image-guide.html"),med
 def content_rules(): return FileResponse(os.path.join(ROOT,"rules.html"),media_type="text/html")
 @app.get("/terms.html")
 def terms(): return FileResponse(os.path.join(ROOT,"terms.html"),media_type="text/html")
+@app.get("/robots.txt")
+def robots_txt():
+    base = _public_base_url()
+    body = (
+        "User-agent: *\n"
+        "Allow: /\n"
+        "Disallow: /admin.html\n"
+        "Disallow: /api/\n"
+        f"Sitemap: {base}/sitemap.xml\n"
+    )
+    return PlainTextResponse(body)
+
+@app.get("/sitemap.xml")
+def sitemap_xml():
+    base = _public_base_url()
+    pages = ("/", "/privacy.html", "/terms.html", "/rules.html", "/image-guide.html")
+    urls = "".join(f"<url><loc>{base}{path}</loc></url>" for path in pages)
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        + urls +
+        "</urlset>"
+    )
+    return Response(content=xml, media_type="application/xml")
+
 @app.get("/health")
 def health():
     """Liveness/readiness probe: reports database availability without internals."""
