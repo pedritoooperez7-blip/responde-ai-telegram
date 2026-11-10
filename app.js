@@ -186,7 +186,7 @@ const FULL_SCREENS=['premiumScreen','transferScreen','paymentMethodScreen','proo
 // aparecen "visibles", lo que dejaba la pila de navegación con 'chatScreen' y la pantalla en blanco al volver atrás.
 function currentScreenId(){return TOP_SCREENS.find(id=>{const e=$('#'+id);return e&&!e.classList.contains('hidden')})||'homeScreen'}
 function hideTopScreens(){TOP_SCREENS.forEach(id=>$('#'+id)?.classList.add('hidden'))}
-function showScreen(id){const cur=currentScreenId();if(cur!==id){screenStack.push(cur);if(screenStack.length>20)screenStack.splice(0,screenStack.length-20);}hideTopScreens();$('#'+id)?.classList.remove('hidden');$('.bottom-nav').classList.toggle('hidden',FULL_SCREENS.includes(id));}
+function showScreen(id){const cur=currentScreenId();if(cur!==id){screenStack.push(cur);if(screenStack.length>20)screenStack.splice(0,screenStack.length-20);}hideTopScreens();$('#'+id)?.classList.remove('hidden');$('.bottom-nav').classList.toggle('hidden',FULL_SCREENS.includes(id));window.scrollTo(0,0);}
 function goBack(){const previous=screenStack.pop();if(!previous)return home();if(previous==='homeScreen')return home();if(previous==='profileScreen')return profile();if(previous==='settingsScreen')return settings();if(previous==='moreScreen')return more();if(previous==='statsScreen'){hideTopScreens();$('#statsScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden');return}hideTopScreens();$('#'+previous)?.classList.remove('hidden');$('.bottom-nav').classList.toggle('hidden',FULL_SCREENS.includes(previous));}
 function showPremium(reason='general'){try{window.LiggaChat&&window.LiggaChat.leaveDating&&window.LiggaChat.leaveDating()}catch(_){};const cur=currentScreenId();if(cur!=='premiumScreen'){screenStack.push(cur);if(screenStack.length>20)screenStack.splice(0,screenStack.length-20);}['#datingScreen','#homeScreen','#profileScreen','#settingsScreen','#moreScreen','#transferScreen','#paymentMethodScreen','#proofScreen','#supportScreen','#businessAdScreen','#businessAdEditorScreen','#statsScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#premiumScreen').classList.remove('hidden');$('.bottom-nav').classList.add('hidden');if(reason==='limit')$('#premiumReason').textContent=t('no_more');else if(reason==='locked')$('#premiumReason').textContent=t('premium_only');else $('#premiumReason').textContent='';updatePremiumView()}
 function hidePremium(){['#premiumScreen','#paymentFlow','#transferScreen','#paymentMethodScreen','#proofScreen','#supportScreen','#businessAdScreen','#businessAdEditorScreen'].forEach(s=>$(s)?.classList.add('hidden'));goBack()}
@@ -357,6 +357,7 @@ function settings(){try{window.LiggaChat&&window.LiggaChat.leaveDating&&window.L
 async function showStats(){
   if(currentScreenId()!=='statsScreen')showScreen('statsScreen');
   $('.bottom-nav').classList.remove('hidden');
+  window.scrollTo(0,0);
   $('#statsContent').innerHTML='<div class="stats-loading"><i class="fa-solid fa-spinner fa-spin"></i></div>';
   try{
     const r=await fetch('/api/stats',{headers:{'Authorization':'Bearer '+state.authToken}});
