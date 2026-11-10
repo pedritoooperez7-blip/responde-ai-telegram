@@ -138,7 +138,7 @@
 
   // ---- navegación -------------------------------------------------------
   function hideOthers() {
-    ['#homeScreen', '#profileScreen', '#settingsScreen', '#moreScreen', '#premiumScreen', '#transferScreen', '#paymentMethodScreen', '#proofScreen', '#supportScreen','#businessAdScreen'].forEach(s => $(s)?.classList.add('hidden'));
+    ['#homeScreen', '#profileScreen', '#settingsScreen', '#moreScreen', '#premiumScreen', '#transferScreen', '#paymentMethodScreen', '#proofScreen', '#supportScreen', '#businessAdScreen', '#businessAdEditorScreen', '#statsScreen'].forEach(s => $(s)?.classList.add('hidden'));
     $('#datingScreen').classList.remove('hidden');
     $('.bottom-nav').classList.remove('hidden');
     $$('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.nav === 'dating'));
@@ -649,7 +649,7 @@
   function renderMine() {
     const p = D.me.profile;
     const badge = (s) => el('span', { class: 'd-badge ' + s, text: T('photo_' + s) });
-    const grid = el('div', { class: 'photo-grid' }, D.me.photos.map(ph => el('div', { class: 'photo-tile' },
+    const tiles = D.me.photos.map(ph => el('div', { class: 'photo-tile' },
       el('img', { src: safePhoto(ph.url), alt: '' }), badge(ph.status),
       ph.status === 'rejected' && ph.reject_reason ? el('small', { text: ph.reject_reason }) : null,
       el('button', { class: 'photo-del', type: 'button', 'aria-label': T('photo_delete'), text: '×', onclick: async () => {
@@ -657,13 +657,14 @@
           const r = await fetch('/api/dating/photos/' + Number(ph.id), { method: 'DELETE' });
           if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(typeof d.detail === 'string' ? d.detail : T('error')); }
           D.me = await jpost('/api/dating/me'); renderMine();
-        } catch (e) { fail(e); } } }))));
+        } catch (e) { fail(e); } } })));
     const input = el('input', { type: 'file', accept: 'image/*', hidden: true });
-    const addBtn = el('button', { class: 'secondary', type: 'button', text: T('add_photo'), disabled: D.me.photos.length >= D.cfg.max_photos, onclick: () => input.click() });
+    const addTile = el('button', { class: 'photo-add', type: 'button', disabled: D.me.photos.length >= D.cfg.max_photos, onclick: () => input.click() },
+      el('i', { class: 'fa-solid fa-plus' }), el('span', { text: T('add_photo') }));
     input.onchange = async () => {
       const file = input.files?.[0]; input.value = '';
       if (!file) return;
-      setBusy(addBtn, true, T('uploading'));
+      addTile.disabled = true;
       try {
         const image = await shrink(file);
         await jpost('/api/dating/photos', { image });
@@ -674,22 +675,38 @@
     };
     const status = p.status === 'under_review' ? el('p', { class: 'd-notice', text: T('under_review') })
       : p.status === 'suspended' ? el('p', { class: 'd-notice danger', text: T('suspended') }) : null;
+    const heroPhoto = D.me.photos.find(ph => ph.status === 'approved') || D.me.photos[0];
+    const place = [p.municipality, p.province].filter(Boolean).join(', ');
+    const look = { hombres: T('hombres'), mujeres: T('mujeres'), todos: T('todos') }[p.looking_for] || '';
+    const who = [p.gender ? T(p.gender) : '', look ? (T('looking') + ': ' + look) : '', (p.min_age && p.max_age) ? (p.min_age + '–' + p.max_age) : ''].filter(Boolean).join(' · ');
+    const hero = el('div', { class: 'tinder-photo' },
+      heroPhoto ? el('img', { src: safePhoto(heroPhoto.url), alt: '' }) : el('div', { class: 'tinder-empty' }, el('i', { class: 'fa-solid fa-camera' })),
+      el('button', { class: 'tinder-edit', type: 'button', onclick: () => { D.tab = 'form'; render(); } },
+        el('i', { class: 'fa-solid fa-pen' }), el('span', { text: T('edit_profile') })),
+      el('div', { class: 'tinder-shade' },
+        el('h2', { text: p.display_name + ', ' + p.age }),
+        place ? el('p', { class: 'tinder-loc' }, el('i', { class: 'fa-solid fa-location-dot' }), ' ' + place) : null));
     setBody(
       status,
-      el('div', { class: 'd-card' },
-        el('h2', { text: `${p.display_name}, ${p.age}` }),
-        el('p', { class: 'd-muted', text: [p.province, p.municipality].filter(Boolean).join(' · ') }),
-        p.bio ? el('p', { text: p.bio }) : null,
-        el('button', { class: 'secondary', type: 'button', text: T('edit_profile'), onclick: () => { D.tab = 'form'; render(); } })),
-      el('h3', { class: 'd-sub', text: T('photos') }), grid, input, addBtn,
-      el('p', { class: 'd-muted small', text: T('photo_review_note') }),
       p.visible ? null : el('p', { class: 'd-notice', text: T('paused') }),
-      el('button', { class: 'secondary', type: 'button', text: p.visible ? T('pause') : T('unpause'), onclick: async () => {
-        try { await jpost('/api/dating/visibility', { visible: !p.visible }); D.me = await jpost('/api/dating/me'); renderMine(); } catch (e) { fail(e); } } }),
-      el('button', { class: 'secondary danger-btn', type: 'button', text: T('delete_data'), onclick: async () => {
-        if (!await datingConfirm(T('delete_confirm'))) return;
-        try { await jpost('/api/dating/delete'); D.me = { profile: null, photos: [] }; D.feed = []; D.tab = 'intro'; toast(T('deleted')); render(); } catch (e) { fail(e); } } }));
+      el('article', { class: 'tinder-card mine' }, hero),
+      p.bio ? el('section', { class: 'mine-block' }, el('h3', { text: T('bio') }), el('p', { text: p.bio })) : null,
+      who ? el('section', { class: 'mine-block' }, el('h3', { text: T('sec_identity') }), el('p', { text: who })) : null,
+      (p.interests || []).length ? el('section', { class: 'mine-block' },
+        el('h3', { text: T('interests').split(' (')[0] }),
+        el('div', { class: 'chips' }, p.interests.map(i => el('span', { class: 'chip', text: i })))) : null,
+      el('h3', { class: 'd-sub', text: T('photos') }),
+      el('div', { class: 'photo-grid' }, tiles, D.me.photos.length >= D.cfg.max_photos ? null : addTile),
+      input,
+      el('p', { class: 'd-muted small', text: T('photo_review_note') }),
+      el('div', { class: 'mine-actions' },
+        el('button', { class: 'secondary', type: 'button', text: p.visible ? T('pause') : T('unpause'), onclick: async () => {
+          try { await jpost('/api/dating/visibility', { visible: !p.visible }); D.me = await jpost('/api/dating/me'); renderMine(); } catch (e) { fail(e); } } }),
+        el('button', { class: 'secondary danger-btn', type: 'button', text: T('delete_data'), onclick: async () => {
+          if (!await datingConfirm(T('delete_confirm'))) return;
+          try { await jpost('/api/dating/delete'); D.me = { profile: null, photos: [] }; D.feed = []; D.tab = 'intro'; toast(T('deleted')); render(); } catch (e) { fail(e); } } })));
   }
+
   // Reduce la foto en el dispositivo antes de subirla (ahorra datos móviles).
   function shrink(file) {
     return new Promise((resolve, reject) => {
@@ -730,10 +747,21 @@
           el('button', { class: 'secondary', type: 'button', text: T('refresh'), onclick: renderDiscover })));
     }
     const photos = p.photos.map(safePhoto).filter(Boolean);
-    const idx = Math.min(D.photoIdx, photos.length - 1);
-    const shot = el('div', { class: 'd-photo' },
-      photos.length ? el('img', { src: photos[idx], alt: '' }) : null,
+    const idx = Math.min(D.photoIdx, Math.max(photos.length - 1, 0));
+    const place = [p.municipality, p.province].filter(Boolean).join(', ');
+    const locLine = place + (p.same_province ? ' · ' + T('same_province') : '');
+    const shot = el('div', { class: 'tinder-photo' },
+      photos.length ? el('img', { src: photos[idx], alt: '' }) : el('div', { class: 'tinder-empty' }, el('i', { class: 'fa-solid fa-user' })),
       photos.length > 1 ? el('div', { class: 'd-dots' }, photos.map((_, i) => el('i', { class: i === idx ? 'on' : '' }))) : null,
+      el('button', { class: 'tinder-flag', type: 'button', 'aria-label': T('report'), onclick: () => reportSheet(p.public_id) },
+        el('i', { class: 'fa-regular fa-flag' })),
+      el('div', { class: 'tinder-shade' },
+        el('h2', { text: p.display_name + ', ' + p.age }),
+        locLine ? el('p', { class: 'tinder-loc' }, el('i', { class: 'fa-solid fa-location-dot' }), ' ' + locLine) : null,
+        p.bio ? el('p', { class: 'tinder-bio', text: p.bio }) : null,
+        ((p.interests && p.interests.length) || p.in_common) ? el('div', { class: 'chips tinder-chips' },
+          p.in_common ? el('span', { class: 'chip match', text: X(p.in_common === 1 ? 'in_common_one' : 'in_common', { n: p.in_common }) }) : null,
+          (p.interests || []).slice(0, 6).map(i => el('span', { class: 'chip', text: i }))) : null),
       el('button', { class: 'tap left', type: 'button', 'aria-label': '‹', onclick: () => { D.photoIdx = Math.max(0, idx - 1); renderDiscover(); } }),
       el('button', { class: 'tap right', type: 'button', 'aria-label': '›', onclick: () => { D.photoIdx = Math.min(photos.length - 1, idx + 1); renderDiscover(); } }));
     const limitText = D.premium ? T('likes_unlimited') : (D.likesLeft != null ? T('likes_left', { n: D.likesLeft }) : '');
@@ -759,17 +787,11 @@
           ? el('div', { class: 'd-share-earn-banner done' }, el('span', { text: T('share_earn_done') }))
           : null);
     setBody(likesBanner(), shareEarnBanner,
-      el('div', { class: 'd-card profile' }, shot,
-        el('div', { class: 'd-info' },
-          el('h2', { text: `${p.display_name}, ${p.age}` }),
-          el('p', { class: 'd-muted', text: [p.province, p.municipality].filter(Boolean).join(' · ') + (p.same_province ? ' · ' + T('same_province') : '') }),
-          p.bio ? el('p', { text: p.bio }) : null,
-          el('div', { class: 'chips' }, p.in_common ? el('span', { class: 'chip match', text: X(p.in_common === 1 ? 'in_common_one' : 'in_common', { n: p.in_common }) }) : null, (p.interests || []).map(i => el('span', { class: 'chip', text: i }))),
-          el('button', { class: 'text-btn small', type: 'button', text: T('report'), onclick: () => reportSheet(p.public_id) }))),
-      el('div', { class: 'd-actions' },
-        el('button', { class: 'round', type: 'button', 'aria-label': T('pass'), onclick: () => swipe('pass'), text: '✕' }),
-        el('button', { class: 'round like', type: 'button', 'aria-label': T('like'), onclick: () => swipe('like'), text: '♥' }),
-        el('button', { class: 'pill-btn', type: 'button', text: T('undo') + (D.premium ? '' : ' · Premium'), onclick: undo })),
+      el('article', { class: 'tinder-card' }, shot),
+      el('div', { class: 'tinder-actions' },
+        el('button', { class: 'tinder-btn rewind', type: 'button', 'aria-label': T('undo'), onclick: undo }, el('i', { class: 'fa-solid fa-rotate-left' })),
+        el('button', { class: 'tinder-btn nope', type: 'button', 'aria-label': T('pass'), onclick: () => swipe('pass') }, el('i', { class: 'fa-solid fa-xmark' })),
+        el('button', { class: 'tinder-btn like', type: 'button', 'aria-label': T('like'), onclick: () => swipe('like') }, el('i', { class: 'fa-solid fa-heart' }))),
       el('p', { class: 'd-muted center small', text: limitText }),
       el('p', { class: 'd-muted center small', text: T('safety') }));
   }

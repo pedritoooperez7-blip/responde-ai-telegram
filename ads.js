@@ -286,7 +286,7 @@
       field('link_url', 'Enlace (https:// o t.me/…)', 300, 'input', 'https://t.me/minegocio'),
       imgUploader,
       el('p', { class: 'd-muted', text: 'Cada cambio vuelve a revisión. Debe cumplir las reglas de contenido.' }),
-      el('a', { href: '/rules.html', text: 'Ver reglas de contenido' }),
+      el('a', { href: '/rules.html', text: 'Ver reglas de contenido para anunciantes' }),
       err, save));
   }
 
