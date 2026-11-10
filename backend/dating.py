@@ -1,10 +1,10 @@
-"""LiggaCuba Citas: descubrir perfiles, dar like y hacer match.
+"""LiggaCuba Citas: descubrir perfiles, dar like, hacer match y chatear.
 
 Decisiones de diseño
 --------------------
-* NO hay chat interno. Cuando dos personas se dan like (match), cada una ve el
-  canal de contacto que la otra decidió compartir: su usuario de Telegram
-  (t.me/usuario) y/o su WhatsApp (wa.me/numero). La conversación ocurre fuera.
+* Hay un chat interno ligero (texto, sin imágenes ni stickers).
+* Los usuarios free tienen un límite de FREE_MSG_LIMIT mensajes por match.
+* Los contactos externos (Telegram/WhatsApp) siguen disponibles en el perfil.
 * Los contactos solo se muestran en matches activos. Bloquear o deshacer un
   match los oculta de inmediato.
 * Se exige ser mayor de 18 años (fecha de nacimiento) y aceptar los términos.
@@ -55,6 +55,10 @@ PHOTO_URL_TTL = 3600
 REPORT_AUTOHIDE_THRESHOLD = 3
 UNDO_WINDOW_SECONDS = 24 * 3600
 MAX_MINOR_REPORTS_PER_DAY = 3
+
+# ── Chat interno ──────────────────────────────────────────────────────────────
+FREE_MSG_LIMIT = int(os.getenv("DATING_FREE_MSG_LIMIT", "8"))
+MSG_RATE_PER_MINUTE = int(os.getenv("DATING_MSG_RATE_PER_MINUTE", "10"))
 
 GENDERS = ("hombre", "mujer", "otro")
 LOOKING_FOR = ("hombres", "mujeres", "todos")
@@ -115,6 +119,29 @@ CREATE INDEX IF NOT EXISTS idx_dating_reports_open ON dating_reports(reported_id
 """
 
 
+CHAT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS dating_messages (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  match_id   INTEGER NOT NULL,
+  sender_id  TEXT    NOT NULL,
+  body       TEXT    NOT NULL,
+  created_at TEXT    NOT NULL,
+  read_at    TEXT,
+  is_system  INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY (match_id) REFERENCES dating_matches(id)
+);
+CREATE INDEX IF NOT EXISTS idx_dmsg_match_created ON dating_messages(match_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_dmsg_match_id      ON dating_messages(match_id, id);
+CREATE INDEX IF NOT EXISTS idx_dmsg_unread        ON dating_messages(match_id, sender_id, read_at);
+CREATE TABLE IF NOT EXISTS dating_chat_presence (
+  user_id    TEXT NOT NULL,
+  match_id   INTEGER NOT NULL,
+  seen_at    TEXT NOT NULL,
+  PRIMARY KEY (user_id, match_id)
+);
+"""
+
+
 class DatingError(Exception):
     """Error de negocio con código HTTP sugerido."""
 
@@ -142,6 +169,8 @@ def init_schema(connection: sqlite3.Connection) -> None:
         PRIMARY KEY(user_id, earn_date)
     );
     """)
+    # Schema del chat interno
+    connection.executescript(CHAT_SCHEMA)
 
 
 def _utcnow() -> datetime:
@@ -719,11 +748,24 @@ def record_swipe(c: sqlite3.Connection, uid: str, target_public_id: str, action:
             raise DatingError("Llegaste al límite diario de likes. Mejora a Premium para likes ilimitados.", 403, "daily_limit")
         c.execute("INSERT INTO dating_swipes(user_id,target_id,action,created_at) VALUES(?,?,?,?)", (uid, tid, action, now))
         matched = False
+        match_row_id = None
         if action == "like" and c.execute(
                 "SELECT 1 FROM dating_swipes WHERE user_id=? AND target_id=? AND action='like'", (tid, uid)).fetchone():
             a, b = _pair(uid, tid)
             c.execute("INSERT OR IGNORE INTO dating_matches(user_a,user_b,status,created_at) VALUES(?,?,?,?)", (a, b, "active", now))
             c.execute("UPDATE dating_matches SET status='active',ended_at=NULL WHERE user_a=? AND user_b=? AND status!='active'", (a, b))
+            row = c.execute("SELECT id FROM dating_matches WHERE user_a=? AND user_b=?", (a, b)).fetchone()
+            match_row_id = int(row["id"]) if row else None
+            # Mensaje de sistema inicial (solo si aún no hay mensajes en este match)
+            if match_row_id is not None:
+                existing = c.execute(
+                    "SELECT 1 FROM dating_messages WHERE match_id=? LIMIT 1", (match_row_id,)
+                ).fetchone()
+                if not existing:
+                    c.execute(
+                        "INSERT INTO dating_messages(match_id, sender_id, body, created_at, is_system) VALUES(?,?,?,?,1)",
+                        (match_row_id, "system", "¡Es un match!", now),
+                    )
             matched = True
         c.commit()
     except Exception:
@@ -734,6 +776,8 @@ def record_swipe(c: sqlite3.Connection, uid: str, target_public_id: str, action:
     if matched:
         result["notify"] = [uid, tid]
         result["match_public_id"] = target["public_id"]
+        if match_row_id is not None:
+            result["match_id"] = match_row_id
     return result
 
 
@@ -949,12 +993,193 @@ def admin_stats(c: sqlite3.Connection) -> Dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
+# Chat interno — funciones de negocio
+# ---------------------------------------------------------------------------
+
+def _require_active_match(c: sqlite3.Connection, uid: str, match_id: int) -> sqlite3.Row:
+    """Devuelve la fila del match si está activo y el usuario pertenece a él."""
+    row = c.execute(
+        "SELECT * FROM dating_matches WHERE id=? AND status='active' AND (user_a=? OR user_b=?)",
+        (int(match_id), str(uid), str(uid))
+    ).fetchone()
+    if not row:
+        raise DatingError("Chat no disponible.", 404, "match_not_found")
+    return row
+
+
+def count_sent_messages(c: sqlite3.Connection, match_id: int, sender_id: str) -> int:
+    """Número de mensajes (no sistema) que el remitente ya envió en este match."""
+    return c.execute(
+        "SELECT COUNT(*) FROM dating_messages WHERE match_id=? AND sender_id=? AND is_system=0",
+        (int(match_id), str(sender_id))
+    ).fetchone()[0]
+
+
+def get_messages(
+    c: sqlite3.Connection,
+    uid: str,
+    match_id: int,
+    after_id: int = 0,
+    limit: int = 40,
+) -> Dict[str, Any]:
+    """Devuelve mensajes del match paginados por after_id (polling incremental)."""
+    _require_active_match(c, uid, match_id)
+    touch_chat_presence(c, uid, match_id)
+    rows = c.execute(
+        "SELECT * FROM dating_messages WHERE match_id=? AND id>? ORDER BY id LIMIT ?",
+        (int(match_id), int(after_id), min(100, int(limit or 40)))
+    ).fetchall()
+    messages = [
+        {
+            "id":         r["id"],
+            "sender_id":  r["sender_id"],
+            "body":       r["body"],
+            "created_at": r["created_at"],
+            "read_at":    r["read_at"],
+            "is_system":  bool(r["is_system"]),
+        }
+        for r in rows
+    ]
+    last_id = messages[-1]["id"] if messages else int(after_id)
+    return {"messages": messages, "last_id": last_id}
+
+
+def post_message(
+    c: sqlite3.Connection,
+    uid: str,
+    match_id: int,
+    body: str,
+    free_msg_limit: int,
+    is_premium_user: bool,
+    now: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Envía un mensaje al match.
+
+    Reglas:
+    - Match debe estar active y el usuario debe ser parte de él.
+    - Bloquea enlaces (_LINK_RE).
+    - Aplica límite de mensajes para free users.
+    - Solo texto (sin imágenes en el MVP).
+    """
+    uid = str(uid)
+    now = now or _now()
+
+    body = str(body or "").strip()
+    if not body:
+        raise DatingError("El mensaje no puede estar vacío.")
+    if len(body) > 1000:
+        raise DatingError("El mensaje es demasiado largo (máximo 1000 caracteres).")
+    if _LINK_RE.search(body):
+        raise DatingError(
+            "Los mensajes no pueden contener enlaces ni usuarios. "
+            "Comparte tu contacto en tu perfil para que lo vean tus matches."
+        )
+
+    _require_active_match(c, uid, match_id)
+
+    if not is_premium_user:
+        sent = count_sent_messages(c, match_id, uid)
+        if sent >= free_msg_limit:
+            raise DatingError(
+                f"Con el plan gratuito puedes enviar {free_msg_limit} mensajes por match. "
+                "Mejora a Premium para escribir sin límite.",
+                403, "msg_limit"
+            )
+
+    cur = c.execute(
+        "INSERT INTO dating_messages(match_id, sender_id, body, created_at, is_system) VALUES(?,?,?,?,0)",
+        (int(match_id), uid, body, now)
+    )
+    c.commit()
+
+    return {
+        "id":         cur.lastrowid,
+        "sender_id":  uid,
+        "body":       body,
+        "created_at": now,
+        "read_at":    None,
+        "is_system":  False,
+    }
+
+
+def mark_messages_read(c: sqlite3.Connection, uid: str, match_id: int) -> None:
+    """Marca como leídos los mensajes del otro usuario en este match."""
+    _require_active_match(c, uid, match_id)
+    c.execute(
+        "UPDATE dating_messages SET read_at=? WHERE match_id=? AND sender_id!=? AND read_at IS NULL AND is_system=0",
+        (_now(), int(match_id), str(uid))
+    )
+    c.execute(
+        "INSERT INTO dating_chat_presence(user_id, match_id, seen_at) VALUES(?,?,?) "
+        "ON CONFLICT(user_id, match_id) DO UPDATE SET seen_at=excluded.seen_at",
+        (str(uid), int(match_id), _now()),
+    )
+    c.commit()
+
+
+def touch_chat_presence(c: sqlite3.Connection, uid: str, match_id: int) -> None:
+    """Registra que el usuario tiene el chat abierto (polling / lectura)."""
+    c.execute(
+        "INSERT INTO dating_chat_presence(user_id, match_id, seen_at) VALUES(?,?,?) "
+        "ON CONFLICT(user_id, match_id) DO UPDATE SET seen_at=excluded.seen_at",
+        (str(uid), int(match_id), _now()),
+    )
+    c.commit()
+
+
+def is_chat_open(c: sqlite3.Connection, uid: str, match_id: int, window_seconds: int = 15) -> bool:
+    """True si el usuario hizo poll/read de este match en los últimos window_seconds."""
+    row = c.execute(
+        "SELECT seen_at FROM dating_chat_presence WHERE user_id=? AND match_id=?",
+        (str(uid), int(match_id)),
+    ).fetchone()
+    if not row or not row["seen_at"]:
+        return False
+    try:
+        seen = datetime.fromisoformat(row["seen_at"])
+        if seen.tzinfo is not None:
+            seen = seen.replace(tzinfo=None)
+        return (_utcnow() - seen).total_seconds() <= window_seconds
+    except Exception:
+        return False
+
+
+def _enrich_matches_with_chat(c: sqlite3.Connection, uid: str, matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Añade last_message y unread_count a cada match de la lista."""
+    for m in matches:
+        mid = m.get("match_id")
+        if mid is None:
+            m["last_message"] = None
+            m["unread_count"] = 0
+            continue
+        last = c.execute(
+            "SELECT * FROM dating_messages WHERE match_id=? ORDER BY id DESC LIMIT 1",
+            (mid,)
+        ).fetchone()
+        if last:
+            m["last_message"] = {
+                "id":         last["id"],
+                "sender_id":  last["sender_id"],
+                "body":       last["body"],
+                "created_at": last["created_at"],
+                "is_system":  bool(last["is_system"]),
+            }
+        else:
+            m["last_message"] = None
+        m["unread_count"] = c.execute(
+            "SELECT COUNT(*) FROM dating_messages WHERE match_id=? AND sender_id!=? AND read_at IS NULL AND is_system=0",
+            (mid, str(uid))
+        ).fetchone()[0]
+    return matches
+
+
+# ---------------------------------------------------------------------------
 # Rutas HTTP
 # ---------------------------------------------------------------------------
 
 def build_router(*, current_user: Callable, connect: Callable, is_premium: Callable, admin: Callable,
                  audit: Callable, notify: Callable, secret: Callable, photos_dir: Callable,
-                 free_daily_likes: int = 20):
+                 free_daily_likes: int = 20, free_msg_limit: int = FREE_MSG_LIMIT):
     """Crea el APIRouter. ``main.py`` inyecta autenticación, base de datos y Telegram."""
     from fastapi import APIRouter, HTTPException, Request
     from fastapi.responses import FileResponse, Response
@@ -1146,10 +1371,21 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
                 other = c.execute("SELECT * FROM dating_profiles WHERE public_id=?", (result["match_public_id"],)).fetchone()
                 result["match"] = card(c, other, secret())
                 result["match"]["contacts"] = contact_links(other, _username_of(c, other["user_id"]))
+                if result.get("match_id") is not None:
+                    result["match"]["match_id"] = result["match_id"]
             return result
         result = run(work)
+        match_id_for_link = result.get("match_id")
         for user_id in result.pop("notify", []):
-            fire_and_forget(user_id, "💜 <b>¡Tienes un nuevo match en LiggaCuba Citas!</b>\nAbre la Mini App, entra en Matches y escríbele por Telegram o WhatsApp.")
+            link_hint = ""
+            if match_id_for_link is not None:
+                link_hint = f"\nAbre la Mini App (startapp=chat_{match_id_for_link}) para chatear."
+            else:
+                link_hint = "\nAbre la Mini App, entra en Matches y escríbele."
+            fire_and_forget(
+                user_id,
+                "💜 <b>¡Tienes un nuevo match en LiggaCuba Citas!</b>" + link_hint,
+            )
         result.pop("match_public_id", None)
         return result
 
@@ -1169,7 +1405,13 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
     @router.post("/api/dating/matches")
     def dating_matches(request: Request):
         uid = current_user(request)
-        return {"matches": run(lambda c: list_matches(c, uid, secret()))}
+
+        def work(c):
+            raw = list_matches(c, uid, secret())
+            enriched = _enrich_matches_with_chat(c, uid, raw)
+            return {"matches": enriched}
+
+        return run(work)
 
     @router.post("/api/dating/unmatch")
     def dating_unmatch(p: MatchIn, request: Request):
@@ -1238,6 +1480,54 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
         audit(ident["username"], "dating_profile_restored", user_id, {})
         fire_and_forget(user_id,
             "✅ <b>Tu perfil de Citas ha sido reactivado.</b>\n\nYa puedes usar Citas con normalidad. ¡Mucho éxito! 💜")
+        return {"success": True}
+
+    # --- chat interno -------------------------------------------------------
+    msg_rate_limiter = _limits.SlidingWindowLimiter(
+        int(os.getenv("DATING_MSG_RATE_PER_MINUTE", str(MSG_RATE_PER_MINUTE))), 60
+    )
+
+    class MessageIn(BaseModel):
+        body: str = ""
+
+    @router.get("/api/dating/matches/{match_id}/messages")
+    def dating_messages_get(match_id: int, request: Request, after_id: int = 0, limit: int = 40):
+        uid = current_user(request)
+        return run(lambda c: get_messages(c, uid, match_id, after_id, limit))
+
+    @router.post("/api/dating/matches/{match_id}/messages")
+    def dating_messages_post(match_id: int, p: MessageIn, request: Request):
+        uid = current_user(request)
+        throttle(msg_rate_limiter, uid, "Vas muy rápido. Espera un momento.")
+        premium_user = is_premium(uid)
+
+        def work(c):
+            msg = post_message(c, uid, match_id, p.body, free_msg_limit, premium_user)
+            # Notificar al otro usuario (fire_and_forget, solo si no tiene el chat abierto)
+            match_row = c.execute(
+                "SELECT * FROM dating_matches WHERE id=?", (match_id,)
+            ).fetchone()
+            if match_row:
+                other_id = match_row["user_b"] if match_row["user_a"] == uid else match_row["user_a"]
+                # No notificar si el destinatario tiene el chat abierto (poll reciente)
+                if not is_chat_open(c, other_id, match_id, window_seconds=15):
+                    sender_row = c.execute(
+                        "SELECT display_name FROM dating_profiles WHERE user_id=?", (uid,)
+                    ).fetchone()
+                    sender_name = sender_row["display_name"] if sender_row else "Alguien"
+                    fire_and_forget(
+                        other_id,
+                        f"💬 <b>{sender_name} te envió un mensaje en LiggaCuba Citas.</b>\n"
+                        f"Abre la Mini App para leer y responder (startapp=chat_{match_id}).",
+                    )
+            return {"message": msg}
+
+        return run(work)
+
+    @router.post("/api/dating/matches/{match_id}/read")
+    def dating_messages_read(match_id: int, request: Request):
+        uid = current_user(request)
+        run(lambda c: mark_messages_read(c, uid, match_id))
         return {"success": True}
 
     return router
