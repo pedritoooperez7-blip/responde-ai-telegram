@@ -38,7 +38,64 @@ function updateUsage(){['#usageText','#storyUsageText'].forEach(s=>{if($(s))$(s)
 const _fetch=(window.fetch||fetch).bind(window);
 window.fetch=async function(url,options={}){options={...options,headers:{...(options.headers||{})}};if(state.authToken&&((String(url).startsWith("/api/")&&!String(url).startsWith("/api/auth/"))||String(url)==="/ocr"))options.headers.Authorization="Bearer "+state.authToken;return _fetch(url,options)};
 
-async function auth(){try{const r=await fetch('/api/auth/telegram',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData:tg?.initData||'',user_id:state.userId})});if(!r.ok)throw 0;const d=await r.json();state.userId=String(d.user_id);state.authToken=String(d.token||"");if(state.authToken)sessionStorage.setItem('liggacuba_auth',state.authToken);checkAdminShortcut();window.warmDating?.();state.premium=!!d.premium;state.remaining=Number(d.remaining||0);loadProfile();updateUsage()}catch(e){refreshUsage()}}
+// ── Autenticación ──────────────────────────────────────────────────────────
+// 3 caminos:
+//  1. Mini App Telegram  → tg.initData presente   → POST /api/auth/telegram
+//  2. Web/Android con token en sessionStorage      → reutiliza sesión
+//  3. Web/Android sin sesión                       → muestra Telegram Login Widget
+
+function _applyAuthData(d){
+  state.userId=String(d.user_id);
+  state.authToken=String(d.token||'');
+  if(state.authToken)sessionStorage.setItem('liggacuba_auth',state.authToken);
+  checkAdminShortcut();
+  window.warmDating?.();
+  state.premium=!!d.premium;
+  state.premiumUntil=d.premium_until||null;
+  state.remaining=Number(d.remaining||0);
+  loadProfile();
+  updateUsage();
+  _hideLoginScreen();
+}
+function _hideLoginScreen(){const ls=$('#loginScreen');if(ls)ls.classList.add('hidden');}
+
+async function auth(){
+  if(tg?.initData){
+    try{const r=await fetch('/api/auth/telegram',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData:tg.initData,user_id:state.userId})});if(!r.ok)throw 0;_applyAuthData(await r.json());return;}catch(e){refreshUsage();return;}
+  }
+  if(state.authToken){
+    try{const r=await fetch('/api/usage',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId})});if(!r.ok)throw 0;const d=await r.json();state.premium=!!d.premium;state.premiumUntil=d.premium_until||null;state.remaining=Number(d.remaining||0);updateUsage();_hideLoginScreen();return;}catch(e){state.authToken='';sessionStorage.removeItem('liggacuba_auth');}
+  }
+  _showLoginScreen();
+}
+
+async function _showLoginScreen(){
+  const ls=$('#loginScreen');if(!ls)return;
+  ls.classList.remove('hidden');
+  if(!ls.dataset.widgetLoaded){
+    try{const r=await _fetch('/api/auth/bot-username');if(!r.ok)throw 0;const {username}=await r.json();_mountTelegramWidget(username);ls.dataset.widgetLoaded='1';}
+    catch(e){const c=$('#loginWidgetContainer');if(c)c.innerHTML='<p style="color:var(--text-secondary);font-size:13px;text-align:center">No se pudo cargar el widget de Telegram.<br>Recarga la p\u00e1gina.</p>';}
+  }
+}
+
+function _mountTelegramWidget(botUsername){
+  const container=$('#loginWidgetContainer');if(!container||!botUsername)return;
+  container.innerHTML='';
+  const script=document.createElement('script');
+  script.src='https://telegram.org/js/telegram-widget.js?22';
+  script.setAttribute('data-telegram-login',botUsername);
+  script.setAttribute('data-size','large');
+  script.setAttribute('data-radius','8');
+  script.setAttribute('data-request-access','write');
+  script.setAttribute('data-onauth','onTelegramWidgetAuth(user)');
+  script.async=true;
+  container.appendChild(script);
+}
+
+window.onTelegramWidgetAuth=async function(user){
+  try{const r=await _fetch('/api/auth/telegram-widget',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(user)});if(!r.ok){const e=await r.json();throw new Error(e.detail||'Error de autenticaci\u00f3n');}
+  _applyAuthData(await r.json());}catch(e){toast(e.message||'Error al iniciar sesi\u00f3n');}
+};
 async function checkAdminShortcut(){try{const r=await fetch('/api/admin/telegram-access',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId})});if(!r.ok)throw new Error('No autorizado');const d=await r.json();$('#adminShortcut')?.classList.toggle('hidden',!d.allowed);if(d.allowed&&$('#adminShortcut'))$('#adminShortcut').setAttribute('href',d.url||'/admin.html')}catch(e){$('#adminShortcut')?.classList.add('hidden')}}
 async function refreshUsage(){try{const r=await fetch('/api/usage',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId})});const d=await r.json();if(!r.ok)throw new Error(d.detail||'Error');state.premium=!!d.premium;state.remaining=Number(d.remaining||0);updateUsage()}catch(e){toast(e.message)}}
 function openFile(input){const f=input.files?.[0];if(!f)return;if(f.size>8*1024*1024){toast(state.language==='es'?'Máximo 8 MB':'Maximum 8 MB');input.value='';return}openCropper(f)}
