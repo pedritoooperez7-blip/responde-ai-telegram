@@ -309,9 +309,16 @@ class TestHardening(unittest.TestCase):
         self.assertEqual(r.json().get("status"), "duplicate")
 
     def test_static_assets(self):
-        for path in ("/", "/app.js", "/style.css", "/admin.html", "/privacy.html", "/terms.html"):
+        for path in ("/", "/app.js", "/chat.js", "/style.css", "/admin.html", "/privacy.html", "/terms.html", "/robots.txt", "/sitemap.xml"):
             with self.subTest(path=path):
                 self.assertEqual(client.get(path).status_code, 200)
+
+        chat = client.get("/chat.js")
+        self.assertIn("javascript", chat.headers.get("content-type", ""))
+        home = client.get("/")
+        self.assertIn('name="description"', home.text)
+        self.assertNotIn("__PUBLIC_BASE_URL__", home.text)
+        self.assertIn("reactivar:'Reactivar'", client.get("/app.js").text)
 
 
 if __name__ == "__main__":
