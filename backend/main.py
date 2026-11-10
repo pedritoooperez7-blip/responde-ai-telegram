@@ -80,6 +80,7 @@ FREE_STORY_MODES = {"gracioso", "coquetear"}
 PREMIUM_STORY_MODES = {"provocativo", "enamorar", "reactivar"}
 DB_PATH = os.getenv("DB_PATH", os.path.join(ROOT, "liggacuba.db"))
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 ATAJO_KEY = os.getenv("ATAJO_KEY", "")
 BANDEC_ACCOUNT = os.getenv("BANDEC_ACCOUNT", "")
@@ -607,6 +608,14 @@ def consume(uid, module, mode):
 
 
 class TelegramAuth(BaseModel): initData:str=""; user_id:Optional[str]=None
+class TelegramWidgetAuth(BaseModel):
+    id: str
+    first_name: str = ""
+    last_name: str = ""
+    username: str = ""
+    photo_url: str = ""
+    auth_date: str = ""
+    hash: str = ""
 class Usage(BaseModel): user_id:str
 class Analyze(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"; image:str=""
 class Generate(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"; text:str=""; analysis_id:Optional[str]=None; image:str=""; idempotency_key:Optional[str]=None
@@ -1174,6 +1183,53 @@ def auth_telegram(p:TelegramAuth):
     uid=str(u["id"]); _reject_if_banned(uid)
     user(uid,{"username":u.get("username"),"first_name":u.get("first_name"),"last_name":u.get("last_name")}); x=usage(uid)
     return {"success":True,"user_id":uid,"token":session_token(uid),**x}
+
+@app.post("/api/auth/telegram-widget")
+def auth_telegram_widget(p: TelegramWidgetAuth):
+    """Endpoint para el Telegram Login Widget (web y Android WebView).
+    Verifica la firma HMAC usando SHA-256 del BOT_TOKEN (distinto al initData).
+    """
+    if not BOT_TOKEN:
+        raise HTTPException(503, "TELEGRAM_BOT_TOKEN no configurado")
+    if not p.id or not p.hash:
+        raise HTTPException(401, "Datos de autenticación incompletos")
+    try:
+        auth_date_int = int(p.auth_date or "0")
+    except (ValueError, TypeError):
+        raise HTTPException(401, "auth_date inválido")
+    if auth_date_int > time.time() + 60:
+        raise HTTPException(401, "auth_date en el futuro")
+    if time.time() - auth_date_int > 86400:
+        raise HTTPException(401, "Sesión de Telegram expirada (>24h)")
+    # Construir la cadena de verificación (todos los campos excepto hash, ordenados)
+    fields = {k: v for k, v in {
+        "auth_date": p.auth_date,
+        "first_name": p.first_name,
+        "id": p.id,
+        "last_name": p.last_name,
+        "photo_url": p.photo_url,
+        "username": p.username,
+    }.items() if v}
+    check_string = "\n".join(f"{k}={fields[k]}" for k in sorted(fields))
+    # El widget usa SHA-256 del BOT_TOKEN como clave secreta (no "WebAppData")
+    secret = hashlib.sha256(BOT_TOKEN.encode()).digest()
+    calc = hmac.new(secret, check_string.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc, p.hash):
+        raise HTTPException(401, "Firma de Telegram inválida")
+    uid = str(p.id)
+    _reject_if_banned(uid)
+    user(uid, {"username": p.username, "first_name": p.first_name, "last_name": p.last_name})
+    x = usage(uid)
+    return {"success": True, "user_id": uid, "token": session_token(uid), **x}
+
+
+@app.get("/api/auth/bot-username")
+def get_bot_username():
+    """Devuelve el username del bot para que el frontend pueda inicializar el widget."""
+    if not BOT_USERNAME:
+        raise HTTPException(503, "TELEGRAM_BOT_USERNAME no configurado")
+    return {"username": BOT_USERNAME}
+
 
 @app.post("/api/usage")
 def api_usage(p:Usage, request:Request):
