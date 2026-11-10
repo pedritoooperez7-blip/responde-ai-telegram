@@ -6,7 +6,7 @@ from PIL import Image
 import base64, hashlib, hmac, io, json, logging, os, re, sqlite3, threading, time, uuid
 import pytesseract
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 from urllib.parse import parse_qs
 from starlette.concurrency import run_in_threadpool
 try:
@@ -609,12 +609,12 @@ def consume(uid, module, mode):
 
 class TelegramAuth(BaseModel): initData:str=""; user_id:Optional[str]=None
 class TelegramWidgetAuth(BaseModel):
-    id: str
+    id: Union[int, str]
     first_name: str = ""
     last_name: str = ""
     username: str = ""
     photo_url: str = ""
-    auth_date: str = ""
+    auth_date: Union[int, str] = ""
     hash: str = ""
 class Usage(BaseModel): user_id:str
 class Analyze(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"; image:str=""
