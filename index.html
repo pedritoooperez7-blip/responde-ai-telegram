@@ -1,5 +1,18 @@
 <!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no"><meta name="theme-color" content="#f7f5fb"><title>LiggaCuba</title><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"></head><body>
 <div id="splash" class="splash"><img class="brand-image splash-logo" src="/liggacuba-logo.jpg" alt="Logo oficial de LiggaCuba"><h1>LIGGACUBA</h1><p data-i18n="loading">Cargando...</p><span class="loader"></span></div>
+<div id="loginScreen" class="login-screen hidden">
+  <div class="login-card">
+    <img class="brand-image login-logo" src="/liggacuba-logo.jpg" alt="Logo de LiggaCuba">
+    <h1>LiggaCuba</h1>
+    <p class="login-desc">Tu asistente para ligar</p>
+    <div class="login-divider"></div>
+    <p class="login-help">Inicia sesión con tu cuenta de Telegram para continuar</p>
+    <div id="loginWidgetContainer" class="login-widget-container">
+      <div class="login-widget-loading"><span class="loader"></span></div>
+    </div>
+    <p class="login-note">Al continuar aceptas los <a href="/terms.html">Términos de Uso</a> y la <a href="/privacy.html">Política de Privacidad</a>.</p>
+  </div>
+</div>
 <div id="app" class="app hidden"><main>
 <section id="homeScreen"><header class="brand-hero"><div class="brand-word">LiggaCuba</div><img class="brand-image hero-logo" src="/liggacuba-logo.jpg" alt="Logo oficial de LiggaCuba"><p>Tu asistente para ligar</p></header><div class="segmented"><button class="segment active" data-module="chat" data-i18n="chat">Chat</button><button class="segment" data-module="story" data-i18n="story">Estado Story</button></div>
 <section id="chatScreen" class="screen"><div class="section-title"><div class="section-icon"><i class="fa-solid fa-comments"></i></div><div><h2 data-i18n="chat_image">Imagen de la conversación</h2><p data-i18n="chat_help">Sube una captura de tu chat</p></div></div><div id="uploadCard" class="upload-card"><input id="imageInput" type="file" accept="image/*" hidden><div id="emptyUpload" class="upload-empty"><div class="upload-plus"><i class="fa-solid fa-plus"></i></div><strong data-i18n="add">Agregar</strong></div><div id="imagePreview" class="image-preview hidden"><img id="previewImg" alt=""><div class="preview-actions"><button id="replaceImage" class="mini-btn"><span data-i18n="replace">Reemplazar</span></button><button id="deleteImage" class="mini-btn danger"><span data-i18n="delete">Eliminar</span></button></div></div></div><div class="section-title compact"><div class="section-icon"><i class="fa-solid fa-wand-magic-sparkles"></i></div><div><h2 data-i18n="mode">Modo de respuesta</h2><p data-i18n="mode_help">Elige el estilo de tu respuesta</p></div></div><div id="chatModes" class="mode-grid"></div><div class="usage-card"><span id="usageText">...</span><button id="refreshUsage" class="text-btn" data-i18n="refresh">Actualizar</button></div><button id="analyzeButton" class="primary" data-i18n="analyze">Analizar con LiggaCuba</button></section>
