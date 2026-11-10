@@ -165,11 +165,20 @@
     base.catch(() => { D.warm = null; });
   }
   const entryTab = () => { D.tab = D.me.profile ? (['intro', 'form'].includes(D.tab) ? 'discover' : D.tab) : 'intro'; };
+  function _handleChatDeepLink() {
+    try {
+      const startParam = (typeof tg !== 'undefined' && tg?.initDataUnsafe?.start_param) || '';
+      if (startParam.startsWith('chat_') && window.LiggaChat) {
+        window.LiggaChat.handleDeepLink(startParam);
+      }
+    } catch (_) { /* ignore */ }
+  }
   async function openDating() {
     hideOthers();
     const warm = D.warm && Date.now() - D.warm.at < 60000 ? D.warm : null;
     if (D.cfg && D.me) {           // ya hay datos: se pinta al instante y se refresca en segundo plano
       entryTab(); render();
+      _handleChatDeepLink();
       if (!warm) startBase().catch(() => {});
       return;
     }
@@ -177,6 +186,7 @@
     try {
       await (warm ? warm.base : startBase());
       entryTab(); render();
+      _handleChatDeepLink();
     } catch (e) {
       D.warm = null;
       setBody(el('p', { class: 'd-muted', text: e.message || T('error') }),
@@ -812,17 +822,13 @@
       el('button', { class: 'contact-btn ' + (c.type === 'whatsapp' ? 'wa' : 'tg'), type: 'button', text: T('write_to') + ' ' + (c.type === 'whatsapp' ? 'WhatsApp' : 'Telegram'), onclick: () => openExternal(c.url) })));
   }
   async function renderMatches() {
-    setBody(el('p', { class: 'd-muted', text: T('loading') }));
-    try {
-      const d = await jpost('/api/dating/matches');
-      if (!d.matches.length) return setBody(el('div', { class: 'd-card center' }, el('p', { class: 'd-muted', text: T('matches_empty') })));
-      setBody(d.matches.map(m => el('div', { class: 'd-card match' },
-        el('div', { class: 'match-row' },
-          el('img', { src: safePhoto(m.photos[0]), alt: '' }),
-          el('div', { class: 'grow' }, el('strong', { text: `${m.display_name}, ${m.age}` }), el('small', { text: [m.province, m.municipality].filter(Boolean).join(' · ') })),
-          el('button', { class: 'mini-btn', type: 'button', text: '⋯', 'aria-label': T('report'), onclick: () => manageSheet(m) })),
-        contactButtons(m.contacts))));
-    } catch (e) { setBody(el('p', { class: 'd-muted', text: e.message })); }
+    const container = el('div', { class: 'd-matches-container' });
+    setBody(container);
+    if (window.LiggaChat && typeof window.LiggaChat.renderList === 'function') {
+      window.LiggaChat.renderList(container);
+    } else {
+      setBody(el('p', { class: 'd-muted', text: T('matches_empty') }));
+    }
   }
 
   // ---- hojas modales ----------------------------------------------------
@@ -835,8 +841,14 @@
     const m = sheet(el('div', { class: 'center' },
       el('h2', { text: T('match_title') }),
       el('p', { class: 'd-muted', text: T('match_text', { n: match.display_name }) }),
+      el('button', { class: 'primary', type: 'button', text: '💬 Chatear ahora',
+        onclick: () => {
+          m.close();
+          if (match.match_id && window.LiggaChat) window.LiggaChat.open(match.match_id);
+          else { D.tab = 'matches'; render(); }
+        } }),
       contactButtons(match.contacts),
-      el('button', { class: 'primary', type: 'button', text: T('keep'), onclick: () => m.close() })));
+      el('button', { class: 'secondary', type: 'button', text: T('keep'), onclick: () => m.close() })));
   }
   function manageSheet(match) {
     const m = sheet(el('h3', { text: match.display_name }),
