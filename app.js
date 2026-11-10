@@ -56,8 +56,18 @@ function _applyAuthData(d){
   loadProfile();
   updateUsage();
   _hideLoginScreen();
-  // Mostrar la app si estaba oculta (login desde web/Android)
-  $('#app')?.classList.remove('hidden');
+  // Mostrar la app si estaba oculta (login desde web/Android).
+  // Fix iOS Safari: usar requestAnimationFrame garantiza que el ocultamiento
+  // del loginScreen ya fue procesado por el motor de render antes de mostrar
+  // #app, evitando la condición de carrera del Telegram Login Widget en iOS.
+  const appEl=document.getElementById('app');
+  if(appEl){
+    requestAnimationFrame(()=>{
+      appEl.classList.remove('hidden');
+      // Segundo frame como seguro extra para Safari en dispositivos lentos
+      requestAnimationFrame(()=>appEl.classList.remove('hidden'));
+    });
+  }
 }
 function _hideLoginScreen(){const ls=$('#loginScreen');if(ls)ls.classList.add('hidden');}
 
@@ -95,8 +105,24 @@ function _mountTelegramWidget(botUsername){
 }
 
 window.onTelegramWidgetAuth=async function(user){
-  try{const r=await _fetch('/api/auth/telegram-widget',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(user)});if(!r.ok){const e=await r.json();throw new Error(e.detail||'Error de autenticaci\u00f3n');}
-  _applyAuthData(await r.json());}catch(e){toast(e.message||'Error al iniciar sesi\u00f3n');}
+  try{
+    const r=await _fetch('/api/auth/telegram-widget',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(user)});
+    if(!r.ok){const e=await r.json();throw new Error(e.detail||'Error de autenticaci\u00f3n');}
+    _applyAuthData(await r.json());
+    // Fix iOS Safari: si el widget corre en un iframe/popup, el #app puede
+    // seguir oculto al volver al contexto principal. Forzamos la visibilidad
+    // con un reintento diferido como red de seguridad adicional.
+    setTimeout(()=>{
+      const ls=document.getElementById('loginScreen');
+      const app=document.getElementById('app');
+      if(app&&ls&&!ls.classList.contains('hidden')){
+        ls.classList.add('hidden');
+      }
+      if(app&&app.classList.contains('hidden')&&state.authToken){
+        app.classList.remove('hidden');
+      }
+    },300);
+  }catch(e){toast(e.message||'Error al iniciar sesi\u00f3n');}
 };
 async function checkAdminShortcut(){try{const r=await fetch('/api/admin/telegram-access',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId})});if(!r.ok)throw new Error('No autorizado');const d=await r.json();$('#adminShortcut')?.classList.toggle('hidden',!d.allowed);if(d.allowed&&$('#adminShortcut'))$('#adminShortcut').setAttribute('href',d.url||'/admin.html')}catch(e){$('#adminShortcut')?.classList.add('hidden')}}
 async function refreshUsage(){try{const r=await fetch('/api/usage',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId})});const d=await r.json();if(!r.ok)throw new Error(d.detail||'Error');state.premium=!!d.premium;state.remaining=Number(d.remaining||0);updateUsage()}catch(e){toast(e.message)}}
@@ -432,7 +458,11 @@ applyLanguage();loadPaymentPricing();
 const _splashTimeout=new Promise(r=>setTimeout(r,5000));
 Promise.race([auth(),_splashTimeout]).finally(()=>{
   $('#splash').classList.add('hidden');
-  // Solo mostrar #app si ya tenemos sesión (no estamos en la pantalla de login web)
-  const loginVisible=$('#loginScreen')&&!$('#loginScreen').classList.contains('hidden');
-  if(!loginVisible){$('#app').classList.remove('hidden');}
+  // Solo mostrar #app si ya tenemos sesión (no estamos en la pantalla de login web).
+  // Fix iOS Safari: usar requestAnimationFrame para asegurar que el DOM procesó
+  // el estado del loginScreen antes de decidir si mostrar #app.
+  requestAnimationFrame(()=>{
+    const loginVisible=$('#loginScreen')&&!$('#loginScreen').classList.contains('hidden');
+    if(!loginVisible){$('#app')?.classList.remove('hidden');}
+  });
 });
