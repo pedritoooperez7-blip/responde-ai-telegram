@@ -29,12 +29,135 @@
     <h2 data-i18n="stats_title">Mis estadísticas</h2>
   </div>
   <div id="statsContent" class="stats-content"><div class="stats-loading"><i class="fa-solid fa-spinner fa-spin"></i></div></div>
-  <div class="stats-section">
+  <!-- ===== SECCIÓN REFERIDOS: Invita y gana ===== -->
+  <div class="refer-hero">
+    <div class="refer-hero-icon"><i class="fa-solid fa-gift"></i></div>
     <h3 data-i18n="refer_title">Invita y gana</h3>
-    <p data-i18n="refer_desc" class="payment-note">Comparte tu código. Cuando tu amigo active Premium, tú ganas 3 días gratis.</p>
-    <div class="refer-code-box"><span data-i18n="refer_code_label">Tu código de referido</span><div class="copy-row"><strong id="myReferCode">—</strong><button id="copyReferCode" class="copy-btn" type="button"><i class="fa-regular fa-copy"></i> <span data-i18n="refer_copy">Copiar código</span></button></div></div>
-    <div class="refer-stats-row"><div class="refer-stat"><span data-i18n="refer_friends">Amigos invitados</span><b id="referTotal">0</b></div><div class="refer-stat"><span data-i18n="refer_rewarded">Recompensas ganadas</span><b id="referRewarded">0</b></div></div>
-    <div class="refer-apply"><h4 data-i18n="refer_apply_title">¿Tienes un código?</h4><div class="refer-apply-row"><input id="referCodeInput" type="text" maxlength="8" placeholder="Código de referido" style="text-transform:uppercase"><button id="applyReferCode" class="secondary" type="button" data-i18n="refer_apply_btn">Aplicar código</button></div><p id="referApplyMsg" class="payment-note hidden"></p></div>
+    <p data-i18n="refer_desc_full" class="refer-hero-desc">Comparte LiggaCuba con tus amigos y gana <b>3 días de Premium</b> por cada invitación que active su primera suscripción elegible.</p>
+  </div>
+
+  <!-- Tarjeta principal: código + enlace + botones -->
+  <div class="refer-card">
+    <div class="refer-field-group">
+      <label class="refer-label" data-i18n="refer_code_label">Tu código de referido</label>
+      <div class="refer-copy-row">
+        <strong id="myReferCode" class="refer-value">—</strong>
+        <button id="copyReferCode" class="refer-action-btn" type="button" aria-label="Copiar código">
+          <i class="fa-regular fa-copy"></i> <span data-i18n="refer_copy">Copiar</span>
+        </button>
+      </div>
+    </div>
+    <div class="refer-field-group">
+      <label class="refer-label" data-i18n="refer_link_label">Tu enlace de invitación</label>
+      <div class="refer-copy-row">
+        <span id="myReferLink" class="refer-value refer-link-value">—</span>
+        <button id="copyReferLink" class="refer-action-btn" type="button" aria-label="Copiar enlace">
+          <i class="fa-regular fa-copy"></i> <span data-i18n="refer_copy_link">Copiar</span>
+        </button>
+      </div>
+    </div>
+    <div class="refer-share-row">
+      <button id="shareReferLink" class="refer-share-btn share-generic" type="button">
+        <i class="fa-solid fa-share-nodes"></i> <span data-i18n="refer_share">Compartir</span>
+      </button>
+      <button id="shareReferTelegram" class="refer-share-btn share-telegram" type="button">
+        <i class="fa-brands fa-telegram"></i> <span data-i18n="refer_share_tg">Telegram</span>
+      </button>
+      <button id="shareReferWhatsapp" class="refer-share-btn share-whatsapp" type="button">
+        <i class="fa-brands fa-whatsapp"></i> <span data-i18n="refer_share_wa">WhatsApp</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- Panel de 4 indicadores -->
+  <div class="refer-kpi-grid">
+    <div class="refer-kpi">
+      <i class="fa-solid fa-user-plus refer-kpi-icon"></i>
+      <b id="referStatTotal">0</b>
+      <span data-i18n="refer_kpi_total">Amigos invitados</span>
+    </div>
+    <div class="refer-kpi">
+      <i class="fa-solid fa-clock refer-kpi-icon"></i>
+      <b id="referStatPending">0</b>
+      <span data-i18n="refer_kpi_pending">Pendientes</span>
+    </div>
+    <div class="refer-kpi">
+      <i class="fa-solid fa-crown refer-kpi-icon"></i>
+      <b id="referStatConverted">0</b>
+      <span data-i18n="refer_kpi_converted">Activaron Premium</span>
+    </div>
+    <div class="refer-kpi">
+      <i class="fa-solid fa-calendar-plus refer-kpi-icon"></i>
+      <b id="referStatDays">0</b>
+      <span data-i18n="refer_kpi_days">Días ganados</span>
+    </div>
+  </div>
+
+  <!-- Lista de invitados -->
+  <div class="refer-section-block" id="referInvitationsBlock">
+    <h4 class="refer-section-title" data-i18n="refer_invitations_title">Mis invitaciones</h4>
+    <div id="referInvitationsList" class="refer-invitations-list">
+      <p class="refer-empty" data-i18n="refer_no_invitations">Aún no has invitado a nadie. ¡Comparte tu enlace!</p>
+    </div>
+  </div>
+
+  <!-- Panel de recompensas -->
+  <div class="refer-section-block" id="referRewardsBlock">
+    <h4 class="refer-section-title" data-i18n="refer_rewards_title">Recompensas Premium</h4>
+    <div class="refer-rewards-summary">
+      <div class="refer-reward-item">
+        <span data-i18n="refer_days_earned">Días acumulados</span>
+        <b id="referDaysEarned">0</b>
+      </div>
+      <div class="refer-reward-item">
+        <span data-i18n="refer_rewards_count">Recompensas acreditadas</span>
+        <b id="referRewardsCount">0</b>
+      </div>
+      <div class="refer-reward-item">
+        <span data-i18n="refer_rewards_pending">Próximas recompensas</span>
+        <b id="referNextRewards">0</b>
+      </div>
+    </div>
+    <div id="referRewardHistory" class="refer-reward-history"></div>
+  </div>
+
+  <!-- Cómo funciona -->
+  <div class="refer-section-block refer-how-it-works">
+    <h4 class="refer-section-title" data-i18n="refer_how_title">Cómo funciona</h4>
+    <div class="refer-steps">
+      <div class="refer-step">
+        <div class="refer-step-num">1</div>
+        <div class="refer-step-text">
+          <strong data-i18n="refer_step1_title">Comparte tu enlace</strong>
+          <span data-i18n="refer_step1_desc">Envíalo a tus amigos por Telegram, WhatsApp o donde prefieras.</span>
+        </div>
+      </div>
+      <div class="refer-step">
+        <div class="refer-step-num">2</div>
+        <div class="refer-step-text">
+          <strong data-i18n="refer_step2_title">Tu amigo se registra y activa Premium</strong>
+          <span data-i18n="refer_step2_desc">Cuando hace su primer pago elegible, el sistema lo registra automáticamente.</span>
+        </div>
+      </div>
+      <div class="refer-step">
+        <div class="refer-step-num">3</div>
+        <div class="refer-step-text">
+          <strong data-i18n="refer_step3_title">¡Recibes 3 días Premium gratis!</strong>
+          <span data-i18n="refer_step3_desc">Los días se suman automáticamente a tu suscripción activa o futura.</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Aplicar código manual (preservado) -->
+  <div class="refer-section-block refer-apply-block">
+    <h4 class="refer-section-title" data-i18n="refer_apply_title">¿Te invitaron con un código?</h4>
+    <p class="refer-apply-hint" data-i18n="refer_apply_hint">Si alguien te dio un código directamente, puedes introducirlo aquí.</p>
+    <div class="refer-apply-row">
+      <input id="referCodeInput" type="text" maxlength="8" data-i18n-placeholder="refer_apply_placeholder" placeholder="Código de referido" style="text-transform:uppercase">
+      <button id="applyReferCode" class="secondary" type="button" data-i18n="refer_apply_btn">Aplicar código</button>
+    </div>
+    <p id="referApplyMsg" class="payment-note hidden"></p>
   </div>
 </section>
 </main><nav class="bottom-nav"><button class="nav-item active" data-nav="home"><i class="fa-solid fa-house"></i><span data-i18n="home">Inicio</span></button><button class="nav-item" data-nav="dating"><i class="fa-solid fa-heart"></i><span data-i18n="dating">Citas</span></button><button class="nav-item" data-nav="profile"><i class="fa-solid fa-user"></i><span data-i18n="profile">Perfil</span></button></nav></div>
