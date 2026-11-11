@@ -382,3 +382,90 @@ body.ad-open { overflow: hidden; }
 .login-widget-loading{display:flex;align-items:center;justify-content:center;min-height:48px}
 .login-note{font-size:11px;color:var(--muted);line-height:1.6;margin:0}
 .login-note a{color:var(--purple);text-decoration:none}
+
+/* ══════════════════════════════════════════════════
+   SISTEMA DE REFERIDOS – Invita y gana
+   ══════════════════════════════════════════════════ */
+
+/* Hero header */
+.refer-hero{text-align:center;padding:20px 16px 10px;margin-top:4px}
+.refer-hero-icon{width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,var(--purple),#9b59b6);display:flex;align-items:center;justify-content:center;margin:0 auto 10px;color:#fff;font-size:22px}
+.refer-hero h3{font-size:20px;font-weight:700;color:var(--text);margin:0 0 6px}
+.refer-hero-desc{font-size:13px;color:var(--muted);line-height:1.5;margin:0}
+.refer-hero-desc b{color:var(--purple)}
+
+/* Tarjeta principal */
+.refer-card{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:16px;margin:12px 0 8px;display:flex;flex-direction:column;gap:14px}
+.refer-field-group{display:flex;flex-direction:column;gap:4px}
+.refer-label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.refer-copy-row{display:flex;align-items:center;gap:8px;min-width:0}
+.refer-value{font-size:16px;font-weight:700;color:var(--text);letter-spacing:.5px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.refer-link-value{font-size:12px;font-weight:500;letter-spacing:0;color:var(--purple)}
+.refer-action-btn{flex-shrink:0;padding:7px 12px;border:1px solid var(--purple);border-radius:8px;background:transparent;color:var(--purple);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;transition:background .15s,color .15s}
+.refer-action-btn:hover{background:var(--purple);color:#fff}
+.refer-action-btn:active{opacity:.8}
+
+/* Botones de compartir */
+.refer-share-row{display:flex;gap:8px;flex-wrap:wrap}
+.refer-share-btn{flex:1;min-width:0;padding:9px 10px;border:none;border-radius:10px;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:5px;transition:opacity .15s,transform .1s}
+.refer-share-btn:active{opacity:.8;transform:scale(.97)}
+.share-generic{background:var(--surface);border:1px solid var(--line);color:var(--text)}
+.share-telegram{background:#2AABEE;color:#fff}
+.share-whatsapp{background:#25D366;color:#fff}
+
+/* KPI grid */
+.refer-kpi-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin:8px 0}
+.refer-kpi{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px 12px;display:flex;flex-direction:column;align-items:center;gap:4px;text-align:center}
+.refer-kpi-icon{font-size:16px;color:var(--purple);margin-bottom:2px}
+.refer-kpi b{font-size:24px;font-weight:700;color:var(--text)}
+.refer-kpi span{font-size:11px;color:var(--muted);line-height:1.3;text-align:center}
+
+/* Secciones internas */
+.refer-section-block{margin:16px 0 8px}
+.refer-section-title{font-size:14px;font-weight:700;color:var(--text);margin:0 0 10px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+
+/* Lista de invitaciones */
+.refer-invitations-list{display:flex;flex-direction:column;gap:8px}
+.refer-empty{font-size:13px;color:var(--muted);text-align:center;padding:16px 0}
+.refer-invitation-row{display:flex;align-items:center;gap:10px;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:10px 12px}
+.ref-inv-avatar{width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,var(--purple),#9b59b6);color:#fff;font-size:14px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.ref-inv-info{flex:1;min-width:0}
+.ref-inv-info strong{display:block;font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ref-inv-info small{font-size:11px;color:var(--muted)}
+.ref-inv-status{display:flex;align-items:center;gap:5px;flex-shrink:0}
+.ref-status-badge{font-size:10px;font-weight:600;padding:3px 7px;border-radius:6px;white-space:nowrap}
+.ref-status-pending{background:#fff3cd;color:#856404}
+.ref-status-premium{background:#d1ecf1;color:#0c5460}
+.ref-status-rewarded{background:#d4edda;color:#155724}
+.ref-status-ineligible{background:#f8d7da;color:#721c24}
+.ref-status-review{background:#fde8d8;color:#8a4600}
+.ref-rewarded-icon{color:#27ae60;font-size:13px}
+.ref-anomaly-icon{color:#e67e22;font-size:12px}
+
+/* Panel de recompensas */
+.refer-rewards-summary{display:flex;flex-direction:column;gap:8px;margin-bottom:12px}
+.refer-reward-item{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:var(--surface);border:1px solid var(--line);border-radius:10px}
+.refer-reward-item span{font-size:13px;color:var(--muted)}
+.refer-reward-item b{font-size:16px;font-weight:700;color:var(--purple)}
+.refer-reward-list{display:flex;flex-direction:column;gap:6px}
+.refer-reward-row{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--surface);border:1px solid var(--line);border-radius:10px}
+.refer-reward-row i{font-size:16px;color:var(--purple)}
+.refer-reward-row div{display:flex;flex-direction:column}
+.refer-reward-row span{font-size:13px;font-weight:600;color:var(--text)}
+.refer-reward-row small{font-size:11px;color:var(--muted)}
+
+/* Cómo funciona */
+.refer-how-it-works{padding:14px;background:linear-gradient(135deg,rgba(77,53,255,.06),rgba(77,53,255,.02));border-radius:14px;border:1px solid rgba(77,53,255,.12)}
+.refer-steps{display:flex;flex-direction:column;gap:14px;margin-top:4px}
+.refer-step{display:flex;align-items:flex-start;gap:12px}
+.refer-step-num{width:28px;height:28px;border-radius:50%;background:var(--purple);color:#fff;font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
+.refer-step-text{display:flex;flex-direction:column;gap:2px}
+.refer-step-text strong{font-size:13px;font-weight:600;color:var(--text)}
+.refer-step-text span{font-size:12px;color:var(--muted);line-height:1.4}
+
+/* Bloque de aplicar código */
+.refer-apply-block{padding:14px;background:var(--surface);border:1px solid var(--line);border-radius:14px}
+.refer-apply-hint{font-size:12px;color:var(--muted);margin:4px 0 10px;line-height:1.4}
+.refer-apply-row{display:flex;gap:8px;align-items:center}
+.refer-apply-row input{flex:1;padding:9px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--text);font-size:14px;font-weight:600;letter-spacing:1px}
+.refer-apply-row input:focus{outline:2px solid rgba(77,53,255,.25);border-color:var(--purple)}

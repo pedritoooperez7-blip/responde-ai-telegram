@@ -3,7 +3,7 @@ const state={authToken:sessionStorage.getItem('liggacuba_auth')||'',paymentMetho
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];const formatCubaDate=v=>{if(!v)return '—';const d=new Date(v);return Number.isNaN(d.getTime())?String(v):new Intl.DateTimeFormat(state.language==='es'?'es-CU':'en-US',{timeZone:'America/Havana',dateStyle:'medium',timeStyle:'short'}).format(d)};
 const modes={chat:[['gracioso','fa-face-grin-stars',false],['coquetear','fa-face-smile-wink',false],['provocativo','fa-bolt',true],['enamorar','fa-heart',false],['salvar','fa-life-ring',true],['reactivar','fa-rotate-right',true]],story:[['gracioso','fa-face-grin-stars',false],['coquetear','fa-face-smile-wink',false],['provocativo','fa-bolt',true],['enamorar','fa-heart',true],['reactivar','fa-rotate-right',true]]};
 const labels={es:{gracioso:'Gracioso',coquetear:'Coquetear',provocativo:'Provocativo',enamorar:'Enamorar',salvar:'Salvar Situación',reactivar:'Reactivar'},en:{gracioso:'Funny',coquetear:'Flirt',provocativo:'Provocative',enamorar:'Romantic',salvar:'Save Situation',reactivar:'Reactivate'}};
-const i18n={es:{loading:'Cargando...',chat:'Chat',story:'Estado Story',chat_image:'Imagen de la conversación',chat_help:'Sube una captura de tu chat',story_image:'Captura del estado',story_help:'Sube una captura del estado para responder',add:'Agregar',replace:'Reemplazar',delete:'Eliminar',mode:'Modo de respuesta',mode_help:'Elige el estilo de tu respuesta',refresh:'Actualizar',analyze:'Analizar con LiggaCuba',back:'Atrás',profile_sub:'Tu asistente para conversaciones',stats_chats:'Chats',stats_stories:'Historias',stats_total:'Análisis',premium:'Premium',premium_title:'Desbloquea todo el poder',premium_desc:'Respuestas más completas, todos los modos y sin límite diario.',get_premium:'Obtener Premium',settings:'Configuración',language:'Idioma',contact:'Contáctanos',more:'Más',weekly:'Semanal',monthly:'Mensual',annual:'Anual',seven_days:'7 días',thirty_days:'30 días',annual_save:'365 días · 1 año',stats_title:'Mis estadísticas',stats_best_mode:'Mejor modo',stats_this_week:'Esta semana',stats_total_all:'Total análisis',refer_title:'Invita y gana',refer_desc:'Comparte tu código. Cuando tu amigo active Premium, tú ganas 3 días gratis.',refer_code_label:'Tu código de referido',refer_copy:'Copiar código',refer_copied:'¡Copiado!',refer_friends:'Amigos invitados',refer_rewarded:'Recompensas ganadas',refer_apply_title:'¿Tienes un código?',refer_apply_placeholder:'Código de referido',refer_apply_btn:'Aplicar código',refer_apply_ok:'¡Código aplicado! Activa Premium para que tu amigo reciba su recompensa.',premium_benefit1:'Análisis ilimitados',premium_benefit2:'Todos los modos de respuesta',premium_benefit3:'Salvar Situación incluido',premium_benefit4:'Acceso a funciones Premium futuras',choose_plan:'Elige tu plan',payment_confirm_number:'Número a confirmar',payment_confirm_help:'Se utiliza para identificar tu pago.',payment_phone_required:'Configura tu número de teléfono en Perfil antes de continuar.',payment_method_title:'Método de pago',payment_method_help:'Elige cómo quieres pagar tu Premium',continue_to_transfer:'Continuar a los datos de pago',transfer_title:'Datos de la transferencia',transfer_help:'Comprueba los datos y completa tu pago',payment_method_locked:'Ya existe una operación de pago. Cancélala antes de cambiar el método.',continue_payment:'Continuar con Premium',payment_title:'Activa tu Premium',payment_help:'Paga con el importe exacto. La confirmación automática funciona en paralelo con la revisión manual.',proof_placeholder:'Referencia o datos del pago (opcional)',proof_image:'Foto del comprobante',send_proof:'Enviar comprobante',payment_instructions:'Realiza la transferencia con el importe exacto. Espera la confirmación automática o envía el comprobante para revisión manual.',manual_review_help:'El comprobante será revisado por administración. Enviar un comprobante no activa Premium automáticamente.',waiting:'Comprobante enviado. Estamos esperando verificación.',cancel_payment:'Cancelar operación',create_payment:'Crear operación de pago',crop_title:'Ajustar captura',crop_help:'Mueve y ajusta el recorte para dejar visible solo la conversación.',cancel:'Cancelar',use:'Usar recorte',result:'Resultado',recognized:'Texto reconocido',ligga_reply:'Respuesta de LiggaCuba',copy:'Copiar',another:'Analizar otra',support:'Centro de Soporte',support_help:'Elige una vía de contacto.',privacy:'Política de Privacidad',terms:'Términos de Uso',about:'Sobre LiggaCuba',more_help:'Información y recursos',home:'Inicio',dating:'Citas',profile:'Perfil',more_screen:'Más',premium_active:'Premium activo',premium_until:'Activo hasta',free_plan:'Plan gratuito',free_help:'3 análisis diarios',go_premium:'Mejorar a Premium',no_more:'Has usado tus 3 análisis gratuitos de hoy.',no_text:'No pude leer texto suficiente. Ajusta el recorte o usa una captura más clara.',premium_only:'Este modo es exclusivo de Premium.',support_telegram:'Telegram · @pedritoficial',support_whatsapp:'WhatsApp · +53 52677163'},en:{loading:'Loading...',chat:'Chat',story:'Story Status',chat_image:'Conversation image',chat_help:'Upload a screenshot of your chat',story_image:'Story screenshot',story_help:'Upload a story screenshot to reply',add:'Add',replace:'Replace',delete:'Delete',mode:'Response mode',mode_help:'Choose your response style',refresh:'Refresh',analyze:'Analyze with LiggaCuba',back:'Back',profile_sub:'Your conversation assistant',stats_chats:'Chats',stats_stories:'Stories',stats_total:'Analyses',premium:'Premium',premium_title:'Unlock the full power',premium_desc:'Better responses, every mode and no daily limit.',get_premium:'Get Premium',settings:'Settings',language:'Language',contact:'Contact us',more:'More',weekly:'Weekly',monthly:'Monthly',annual:'Annual',seven_days:'7 days',thirty_days:'30 days',annual_save:'365 days · 1 year',stats_title:'My statistics',stats_best_mode:'Best mode',stats_this_week:'This week',stats_total_all:'Total analyses',refer_title:'Invite & earn',refer_desc:'Share your code. When your friend activates Premium, you get 3 free days.',refer_code_label:'Your referral code',refer_copy:'Copy code',refer_copied:'Copied!',refer_friends:'Friends invited',refer_rewarded:'Rewards earned',refer_apply_title:'Have a code?',refer_apply_placeholder:'Referral code',refer_apply_btn:'Apply code',refer_apply_ok:'Code applied! Activate Premium so your friend gets their reward.',premium_benefit1:'Unlimited analyses',premium_benefit2:'All response modes',premium_benefit3:'Save Situation included',premium_benefit4:'Access to future Premium features',choose_plan:'Choose your plan',payment_confirm_number:'Number to confirm',payment_confirm_help:'Used to identify your payment.',payment_phone_required:'Add your phone number in Profile before continuing.',payment_method_title:'Payment method',payment_method_help:'Choose how you want to pay for Premium',continue_to_transfer:'Continue to payment details',transfer_title:'Transfer details',transfer_help:'Review the details and complete your payment',payment_method_locked:'A payment operation already exists. Cancel it before changing the method.',continue_payment:'Continue to Premium',payment_title:'Activate Premium',payment_help:'Pay the exact amount. Automatic confirmation works alongside manual review.',proof_placeholder:'Payment reference or details (optional)',proof_image:'Receipt photo',send_proof:'Submit proof',payment_instructions:'Transfer the exact amount. Wait for automatic confirmation or submit proof for manual review.',manual_review_help:'The receipt will be reviewed by an administrator. Submitting proof does not activate Premium automatically.',waiting:'Proof submitted. We are waiting for verification.',cancel_payment:'Cancel operation',create_payment:'Create payment operation',crop_title:'Adjust screenshot',crop_help:'Move and adjust the crop to keep only the conversation visible.',cancel:'Cancel',use:'Use crop',result:'Result',recognized:'Recognized text',ligga_reply:'LiggaCuba reply',copy:'Copy',another:'Analyze another',support:'Support Center',support_help:'Choose a contact method.',privacy:'Privacy Policy',terms:'Terms of Use',about:'About LiggaCuba',more_help:'Information and resources',home:'Home',dating:'Dating',profile:'Profile',more_screen:'More',premium_active:'Premium active',premium_until:'Active until',free_plan:'Free plan',free_help:'3 analyses per day',go_premium:'Upgrade to Premium',no_more:'You have used your 3 free analyses today.',no_text:'I could not read enough text. Adjust the crop or use a clearer screenshot.',premium_only:'This mode is exclusive to Premium.',support_telegram:'Telegram · @pedritoficial',support_whatsapp:'WhatsApp · +53 52677163'}};
+const i18n={es:{loading:'Cargando...',chat:'Chat',story:'Estado Story',chat_image:'Imagen de la conversación',chat_help:'Sube una captura de tu chat',story_image:'Captura del estado',story_help:'Sube una captura del estado para responder',add:'Agregar',replace:'Reemplazar',delete:'Eliminar',mode:'Modo de respuesta',mode_help:'Elige el estilo de tu respuesta',refresh:'Actualizar',analyze:'Analizar con LiggaCuba',back:'Atrás',profile_sub:'Tu asistente para conversaciones',stats_chats:'Chats',stats_stories:'Historias',stats_total:'Análisis',premium:'Premium',premium_title:'Desbloquea todo el poder',premium_desc:'Respuestas más completas, todos los modos y sin límite diario.',get_premium:'Obtener Premium',settings:'Configuración',language:'Idioma',contact:'Contáctanos',more:'Más',weekly:'Semanal',monthly:'Mensual',annual:'Anual',seven_days:'7 días',thirty_days:'30 días',annual_save:'365 días · 1 año',stats_title:'Mis estadísticas',stats_best_mode:'Mejor modo',stats_this_week:'Esta semana',stats_total_all:'Total análisis',refer_title:'Invita y gana',refer_desc:'Comparte tu código. Cuando tu amigo active Premium, tú ganas 3 días gratis.',refer_desc_full:'Comparte LiggaCuba con tus amigos y gana 3 días de Premium por cada invitación que active su primera suscripción elegible.',refer_code_label:'Tu código de referido',refer_link_label:'Tu enlace de invitación',refer_copy:'Copiar',refer_copy_link:'Copiar',refer_copied:'¡Copiado!',refer_friends:'Amigos invitados',refer_rewarded:'Recompensas ganadas',refer_share:'Compartir',refer_share_tg:'Telegram',refer_share_wa:'WhatsApp',refer_kpi_total:'Amigos invitados',refer_kpi_pending:'Pendientes',refer_kpi_converted:'Activaron Premium',refer_kpi_days:'Días ganados',refer_invitations_title:'Mis invitaciones',refer_no_invitations:'Aún no has invitado a nadie. ¡Comparte tu enlace!',refer_rewards_title:'Recompensas Premium',refer_days_earned:'Días ganados',refer_rewards_count:'Recompensas acreditadas',refer_rewards_pending:'Próximas recompensas',refer_how_title:'Cómo funciona',refer_step1_title:'Comparte tu enlace',refer_step1_desc:'Envíalo a tus amigos por Telegram, WhatsApp o donde prefieras.',refer_step2_title:'Tu amigo se registra y activa Premium',refer_step2_desc:'Cuando hace su primer pago elegible, el sistema lo registra automáticamente.',refer_step3_title:'¡Recibes 3 días Premium gratis!',refer_step3_desc:'Los días se suman automáticamente a tu suscripción activa o futura.',refer_apply_title:'¿Te invitaron con un código?',refer_apply_hint:'Si alguien te dio un código directamente, puedes introducirlo aquí.',refer_apply_placeholder:'Código de referido',refer_apply_btn:'Aplicar código',refer_apply_ok:'¡Código aplicado! Activa Premium para que tu amigo reciba su recompensa.',refer_status_registered:'Pendiente',refer_status_premium_active:'Premium activo',refer_status_rewarded:'Recompensado',refer_status_not_eligible:'No elegible',refer_status_admin_review:'En revisión',premium_benefit1:'Análisis ilimitados',premium_benefit2:'Todos los modos de respuesta',premium_benefit3:'Salvar Situación incluido',premium_benefit4:'Acceso a funciones Premium futuras',choose_plan:'Elige tu plan',payment_confirm_number:'Número a confirmar',payment_confirm_help:'Se utiliza para identificar tu pago.',payment_phone_required:'Configura tu número de teléfono en Perfil antes de continuar.',payment_method_title:'Método de pago',payment_method_help:'Elige cómo quieres pagar tu Premium',continue_to_transfer:'Continuar a los datos de pago',transfer_title:'Datos de la transferencia',transfer_help:'Comprueba los datos y completa tu pago',payment_method_locked:'Ya existe una operación de pago. Cancélala antes de cambiar el método.',continue_payment:'Continuar con Premium',payment_title:'Activa tu Premium',payment_help:'Paga con el importe exacto. La confirmación automática funciona en paralelo con la revisión manual.',proof_placeholder:'Referencia o datos del pago (opcional)',proof_image:'Foto del comprobante',send_proof:'Enviar comprobante',payment_instructions:'Realiza la transferencia con el importe exacto. Espera la confirmación automática o envía el comprobante para revisión manual.',manual_review_help:'El comprobante será revisado por administración. Enviar un comprobante no activa Premium automáticamente.',waiting:'Comprobante enviado. Estamos esperando verificación.',cancel_payment:'Cancelar operación',create_payment:'Crear operación de pago',crop_title:'Ajustar captura',crop_help:'Mueve y ajusta el recorte para dejar visible solo la conversación.',cancel:'Cancelar',use:'Usar recorte',result:'Resultado',recognized:'Texto reconocido',ligga_reply:'Respuesta de LiggaCuba',copy:'Copiar',another:'Analizar otra',support:'Centro de Soporte',support_help:'Elige una vía de contacto.',privacy:'Política de Privacidad',terms:'Términos de Uso',about:'Sobre LiggaCuba',more_help:'Información y recursos',home:'Inicio',dating:'Citas',profile:'Perfil',more_screen:'Más',premium_active:'Premium activo',premium_until:'Activo hasta',free_plan:'Plan gratuito',free_help:'3 análisis diarios',go_premium:'Mejorar a Premium',no_more:'Has usado tus 3 análisis gratuitos de hoy.',no_text:'No pude leer texto suficiente. Ajusta el recorte o usa una captura más clara.',premium_only:'Este modo es exclusivo de Premium.',support_telegram:'Telegram · @pedritoficial',support_whatsapp:'WhatsApp · +53 52677163'},en:{loading:'Loading...',chat:'Chat',story:'Story Status',chat_image:'Conversation image',chat_help:'Upload a screenshot of your chat',story_image:'Story screenshot',story_help:'Upload a story screenshot to reply',add:'Add',replace:'Replace',delete:'Delete',mode:'Response mode',mode_help:'Choose your response style',refresh:'Refresh',analyze:'Analyze with LiggaCuba',back:'Back',profile_sub:'Your conversation assistant',stats_chats:'Chats',stats_stories:'Stories',stats_total:'Analyses',premium:'Premium',premium_title:'Unlock the full power',premium_desc:'Better responses, every mode and no daily limit.',get_premium:'Get Premium',settings:'Settings',language:'Language',contact:'Contact us',more:'More',weekly:'Weekly',monthly:'Monthly',annual:'Annual',seven_days:'7 days',thirty_days:'30 days',annual_save:'365 days · 1 year',stats_title:'My statistics',stats_best_mode:'Best mode',stats_this_week:'This week',stats_total_all:'Total analyses',refer_title:'Invite & earn',refer_desc:'Share your code. When your friend activates Premium, you get 3 free days.',refer_desc_full:'Share LiggaCuba with your friends and earn 3 Premium days for each invitation that activates their first eligible subscription.',refer_code_label:'Your referral code',refer_link_label:'Your invitation link',refer_copy:'Copy',refer_copy_link:'Copy',refer_copied:'Copied!',refer_friends:'Friends invited',refer_rewarded:'Rewards earned',refer_share:'Share',refer_share_tg:'Telegram',refer_share_wa:'WhatsApp',refer_kpi_total:'Friends invited',refer_kpi_pending:'Pending',refer_kpi_converted:'Activated Premium',refer_kpi_days:'Days earned',refer_invitations_title:'My invitations',refer_no_invitations:"You haven't invited anyone yet. Share your link!",refer_rewards_title:'Premium Rewards',refer_days_earned:'Days earned',refer_rewards_count:'Rewards credited',refer_rewards_pending:'Upcoming rewards',refer_how_title:'How it works',refer_step1_title:'Share your link',refer_step1_desc:'Send it to your friends on Telegram, WhatsApp or anywhere.',refer_step2_title:'Your friend signs up and activates Premium',refer_step2_desc:'When they make their first eligible payment, the system registers it automatically.',refer_step3_title:'You get 3 free Premium days!',refer_step3_desc:'The days are added automatically to your active or future subscription.',refer_apply_title:'Were you invited with a code?',refer_apply_hint:'If someone gave you a code directly, you can enter it here.',refer_apply_placeholder:'Referral code',refer_apply_btn:'Apply code',refer_apply_ok:'Code applied! Activate Premium so your friend gets their reward.',refer_status_registered:'Pending',refer_status_premium_active:'Premium active',refer_status_rewarded:'Rewarded',refer_status_not_eligible:'Not eligible',refer_status_admin_review:'Under review',premium_benefit1:'Unlimited analyses',premium_benefit2:'All response modes',premium_benefit3:'Save Situation included',premium_benefit4:'Access to future Premium features',choose_plan:'Choose your plan',payment_confirm_number:'Number to confirm',payment_confirm_help:'Used to identify your payment.',payment_phone_required:'Add your phone number in Profile before continuing.',payment_method_title:'Payment method',payment_method_help:'Choose how you want to pay for Premium',continue_to_transfer:'Continue to payment details',transfer_title:'Transfer details',transfer_help:'Review the details and complete your payment',payment_method_locked:'A payment operation already exists. Cancel it before changing the method.',continue_payment:'Continue to Premium',payment_title:'Activate Premium',payment_help:'Pay the exact amount. Automatic confirmation works alongside manual review.',proof_placeholder:'Payment reference or details (optional)',proof_image:'Receipt photo',send_proof:'Submit proof',payment_instructions:'Transfer the exact amount. Wait for automatic confirmation or submit proof for manual review.',manual_review_help:'The receipt will be reviewed by an administrator. Submitting proof does not activate Premium automatically.',waiting:'Proof submitted. We are waiting for verification.',cancel_payment:'Cancel operation',create_payment:'Create payment operation',crop_title:'Adjust screenshot',crop_help:'Move and adjust the crop to keep only the conversation visible.',cancel:'Cancel',use:'Use crop',result:'Result',recognized:'Recognized text',ligga_reply:'LiggaCuba reply',copy:'Copy',another:'Analyze another',support:'Support Center',support_help:'Choose a contact method.',privacy:'Privacy Policy',terms:'Terms of Use',about:'About LiggaCuba',more_help:'Information and resources',home:'Home',dating:'Dating',profile:'Profile',more_screen:'More',premium_active:'Premium active',premium_until:'Active until',free_plan:'Free plan',free_help:'3 analyses per day',go_premium:'Upgrade to Premium',no_more:'You have used your 3 free analyses today.',no_text:'I could not read enough text. Adjust the crop or use a clearer screenshot.',premium_only:'This mode is exclusive to Premium.',support_telegram:'Telegram · @pedritoficial',support_whatsapp:'WhatsApp · +53 52677163'}};
 const i18nExtra={
 es:{payment_destination:'Destino',copy_destination:'Copiar destino',copy_number:'Copiar número',destination_copied:'Destino copiado',number_copied:'Número a confirmar copiado',
  proof_entry_text:'Si no se encuentra tu pago, utiliza nuestro sistema de envío de comprobante.',proof_screen_title:'Enviar comprobante',proof_screen_help:'Adjunta la foto o los datos de tu pago para que administración lo revise.',
@@ -75,7 +75,17 @@ function _hideLoginScreen(){const ls=$('#loginScreen');if(ls)ls.classList.add('h
 
 async function auth(){
   if(tg?.initData){
-    try{const r=await fetch('/api/auth/telegram',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData:tg.initData,user_id:state.userId})});if(!r.ok)throw 0;_applyAuthData(await r.json());return;}catch(e){refreshUsage();return;}
+    try{
+      const authBody={initData:tg.initData,user_id:state.userId};
+      // Pasar start_param para atribución automática de referido vía enlace
+      const sp=tg?.initDataUnsafe?.start_param;
+      if(sp)authBody.start_param=sp;
+      const r=await fetch('/api/auth/telegram',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(authBody)});
+      if(!r.ok)throw 0;
+      const authData=await r.json();
+      _applyAuthData(authData);
+      return;
+    }catch(e){refreshUsage();return;}
   }
   if(state.authToken){
     try{const r=await fetch('/api/usage',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:state.userId})});if(!r.ok)throw 0;const d=await r.json();state.premium=!!d.premium;state.premiumUntil=d.premium_until||null;state.remaining=Number(d.remaining||0);updateUsage();_hideLoginScreen();return;}catch(e){state.authToken='';sessionStorage.removeItem('liggacuba_auth');}
@@ -354,11 +364,90 @@ async function refreshAdRules(){const link=$('#openAdRules');if(!link)return;try
 function profile(){try{window.LiggaChat&&window.LiggaChat.leaveDating&&window.LiggaChat.leaveDating()}catch(_){}['#datingScreen','#homeScreen','#settingsScreen','#premiumScreen','#moreScreen','#transferScreen','#paymentMethodScreen','#proofScreen','#supportScreen','#businessAdScreen','#businessAdEditorScreen','#statsScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#profileScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden');$$('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.nav==='profile'));loadProfile()}
 function home(){try{window.LiggaChat&&window.LiggaChat.leaveDating&&window.LiggaChat.leaveDating()}catch(_){}['#datingScreen','#profileScreen','#settingsScreen','#premiumScreen','#moreScreen','#transferScreen','#paymentMethodScreen','#proofScreen','#supportScreen','#businessAdScreen','#businessAdEditorScreen','#statsScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#homeScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden');$$('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.nav==='home'));setModule(state.module)}
 function settings(){try{window.LiggaChat&&window.LiggaChat.leaveDating&&window.LiggaChat.leaveDating()}catch(_){}['#datingScreen','#homeScreen','#profileScreen','#premiumScreen','#moreScreen','#transferScreen','#paymentMethodScreen','#proofScreen','#supportScreen','#businessAdScreen','#businessAdEditorScreen','#statsScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#settingsScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden');}
+// Referral status labels and icons
+function _referStatusLabel(status){
+  const map={registered:t('refer_status_registered'),premium_active:t('refer_status_premium_active'),rewarded:t('refer_status_rewarded'),not_eligible:t('refer_status_not_eligible'),admin_review:t('refer_status_admin_review')};
+  return map[status]||status;
+}
+function _referStatusClass(status){
+  const map={registered:'ref-status-pending',premium_active:'ref-status-premium',rewarded:'ref-status-rewarded',not_eligible:'ref-status-ineligible',admin_review:'ref-status-review'};
+  return map[status]||'ref-status-pending';
+}
+function _fmtDate(iso){if(!iso)return'—';try{const d=new Date(iso+'Z');return d.toLocaleDateString(state.language==='es'?'es-CU':'en-US',{day:'2-digit',month:'short',year:'numeric'})}catch{return iso.slice(0,10)}}
+
+async function _loadReferralLink(){
+  try{
+    const r=await fetch('/api/referral/my-link',{headers:{'Authorization':'Bearer '+state.authToken}});
+    if(!r.ok)return;
+    const d=await r.json();
+    state.referCode=d.refer_code||'';
+    state.referLink=d.invite_link||'';
+    if($('#myReferCode'))$('#myReferCode').textContent=d.refer_code||'—';
+    if($('#myReferLink')){
+      const linkEl=$('#myReferLink');
+      linkEl.textContent=d.invite_link||'—';
+      linkEl.title=d.invite_link||'';
+    }
+  }catch(e){}
+}
+
+function _renderReferralStats(d){
+  const stats=d.referral_stats||{};
+  if($('#referStatTotal'))$('#referStatTotal').textContent=stats.total_invited||0;
+  if($('#referStatPending'))$('#referStatPending').textContent=stats.pending||0;
+  if($('#referStatConverted'))$('#referStatConverted').textContent=stats.converted||0;
+  if($('#referStatDays'))$('#referStatDays').textContent=stats.days_earned||0;
+  if($('#referDaysEarned'))$('#referDaysEarned').textContent=stats.days_earned||0;
+  if($('#referRewardsCount'))$('#referRewardsCount').textContent=stats.rewarded||0;
+  if($('#referNextRewards'))$('#referNextRewards').textContent=d.referral_next_rewards_pending||0;
+  // Invitaciones
+  const list=$('#referInvitationsList');
+  if(list){
+    const invitations=d.referral_invitations||[];
+    if(!invitations.length){
+      list.innerHTML=`<p class="refer-empty">${t('refer_no_invitations')}</p>`;
+    }else{
+      list.innerHTML=invitations.map(inv=>`
+        <div class="refer-invitation-row">
+          <div class="ref-inv-avatar">${(inv.invitee_display||'?')[0].toUpperCase()}</div>
+          <div class="ref-inv-info">
+            <strong>${escapeHtml(inv.invitee_display||'—')}</strong>
+            <small>${_fmtDate(inv.invited_at)}</small>
+          </div>
+          <div class="ref-inv-status">
+            <span class="ref-status-badge ${_referStatusClass(inv.status)}">${_referStatusLabel(inv.status)}</span>
+            ${inv.rewarded?'<i class="fa-solid fa-gift ref-rewarded-icon" title="Recompensa acreditada"></i>':''}
+            ${inv.anomaly?'<i class="fa-solid fa-triangle-exclamation ref-anomaly-icon" title="Anomalía"></i>':''}
+          </div>
+        </div>
+      `).join('');
+    }
+  }
+  // Historial de recompensas
+  const hist=$('#referRewardHistory');
+  if(hist){
+    const rewards=d.referral_rewards_history||[];
+    if(!rewards.length){hist.innerHTML='';return;}
+    hist.innerHTML=`<div class="refer-reward-list">${rewards.map(r=>`
+      <div class="refer-reward-row">
+        <i class="fa-solid fa-calendar-plus"></i>
+        <div>
+          <span>+${r.days_added||3} días Premium</span>
+          <small>${escapeHtml(r.invitee_display||'—')} · ${_fmtDate(r.rewarded_at)}</small>
+        </div>
+      </div>
+    `).join('')}</div>`;
+  }
+}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+
 async function showStats(){
   if(currentScreenId()!=='statsScreen')showScreen('statsScreen');
   $('.bottom-nav').classList.remove('hidden');
   window.scrollTo(0,0);
   $('#statsContent').innerHTML='<div class="stats-loading"><i class="fa-solid fa-spinner fa-spin"></i></div>';
+  // Load referral link in parallel
+  _loadReferralLink();
   try{
     const r=await fetch('/api/stats',{headers:{'Authorization':'Bearer '+state.authToken}});
     if(!r.ok)throw new Error('Error');
@@ -377,9 +466,11 @@ async function showStats(){
       ${actHtml?`<div class="day-bars-wrap">${actHtml}</div>`:''}
       ${modesHtml?`<div class="stat-modes"><h4>${lang==='es'?'Por modo':'By mode'}</h4>${modesHtml}</div>`:''}
     `;
-    $('#myReferCode').textContent=d.refer_code||'—';
-    $('#referTotal').textContent=d.referrals_total||0;
-    $('#referRewarded').textContent=d.referrals_rewarded||0;
+    // Legacy compat
+    if($('#myReferCode'))$('#myReferCode').textContent=d.refer_code||'—';
+    state.referCode=d.refer_code||'';
+    // Render full referral UI
+    _renderReferralStats(d);
   }catch(e){$('#statsContent').innerHTML='<p class="payment-note">Error cargando estadísticas</p>';}
 }
 function more(){try{window.LiggaChat&&window.LiggaChat.leaveDating&&window.LiggaChat.leaveDating()}catch(_){}['#datingScreen','#homeScreen','#profileScreen','#settingsScreen','#premiumScreen','#transferScreen','#paymentMethodScreen','#proofScreen','#supportScreen','#businessAdScreen','#businessAdEditorScreen','#statsScreen'].forEach(s=>$(s)?.classList.add('hidden'));$('#moreScreen').classList.remove('hidden');$('.bottom-nav').classList.remove('hidden')}
@@ -454,8 +545,91 @@ $('#backFromProof').onclick=goBack;
 $('#imageInput').onchange=()=>openFile($('#imageInput'));$('#storyInput').onchange=()=>openFile($('#storyInput'));$('#uploadCard').onclick=e=>{if(!e.target.closest('button'))$('#imageInput').click()};$('#storyAdd').onclick=()=>$('#storyInput').click();$('#replaceImage').onclick=()=>$('#imageInput').click();$('#storyReplace').onclick=()=>$('#storyInput').click();$('#deleteImage').onclick=clearImage;$('#storyDelete').onclick=clearImage;$('#cropCancel').onclick=closeCrop;$('#cropClose').onclick=closeCrop;$('#cropUse').onclick=useCrop;$('#cropViewport').addEventListener('pointerdown',beginCrop);window.addEventListener('pointermove',moveCrop);window.addEventListener('pointerup',endCrop);window.addEventListener('resize',syncCrop);$('#analyzeButton').onclick=analyze;$('#storyAnalyze').onclick=analyze;$('#refreshUsage').onclick=refreshUsage;$('#storyRefreshUsage').onclick=refreshUsage;$('#settingsButton').onclick=settings;$('#backFromSettings').onclick=goBack;$('#profilePremiumButton').onclick=()=>showPremium();$('#backFromPremium').onclick=goBack;$('#backFromTransfers').onclick=goBack;$('#startPayment').onclick=()=>{state.plan=$('#premiumPlans .plan.selected[data-plan]')?.dataset.plan||'weekly';showPaymentMethods()};$('#continuePaymentMethod').onclick=createPayment;$('#backFromPaymentMethods').onclick=goBack;$('#restartPayment').onclick=()=>createPayment();$('#submitProof').onclick=submitProof;$('#paymentProofFile').onchange=()=>{const f=$('#paymentProofFile').files?.[0];if($('#proofFileName'))$('#proofFileName').textContent=f?f.name:(state.language==='es'?'Opcional · JPG/PNG':'Optional · JPG/PNG')};$('#cancelPayment').onclick=()=>cancelPayment().catch(e=>toast(e.message));$('#resultClose').onclick=()=>$('#resultModal').classList.add('hidden');$('#anotherAnalysis').onclick=()=>{$('#resultModal').classList.add('hidden');clearImage()};async function copyText(text,label){try{await navigator.clipboard.writeText(text);$('#copyStatus').textContent=label+' copiada'}catch(e){toast(state.language==='es'?'No se pudo copiar':'Copy failed')}}$('#copyResponse').onclick=()=>copyText($('#replyOutput').textContent,'Respuesta #1');$('#copyAllResponse').onclick=()=>copyText($('#replyOutput').textContent,'Respuesta #1');$('#copyResponse2').onclick=()=>copyText($('#replyOutput2').textContent,'Respuesta #2');$('#copyRetryResponse1').onclick=()=>copyText($('#retryReplyOutput1').textContent,'Respuesta #3');$('#copyRetryResponse2').onclick=()=>copyText($('#retryReplyOutput2').textContent,'Respuesta #4');$('#retryAnalysis').onclick=async()=>{if(state.retryUsed)return toast('Ya utilizaste el reintento de este análisis');if(!state.lastAnalysisId||!state.lastAnalysisImage)return toast('No hay un análisis válido para reintentar');const b=$('#retryAnalysis');b.disabled=true;b.textContent='🔄 Generando…';try{const check=await fetch('/api/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({analysis_id:state.lastAnalysisId,text:state.lastAnalysisText})});const data=await check.json();if(!check.ok){state.retryUsed=true;b.textContent='Reintento no disponible';throw new Error(data.detail||'No se pudo validar el reintento')}state.retryUsed=true;state.lastGenerationKey=null;let next,next2;if(data.needs_generation===false&&Array.isArray(data.replies)&&data.replies.length>=2){next=data.replies[0];next2=data.replies[1]}else{next=await generate(state.lastAnalysisText,state.lastAnalysisImage);next2=state.lastReply2||makeAlternative(next)}$('#retryReplyOutput1').textContent=next||'—';$('#retryReplyOutput2').textContent=next2||'—';$('#retryProviderOutput1').textContent=state.lastProvider||'Proveedor no informado';$('#retryProviderOutput2').textContent=state.lastProvider||'Proveedor no informado';$('#retryAnswerBlock1').classList.remove('hidden');$('#retryAnswerBlock2').classList.remove('hidden');b.textContent='Reintento utilizado';b.disabled=true;$('#copyStatus').textContent='Se añadieron dos respuestas nuevas; las originales se conservaron.'}catch(e){state.retryUsed=true;b.disabled=true;b.textContent='Reintento utilizado';toast(e.message||'Error')}};$$('.segment').forEach(b=>b.onclick=()=>setModule(b.dataset.module));$$('.nav-item').forEach(b=>b.onclick=()=>b.dataset.nav==='profile'?profile():home());$$('.plan').forEach(b=>b.onclick=()=>{$$('.plan').forEach(x=>x.classList.remove('selected'));b.classList.add('selected');state.plan=b.dataset.plan});$('#languageButton').onclick=()=>{state.language=state.language==='es'?'en':'es';localStorage.setItem('liggacuba_lang',state.language);applyLanguage();loadPaymentPricing();loadProfile();if(!$('#supportScreen').classList.contains('hidden'))renderSupportReasons()};$('#contactButton').onclick=openSupport;$('#supportBack').onclick=goBack;$('#supportTelegram').onclick=()=>contactSupport('telegram');$('#supportWhatsapp').onclick=()=>contactSupport('whatsapp');$('#moreButton').onclick=more;$('#moreBack').onclick=goBack;
 $('#statsBack').onclick=goBack;
 const openStatsBtn=$('#openStats');if(openStatsBtn)openStatsBtn.onclick=()=>showStats();
-$('#copyReferCode').onclick=async()=>{const code=$('#myReferCode').textContent;if(!code||code==='—')return;try{await navigator.clipboard.writeText(code);toast(t('refer_copied'))}catch(e){toast(code)}};
-$('#applyReferCode').onclick=async()=>{const code=$('#referCodeInput').value.trim().toUpperCase();if(!code)return;const btn=$('#applyReferCode');btn.disabled=true;try{const r=await fetch('/api/referral/apply',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+state.authToken},body:JSON.stringify({refer_code:code})});const d=await r.json();const msg=$('#referApplyMsg');msg.classList.remove('hidden');msg.textContent=r.ok?t('refer_apply_ok'):d.detail||'Error';if(r.ok){$('#referCodeInput').value='';$('#referCodeInput').disabled=true;btn.style.display='none'}}catch(e){$('#referApplyMsg').classList.remove('hidden');$('#referApplyMsg').textContent='Error de conexión'}finally{btn.disabled=false}};
+
+// ---- Referral: copiar código ----
+if($('#copyReferCode'))$('#copyReferCode').onclick=async()=>{
+  const code=state.referCode||$('#myReferCode')?.textContent;
+  if(!code||code==='—')return;
+  try{await navigator.clipboard.writeText(code);toast(t('refer_copied')+': '+code);}
+  catch(e){toast(code);}
+};
+
+// ---- Referral: copiar enlace ----
+if($('#copyReferLink'))$('#copyReferLink').onclick=async()=>{
+  const link=state.referLink||$('#myReferLink')?.textContent;
+  if(!link||link==='—')return;
+  try{await navigator.clipboard.writeText(link);toast(t('refer_copied'));}
+  catch(e){toast(link);}
+};
+
+// ---- Referral: compartir genérico (Web Share API) ----
+if($('#shareReferLink'))$('#shareReferLink').onclick=async()=>{
+  const link=state.referLink||'';
+  const code=state.referCode||'';
+  const text=state.language==='es'
+    ?`¡Únete a LiggaCuba! Es el asistente más chévere para ligar 💜 Regístrate con mi enlace y cuando actives Premium los dos ganamos: https://t.me y tú 3 días gratis.\nCódigo: ${code}`
+    :`Join LiggaCuba! The best flirting assistant 💜 Sign up with my link and when you activate Premium we both win.\nCode: ${code}`;
+  if(navigator.share){
+    try{await navigator.share({title:'LiggaCuba',text,url:link});return;}catch(e){}
+  }
+  if(link&&link!=='—'){
+    try{await navigator.clipboard.writeText(link);toast(t('refer_copied'));}
+    catch(e){toast(link);}
+  }
+};
+
+// ---- Referral: compartir por Telegram ----
+if($('#shareReferTelegram'))$('#shareReferTelegram').onclick=()=>{
+  const link=state.referLink||'';
+  const code=state.referCode||'';
+  const msg=state.language==='es'
+    ?`¡Únete a LiggaCuba con mi enlace! Cuando actives Premium, te llevas los mejores análisis sin límite 💜\n${link}`
+    :`Join LiggaCuba with my link! Activate Premium and get unlimited analyses 💜\n${link}`;
+  const url=`https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(state.language==='es'?`¡Únete a LiggaCuba! Código: ${code}`:`Join LiggaCuba! Code: ${code}`)}`;
+  try{
+    if(tg?.openTelegramLink)return tg.openTelegramLink(`https://t.me/share/url?url=${encodeURIComponent(link)}`);
+    if(tg?.openLink)return tg.openLink(url);
+  }catch(_){}
+  window.open(url,'_blank','noopener');
+};
+
+// ---- Referral: compartir por WhatsApp ----
+if($('#shareReferWhatsapp'))$('#shareReferWhatsapp').onclick=()=>{
+  const link=state.referLink||'';
+  const code=state.referCode||'';
+  const msg=state.language==='es'
+    ?`¡Mira LiggaCuba! El asistente para ligar más útil 💜 Regístrate con mi enlace: ${link} (código: ${code})`
+    :`Check LiggaCuba! The best flirting assistant 💜 Sign up with my link: ${link} (code: ${code})`;
+  const url=`https://wa.me/?text=${encodeURIComponent(msg)}`;
+  try{if(tg?.openLink)return tg.openLink(url);}catch(_){}
+  window.open(url,'_blank','noopener');
+};
+
+// ---- Referral: aplicar código manual ----
+if($('#applyReferCode'))$('#applyReferCode').onclick=async()=>{
+  const code=$('#referCodeInput').value.trim().toUpperCase();
+  if(!code)return;
+  const btn=$('#applyReferCode');btn.disabled=true;
+  try{
+    const r=await fetch('/api/referral/apply',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+state.authToken},body:JSON.stringify({refer_code:code,source:'manual'})});
+    const d=await r.json();
+    const msg=$('#referApplyMsg');msg.classList.remove('hidden');
+    msg.textContent=r.ok?t('refer_apply_ok'):d.detail||'Error';
+    if(r.ok){$('#referCodeInput').value='';$('#referCodeInput').disabled=true;btn.style.display='none';}
+  }catch(e){$('#referApplyMsg').classList.remove('hidden');$('#referApplyMsg').textContent='Error de conexión';}
+  finally{btn.disabled=false;}
+};
+
+// ---- startapp: atribución automática al iniciar desde enlace de invitación ----
+(function _handleStartParam(){
+  try{
+    // 1. Telegram WebApp start_param (método oficial para Mini Apps)
+    const startParam=tg?.initDataUnsafe?.start_param||'';
+    if(startParam&&startParam.startsWith('ref_')){
+      state._pendingRefCode=startParam.slice(4).toUpperCase();
+    }
+  }catch(_){}
+})();
 applyLanguage();loadPaymentPricing();
 // Si hay initData de Telegram (Mini App) mostramos la app directamente al terminar.
 // En web/Android, _applyAuthData o _showLoginScreen se encargan de mostrar lo correcto.

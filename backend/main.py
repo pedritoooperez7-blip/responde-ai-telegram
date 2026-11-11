@@ -11,10 +11,12 @@ from urllib.parse import parse_qs
 from starlette.concurrency import run_in_threadpool
 try:
     from . import db as _db, limits as _limits, payments as _payments, dating as _dating, telegram_backup as _tgbackup, ads as _ads, cleanup as _cleanup
+    from . import referrals as _referrals
     from .ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
     from .telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo, send_document
 except ImportError:  # Support running uvicorn with backend/ as the working directory.
     import db as _db, limits as _limits, payments as _payments, dating as _dating, telegram_backup as _tgbackup, ads as _ads, cleanup as _cleanup
+    import referrals as _referrals
     from ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
     from telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo, send_document
 logger = logging.getLogger(__name__)
@@ -496,20 +498,16 @@ def init_db():
             c.execute(sql)
         except sqlite3.OperationalError:
             pass
-    c.commit(); c.close()
+    # Migraciones del motor de referidos (nuevas columnas, índices, tabla de auditoría)
+    _referrals.run_migrations(c)
+    c.close()
 
 
 def _ensure_refer_code(uid: str) -> str:
     """Return (creating if needed) a unique 8-char referral code for uid."""
-    import hashlib
     c = db()
-    row = c.execute("SELECT refer_code FROM users WHERE user_id=?", (uid,)).fetchone()
-    if row and row["refer_code"]:
-        c.close()
-        return row["refer_code"]
-    code = hashlib.sha256(f"ref-{uid}-liggacuba".encode()).hexdigest()[:8].upper()
-    c.execute("UPDATE users SET refer_code=?,updated_at=? WHERE user_id=?", (code, now(), uid))
-    c.commit(); c.close()
+    code = _referrals.ensure_refer_code(c, uid)
+    c.close()
     return code
 
 
@@ -607,7 +605,7 @@ def consume(uid, module, mode):
         c.close()
 
 
-class TelegramAuth(BaseModel): initData:str=""; user_id:Optional[str]=None
+class TelegramAuth(BaseModel): initData:str=""; user_id:Optional[str]=None; start_param:Optional[str]=None
 class TelegramWidgetAuth(BaseModel):
     id: Union[int, str]
     first_name: str = ""
@@ -649,7 +647,9 @@ class PaymentReview(BaseModel): operation_id:str; action:str; reason:str=""
 class Proof(BaseModel): operation_id:str; user_id:str=""; proof_text:str=""; proof_image:str=""
 class SaveSituation(BaseModel): user_id:str; ocr_text:str=""; reply:str=""
 class OCR(BaseModel): image:str
-class ReferralApply(BaseModel): refer_code:str
+class ReferralApply(BaseModel):
+    refer_code: str
+    source: Optional[str] = "manual"  # "manual" | "startapp"
 class PriceUpdate(BaseModel): plan:str; price:float
 
 
@@ -1220,7 +1220,36 @@ def auth_telegram(p:TelegramAuth):
         raise HTTPException(401,"El usuario no coincide con Telegram")
     uid=str(u["id"]); _reject_if_banned(uid)
     user(uid,{"username":u.get("username"),"first_name":u.get("first_name"),"last_name":u.get("last_name")}); x=usage(uid)
-    return {"success":True,"user_id":uid,"token":session_token(uid),**x}
+    # Atribución automática vía startapp: start_param = "ref_XXXXXXXX"
+    referral_applied = False
+    if p.start_param:
+        raw = str(p.start_param).strip()
+        if raw.startswith("ref_"):
+            code = raw[4:].upper()
+            c = db()
+            try:
+                ref_result = _referrals.apply_referral(c, uid, code, source="startapp")
+                referral_applied = ref_result.get("success", False)
+                if referral_applied and not ref_result.get("already_registered"):
+                    referrer_id = ref_result.get("referrer_id")
+                    if referrer_id:
+                        c2 = db()
+                        u_row = c2.execute("SELECT first_name, username FROM users WHERE user_id=?", (uid,)).fetchone()
+                        c2.close()
+                        invitee_name = "Un amigo"
+                        if u_row:
+                            invitee_name = u_row["first_name"] or (f"@{u_row['username']}" if u_row["username"] else "Un amigo")
+                        notify_user(
+                            referrer_id,
+                            f"👥 <b>¡Nuevo amigo invitado!</b>\n"
+                            f"{invitee_name} se unió a LiggaCuba usando tu enlace. "
+                            f"Cuando active Premium, recibirás <b>3 días de Premium</b> extra. 🎉",
+                        )
+            except Exception as exc:
+                logger.warning("startapp referral apply failed uid=%s code=%s: %s", uid, code, exc)
+            finally:
+                c.close()
+    return {"success":True,"user_id":uid,"token":session_token(uid),"referral_applied":referral_applied,**x}
 
 @app.post("/api/auth/telegram-widget")
 def auth_telegram_widget(p: TelegramWidgetAuth):
@@ -1768,11 +1797,8 @@ def user_stats(request: Request):
     all_modes = {r["mode"]: r["n"] for r in rows_all if r["mode"]}
     best_mode = max(all_modes, key=all_modes.get) if all_modes else None
     total = sum(all_modes.values())
-    # Referrals
-    ref_code = _ensure_refer_code(uid)
-    ref_rows = c.execute(
-        "SELECT COUNT(*) total, SUM(rewarded) rewarded FROM referrals WHERE referrer_id=?", (uid,)
-    ).fetchone()
+    # Referrals — datos completos del motor de referidos
+    ref_history = _referrals.get_referral_history(c, uid)
     c.close()
     return {
         "total_analyses": total,
@@ -1780,79 +1806,108 @@ def user_stats(request: Request):
         "best_mode": best_mode,
         "this_week": sum(r["n"] for r in rows_week),
         "daily_activity": [{"day": r["d"], "count": r["n"]} for r in rows_days],
-        "refer_code": ref_code,
-        "referrals_total": int(ref_rows["total"] or 0),
-        "referrals_rewarded": int(ref_rows["rewarded"] or 0),
+        # Campos legacy (compatibilidad con código anterior)
+        "refer_code": ref_history["refer_code"],
+        "referrals_total": ref_history["stats"]["total_invited"],
+        "referrals_rewarded": ref_history["stats"]["rewarded"],
+        # Nuevos campos
+        "referral_stats": ref_history["stats"],
+        "referral_invitations": ref_history["invitations"],
+        "referral_rewards_history": ref_history["rewards_history"],
+        "referral_next_rewards_pending": ref_history["next_rewards_pending"],
     }
 
 
 @app.post("/api/referral/apply")
 def apply_referral(p: ReferralApply, request: Request):
-    """Registra que el usuario actual fue invitado por refer_code."""
+    """Registra que el usuario actual fue invitado por refer_code (manual o vía startapp)."""
     uid = current_user(request)
     code = str(p.refer_code or "").strip().upper()
-    if not code:
-        raise HTTPException(400, "Código de referido requerido")
+    source = str(getattr(p, "source", "manual") or "manual")
+
     c = db()
-    # Find referrer
-    referrer = c.execute("SELECT user_id FROM users WHERE refer_code=?", (code,)).fetchone()
-    if not referrer:
-        c.close()
-        raise HTTPException(404, "Código de referido no válido")
-    referrer_id = referrer["user_id"]
-    if referrer_id == uid:
-        c.close()
-        raise HTTPException(400, "No puedes usar tu propio código")
-    # Check if already referred
-    existing = c.execute("SELECT id FROM referrals WHERE referred_id=?", (uid,)).fetchone()
-    if existing:
-        c.close()
-        raise HTTPException(409, "Ya tienes un referido registrado")
-    # Check if already referred by someone
-    already = c.execute("SELECT referred_by FROM users WHERE user_id=?", (uid,)).fetchone()
-    if already and already["referred_by"]:
-        c.close()
-        raise HTTPException(409, "Ya tienes un referido registrado")
-    c.execute("INSERT INTO referrals(referrer_id,referred_id,rewarded,created_at) VALUES(?,?,0,?)",
-              (referrer_id, uid, now()))
-    c.execute("UPDATE users SET referred_by=?,updated_at=? WHERE user_id=?", (referrer_id, now(), uid))
-    c.commit(); c.close()
-    return {"success": True, "message": "Referido registrado. ¡Cuando actives Premium, tu amigo gana 3 días!"}
+    result = _referrals.apply_referral(c, uid, code, source=source)
+    c.close()
+
+    if not result["success"]:
+        error = result.get("error", "")
+        if error == "code_required":
+            raise HTTPException(400, result["message"])
+        elif error == "code_not_found":
+            raise HTTPException(404, result["message"])
+        elif error == "self_referral":
+            raise HTTPException(400, result["message"])
+        elif error == "already_referred":
+            raise HTTPException(409, result["message"])
+        else:
+            raise HTTPException(400, result["message"])
+
+    # Si es un referido nuevo (no idempotente), notificar al invitador
+    if not result.get("already_registered"):
+        referrer_id = result.get("referrer_id")
+        if referrer_id:
+            # Obtener nombre del invitado para la notificación
+            c2 = db()
+            u_row = c2.execute("SELECT first_name, username FROM users WHERE user_id=?", (uid,)).fetchone()
+            c2.close()
+            invitee_name = "Un amigo"
+            if u_row:
+                invitee_name = u_row["first_name"] or (f"@{u_row['username']}" if u_row["username"] else "Un amigo")
+            notify_user(
+                referrer_id,
+                f"👥 <b>¡Nuevo amigo invitado!</b>\n"
+                f"{invitee_name} se unió a LiggaCuba usando tu código. "
+                f"Cuando active Premium, recibirás <b>3 días de Premium</b> extra. 🎉",
+            )
+
+    return {
+        "success": True,
+        "message": result["message"],
+        "already_registered": result.get("already_registered", False),
+    }
 
 
-def _reward_referrer(user_id: str) -> None:
+def _reward_referrer(user_id: str, payment_operation_id: str = "") -> None:
     """Give 3 days Premium to the referrer when referred user pays for the first time."""
+    c = db()
     try:
-        c = db()
-        ref = c.execute(
-            "SELECT id, referrer_id FROM referrals WHERE referred_id=? AND rewarded=0", (user_id,)
-        ).fetchone()
-        if not ref:
+        # Marcar estado intermedio premium_active antes de acreditar
+        # Zip1 engine accepts optional payment_operation_id for better traceability
+        _referrals.mark_referral_premium_active(c, user_id, payment_operation_id or "")
+
+        # Acreditar recompensa atómica
+        rewarded = _referrals.reward_referrer(c, user_id, payment_operation_id or f"pay_{now()}")
+        if not rewarded:
             c.close()
             return
-        referrer_id = ref["referrer_id"]
-        t = now()
-        # Grant 3 days to referrer
-        row = c.execute("SELECT premium_until FROM users WHERE user_id=?", (referrer_id,)).fetchone()
-        current = row["premium_until"] if row else None
-        if current:
-            try:
-                base = _utc_datetime(current)
-                if base < datetime.utcnow():
-                    base = datetime.utcnow()
-            except Exception:
-                base = datetime.utcnow()
-        else:
-            base = datetime.utcnow()
-        until = (base + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S")
-        c.execute("UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?", (until, t, referrer_id))
-        c.execute("UPDATE referrals SET rewarded=1 WHERE id=?", (ref["id"],))
-        c.commit(); c.close()
-        notify_user(referrer_id,
-            "🎁 <b>¡Recompensa de referido!</b>\nUno de tus amigos activó Premium gracias a tu código. "
-            "Te regalamos <b>3 días de Premium</b> extra. ¡Gracias por recomendar LiggaCuba!")
+
+        # Obtener referrer_id para notificaciones
+        ref_row = c.execute(
+            "SELECT referrer_id FROM referrals WHERE referred_id=? AND rewarded=1", (user_id,)
+        ).fetchone()
+        c.close()
+
+        if ref_row:
+            referrer_id = ref_row["referrer_id"]
+            # Notificación al invitador
+            notify_user(
+                referrer_id,
+                "🎁 <b>¡Recompensa de referido!</b>\n"
+                "Uno de tus amigos activó Premium gracias a tu código. "
+                "Te regalamos <b>3 días de Premium</b> extra. ¡Gracias por recomendar LiggaCuba! 💜",
+            )
+            # Notificación al invitado
+            notify_user(
+                user_id,
+                "✅ <b>Tu código de referido está activo.</b>\n"
+                "Tu amigo que te invitó ya recibió su recompensa. ¡Gracias por unirte a LiggaCuba! 🎉",
+            )
     except Exception as exc:
         logger.warning("_reward_referrer failed for %s: %s", user_id, exc)
+        try:
+            c.close()
+        except Exception:
+            pass
 
 
 @app.post("/api/situations/save")
@@ -2091,7 +2146,7 @@ def atajo_pago(p: AtajoPayment, request: Request):
         else:
             days = _payments.plan_days(matched["plan"])
             notify_user(matched["user_id"], f"🎉 <b>¡Premium activado!</b>\nTienes <b>{days} días</b> de acceso Premium en LiggaCuba. ¡Disfrútalo!")
-            _reward_referrer(matched["user_id"])
+            _reward_referrer(matched["user_id"], str(matched.get("operation_id", "")))
         return result
     except sqlite3.IntegrityError:
         c.rollback()
@@ -2590,7 +2645,7 @@ def verify_payment(p:PaymentId, request:Request):
     else:
         days = _payments.plan_days(row["plan"])
         notify_user(row["user_id"], f"🎉 <b>¡Premium activado!</b>\nTienes <b>{days} días</b> de acceso Premium en LiggaCuba. ¡Disfrútalo!")
-        _reward_referrer(row["user_id"])
+        _reward_referrer(row["user_id"], str(p.operation_id))
     return {"success":True,"status":"verified",key:until,"plan":row["plan"]}
 
 @app.post("/api/admin/payments/reject")
@@ -2938,6 +2993,157 @@ def admin_ai_provider_delete(provider_id: str, request: Request):
         raise HTTPException(404, "Proveedor no encontrado")
     audit(ident["username"], "ai_provider_deleted", provider_id, {})
     return {"success": True, "provider_id": provider_id}
+
+
+# ---------------------------------------------------------------------------
+# Admin – Referidos
+# ---------------------------------------------------------------------------
+
+@app.get("/api/admin/referrals/stats")
+def admin_referral_stats(request: Request):
+    """Estadísticas globales del sistema de referidos."""
+    admin(request)
+    c = db()
+    try:
+        stats = _referrals.get_admin_stats(c)
+    finally:
+        c.close()
+    return stats
+
+
+class AdminReferralListQuery(BaseModel):
+    status: Optional[str] = None
+    search: Optional[str] = None
+    limit: int = 50
+    offset: int = 0
+
+
+@app.post("/api/admin/referrals/list")
+def admin_referral_list(p: AdminReferralListQuery, request: Request):
+    """Lista paginada de referidos con filtros."""
+    admin(request)
+    c = db()
+    try:
+        result = _referrals.get_admin_referral_list(
+            c, status=p.status, search=p.search, limit=p.limit, offset=p.offset
+        )
+    finally:
+        c.close()
+    return result
+
+
+class AdminAnomalyResolve(BaseModel):
+    referral_id: int
+    action: str  # "approve" | "reject"
+    notes: str = ""
+
+
+@app.post("/api/admin/referrals/anomaly/resolve")
+def admin_resolve_anomaly(p: AdminAnomalyResolve, request: Request):
+    """Resuelve una anomalía detectada en un referido."""
+    ident = admin(request)
+    if p.action not in ("approve", "reject"):
+        raise HTTPException(400, "action debe ser 'approve' o 'reject'")
+    c = db()
+    try:
+        _referrals.resolve_anomaly(c, p.referral_id, ident["username"], p.action, p.notes)
+    finally:
+        c.close()
+    return {"success": True}
+
+
+class AdminRewardAdjust(BaseModel):
+    referral_id: int
+    grant: bool
+    notes: str = ""
+
+
+@app.post("/api/admin/referrals/reward/adjust")
+def admin_adjust_reward(p: AdminRewardAdjust, request: Request):
+    """Ajuste manual de recompensa. Deja registro de auditoría."""
+    ident = admin(request)
+    c = db()
+    try:
+        result = _referrals.admin_adjust_reward(c, p.referral_id, ident["username"], p.grant, p.notes)
+    finally:
+        c.close()
+    if not result.get("success"):
+        raise HTTPException(400, result.get("error", "No se pudo ajustar"))
+    return result
+
+
+@app.get("/api/admin/referrals/reconcile")
+def admin_reconcile(request: Request):
+    """Detecta recompensas pendientes de acreditar para revisión."""
+    admin(request)
+    c = db()
+    try:
+        pending = _referrals.reconcile_pending_rewards(c)
+    finally:
+        c.close()
+    return {"pending_rewards": pending, "count": len(pending)}
+
+
+@app.post("/api/admin/referrals/flag")
+def admin_flag_anomaly(request: Request, referral_id: int, reason: str = "manual_flag"):
+    """Marca manualmente un referido como anomalía."""
+    ident = admin(request)
+    c = db()
+    try:
+        _referrals.flag_anomaly(c, referral_id, f"admin:{ident['username']} – {reason}")
+    finally:
+        c.close()
+    return {"success": True}
+
+
+@app.get("/api/admin/referrals/audit")
+def admin_referral_audit(request: Request, limit: int = 50, offset: int = 0):
+    """Log de auditoría de acciones administrativas sobre referidos."""
+    admin(request)
+    c = db()
+    try:
+        rows = c.execute(
+            "SELECT * FROM referral_audit_log ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        total = c.execute("SELECT COUNT(*) n FROM referral_audit_log").fetchone()["n"]
+    finally:
+        c.close()
+    return {"total": total, "items": [dict(r) for r in rows]}
+
+
+# ---------------------------------------------------------------------------
+# Referrals – Enlace personal de invitación
+# ---------------------------------------------------------------------------
+
+@app.get("/api/referral/my-link")
+def get_referral_link(request: Request):
+    """
+    Devuelve el código de referido del usuario y el enlace startapp completo.
+    Requiere que TELEGRAM_BOT_USERNAME esté configurado en el entorno.
+    """
+    uid = current_user(request)
+    bot_username = BOT_USERNAME.lstrip("@")
+    c = db()
+    try:
+        code = _ensure_refer_code(uid)
+    finally:
+        c.close()
+
+    if not bot_username:
+        return {
+            "refer_code": code,
+            "invite_link": None,
+            "bot_username": None,
+            "warning": "TELEGRAM_BOT_USERNAME no configurado",
+        }
+
+    invite_link = f"https://t.me/{bot_username}?startapp=ref_{code}"
+    return {
+        "refer_code": code,
+        "invite_link": invite_link,
+        "bot_username": bot_username,
+    }
 
 
 # ---------------------------------------------------------------------------
