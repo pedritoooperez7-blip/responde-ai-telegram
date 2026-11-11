@@ -3182,5 +3182,3 @@ app.include_router(_ads.build_router(
     current_user=current_user, connect=db, is_premium=lambda uid: premium(uid), admin=admin, audit=audit,
     payments=_payments,
 ))
-nts,
-))
