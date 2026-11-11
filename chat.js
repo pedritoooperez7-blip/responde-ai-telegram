@@ -491,6 +491,9 @@
     const textarea = el('textarea', {
       class: 'ch-input', placeholder: C('placeholder'), rows: 1,
       disabled: !!disabled, maxlength: 1000,
+      // Mejor soporte de teclado en Telegram Mini App (iOS/Android)
+      inputmode: 'text', enterkeyhint: 'send', autocomplete: 'off',
+      autocorrect: 'on', autocapitalize: 'sentences',
     });
 
     // auto-resize
@@ -502,6 +505,18 @@
     textarea.onkeydown = (e) => {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); _doSend(textarea, sendBtn); }
     };
+
+    // Forzar apertura del teclado en dispositivos móviles / Telegram WebApp
+    const forceFocus = (e) => {
+      if (disabled) return;
+      // Evitar que el evento se trague en contenedores fixed
+      e.stopPropagation();
+      setTimeout(() => {
+        try { textarea.focus({ preventScroll: false }); } catch (_) { textarea.focus(); }
+      }, 10);
+    };
+    textarea.addEventListener('touchstart', forceFocus, { passive: true });
+    textarea.addEventListener('pointerdown', forceFocus);
 
     const sendBtn = el('button', { class: 'ch-send-btn', type: 'button',
       'aria-label': C('send'), disabled: !!disabled,
@@ -930,6 +945,11 @@
   background: var(--surface, #fff);
   border-top: 1px solid var(--line, #e9e5f5);
   flex-shrink: 0;
+  position: relative;
+  z-index: 5;
+  pointer-events: auto;
+  -webkit-user-select: text;
+  user-select: text;
 }
 .ch-input {
   flex: 1;
@@ -946,6 +966,12 @@
   overflow-y: auto;
   transition: border-color .15s;
   line-height: 1.4;
+  -webkit-user-select: text;
+  user-select: text;
+  pointer-events: auto;
+  -webkit-appearance: none;
+  appearance: none;
+  touch-action: manipulation;
 }
 .ch-input:focus {
   outline: none;

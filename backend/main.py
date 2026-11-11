@@ -2146,7 +2146,7 @@ def atajo_pago(p: AtajoPayment, request: Request):
         else:
             days = _payments.plan_days(matched["plan"])
             notify_user(matched["user_id"], f"🎉 <b>¡Premium activado!</b>\nTienes <b>{days} días</b> de acceso Premium en LiggaCuba. ¡Disfrútalo!")
-            _reward_referrer(matched["user_id"], str(matched.get("operation_id", "")))
+            _reward_referrer(matched["user_id"], str(matched["operation_id"]))
         return result
     except sqlite3.IntegrityError:
         c.rollback()
@@ -3181,4 +3181,6 @@ app.include_router(_dating.build_router(
 app.include_router(_ads.build_router(
     current_user=current_user, connect=db, is_premium=lambda uid: premium(uid), admin=admin, audit=audit,
     payments=_payments,
+))
+nts,
 ))
