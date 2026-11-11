@@ -1,4 +1,32 @@
 const tg=window.Telegram?.WebApp;
+// Robust viewport for Android Telegram Mini App (Problem 6)
+(function _initViewport(){
+  try{
+    if(tg){
+      tg.ready();
+      try{tg.expand();}catch(_){}
+      const applyH=()=>{
+        const h = (tg.viewportStableHeight || tg.viewportHeight || window.innerHeight) + 'px';
+        document.documentElement.style.setProperty('--tg-viewport-stable-height', h);
+        document.documentElement.style.setProperty('--app-height', h);
+        document.body.style.minHeight = h;
+        const app = document.getElementById('app');
+        if(app) app.style.minHeight = h;
+      };
+      applyH();
+      if(tg.onEvent) tg.onEvent('viewportChanged', applyH);
+      window.addEventListener('resize', applyH);
+      // Also use visualViewport if available (keyboard)
+      if(window.visualViewport){
+        window.visualViewport.addEventListener('resize', ()=>{
+          document.documentElement.style.setProperty('--vv-height', window.visualViewport.height + 'px');
+        });
+      }
+    } else {
+      document.documentElement.style.setProperty('--tg-viewport-stable-height', '100dvh');
+    }
+  }catch(e){console.warn('viewport init',e);}
+})();
 const state={authToken:sessionStorage.getItem('liggacuba_auth')||'',paymentMethod:"BANDEC",paymentPhone:"",paymentPricing:null,module:'chat',file:null,mode:'coquetear',userId:String(tg?.initDataUnsafe?.user?.id||'guest-user'),premium:false,premiumUntil:null,remaining:0,language:localStorage.getItem('liggacuba_lang')||'es',plan:'weekly',operationId:null,lastAnalysisText:'',lastReply1:'',lastReply2:'',lastProvider:'',lastOCRText:'',lastAnalysisImage:null,retryUsed:false,analysisModule:'chat',lastAnalysisId:null,lastGenerationKey:null};
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];const formatCubaDate=v=>{if(!v)return '—';const d=new Date(v);return Number.isNaN(d.getTime())?String(v):new Intl.DateTimeFormat(state.language==='es'?'es-CU':'en-US',{timeZone:'America/Havana',dateStyle:'medium',timeStyle:'short'}).format(d)};
 const modes={chat:[['gracioso','fa-face-grin-stars',false],['coquetear','fa-face-smile-wink',false],['provocativo','fa-bolt',true],['enamorar','fa-heart',false],['salvar','fa-life-ring',true],['reactivar','fa-rotate-right',true]],story:[['gracioso','fa-face-grin-stars',false],['coquetear','fa-face-smile-wink',false],['provocativo','fa-bolt',true],['enamorar','fa-heart',true],['reactivar','fa-rotate-right',true]]};
@@ -562,45 +590,81 @@ if($('#copyReferLink'))$('#copyReferLink').onclick=async()=>{
   catch(e){toast(link);}
 };
 
+// ---- Referral: plantilla centralizada de mensaje de invitación (Problemas 2-4) ----
+function buildInviteMessage(channel){
+  const link = state.referLink || '';
+  const code = state.referCode || '';
+  const es = state.language === 'es';
+  if(es){
+    const body = `¡Hola! Te invito a descubrir LiggaCuba 🇨🇺
+
+LiggaCuba es tu asistente inteligente para ligar y conectar. Sube capturas de conversaciones y recibe respuestas personalizadas con diferentes estilos (coquetear, gracioso, enamorar y más). También incluye Citas: descubre perfiles, haz match y chatea en privado.
+
+Beneficios principales:
+• Análisis de chats con IA + OCR de capturas
+• Respuestas adaptadas a tu estilo y a la conversación
+• Módulo de Citas con descubrimiento, matches y chat privado
+• Plan Premium: análisis ilimitados y todos los modos
+
+Recompensa: cuando te registres con mi enlace y actives tu primera suscripción Premium elegible, ambos recibimos 3 días de Premium extra.
+
+Mi código de invitación: ${code}
+Mi enlace personal:
+${link}
+
+¡Entra y prueba LiggaCuba!`;
+    return body;
+  } else {
+    const body = `Hey! I invite you to try LiggaCuba 🇨🇺
+
+LiggaCuba is your smart assistant for flirting and connecting. Upload conversation screenshots and get personalized replies in different styles (flirt, funny, romantic and more). It also includes Dating: discover profiles, match and chat privately.
+
+Key benefits:
+• AI chat analysis + OCR of screenshots
+• Replies adapted to your style and the conversation
+• Dating module with discovery, matches and private chat
+• Premium plan: unlimited analyses and all modes
+
+Reward: when you sign up with my link and activate your first eligible Premium subscription, we both get 3 extra days of Premium.
+
+My invite code: ${code}
+My personal link:
+${link}
+
+Come try LiggaCuba!`;
+    return body;
+  }
+}
+
 // ---- Referral: compartir genérico (Web Share API) ----
 if($('#shareReferLink'))$('#shareReferLink').onclick=async()=>{
   const link=state.referLink||'';
-  const code=state.referCode||'';
-  const text=state.language==='es'
-    ?`¡Únete a LiggaCuba! Es el asistente más chévere para ligar 💜 Regístrate con mi enlace y cuando actives Premium los dos ganamos: https://t.me y tú 3 días gratis.\nCódigo: ${code}`
-    :`Join LiggaCuba! The best flirting assistant 💜 Sign up with my link and when you activate Premium we both win.\nCode: ${code}`;
+  const text=buildInviteMessage('share');
   if(navigator.share){
-    try{await navigator.share({title:'LiggaCuba',text,url:link});return;}catch(e){}
+    try{await navigator.share({title:'LiggaCuba',text,url:link||undefined});return;}catch(e){}
   }
-  if(link&&link!=='—'){
-    try{await navigator.clipboard.writeText(link);toast(t('refer_copied'));}
-    catch(e){toast(link);}
-  }
+  // Fallback: copiar mensaje completo
+  try{await navigator.clipboard.writeText(text);toast(t('refer_copied'));}
+  catch(e){if(link&&link!=='—')try{await navigator.clipboard.writeText(link);toast(t('refer_copied'));}catch(_){toast(link||text);}}
 };
 
 // ---- Referral: compartir por Telegram ----
 if($('#shareReferTelegram'))$('#shareReferTelegram').onclick=()=>{
   const link=state.referLink||'';
-  const code=state.referCode||'';
-  const msg=state.language==='es'
-    ?`¡Únete a LiggaCuba con mi enlace! Cuando actives Premium, te llevas los mejores análisis sin límite 💜\n${link}`
-    :`Join LiggaCuba with my link! Activate Premium and get unlimited analyses 💜\n${link}`;
-  const url=`https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(state.language==='es'?`¡Únete a LiggaCuba! Código: ${code}`:`Join LiggaCuba! Code: ${code}`)}`;
+  const text=buildInviteMessage('telegram');
+  // Telegram share/url: text + url. Usamos el texto completo y el enlace como url.
+  const shareUrl=`https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(text)}`;
   try{
-    if(tg?.openTelegramLink)return tg.openTelegramLink(`https://t.me/share/url?url=${encodeURIComponent(link)}`);
-    if(tg?.openLink)return tg.openLink(url);
+    if(tg?.openTelegramLink) return tg.openTelegramLink(shareUrl);
+    if(tg?.openLink) return tg.openLink(shareUrl);
   }catch(_){}
-  window.open(url,'_blank','noopener');
+  window.open(shareUrl,'_blank','noopener');
 };
 
 // ---- Referral: compartir por WhatsApp ----
 if($('#shareReferWhatsapp'))$('#shareReferWhatsapp').onclick=()=>{
-  const link=state.referLink||'';
-  const code=state.referCode||'';
-  const msg=state.language==='es'
-    ?`¡Mira LiggaCuba! El asistente para ligar más útil 💜 Regístrate con mi enlace: ${link} (código: ${code})`
-    :`Check LiggaCuba! The best flirting assistant 💜 Sign up with my link: ${link} (code: ${code})`;
-  const url=`https://wa.me/?text=${encodeURIComponent(msg)}`;
+  const text=buildInviteMessage('whatsapp');
+  const url=`https://wa.me/?text=${encodeURIComponent(text)}`;
   try{if(tg?.openLink)return tg.openLink(url);}catch(_){}
   window.open(url,'_blank','noopener');
 };

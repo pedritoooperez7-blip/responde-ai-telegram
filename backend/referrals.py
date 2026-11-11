@@ -261,6 +261,12 @@ def reward_referrer(c: sqlite3.Connection, invitee_uid: str, payment_operation_i
             c.rollback()
             return False
 
+        # No recompensar planes de anuncios / business
+        plan = (payment["plan"] or "").lower()
+        if plan.startswith("ad_") or plan in ("business", "ads", "anuncio"):
+            c.rollback()
+            return False
+
         # No atribuir recompensas por pagos anteriores a la invitación ni por renovaciones.
         verified_at = payment["verified_at"] or _now()
         if str(verified_at) < str(ref["created_at"]):
