@@ -197,8 +197,8 @@ def apply_referral(
             and referrer_phone["payment_phone"] and invitee_phone["payment_phone"]
             and str(referrer_phone["payment_phone"]).strip() == str(invitee_phone["payment_phone"]).strip()
         )
-        initial_status = STATUS_REVIEW if same_phone else STATUS_REGISTERED
-        anomaly_reason = "Mismo teléfono de pago en invitador e invitado; requiere revisión" if same_phone else None
+        initial_status = STATUS_REGISTERED
+        anomaly_reason = "Mismo teléfono de pago en invitador e invitado" if same_phone else None
         c.execute(
             """INSERT INTO referrals(referrer_id, referred_id, rewarded, status, source,
                                      anomaly_flag, anomaly_reason, created_at, updated_at)
@@ -217,9 +217,7 @@ def apply_referral(
         c.commit()
         return {"success": True, "referrer_id": referrer_id, "source": source,
                 "anomaly": same_phone,
-                "message": ("Código registrado y enviado a revisión de seguridad."
-                            if same_phone else
-                            "¡Código registrado! Cuando actives Premium, tu amigo ganará 3 días.")}
+                "message": "¡Código registrado! Cuando actives Premium, tu amigo ganará 3 días."}
     except sqlite3.IntegrityError:
         c.rollback()
         existing = c.execute(
@@ -236,24 +234,47 @@ def apply_referral(
 # Motor de recompensas
 # ---------------------------------------------------------------------------
 
+def _is_ad_plan(plan: Optional[str]) -> bool:
+    value = (plan or "").strip().lower()
+    return value.startswith("ad_") or value in {"business", "ads", "anuncio"}
+
+
+def _begin_immediate(c: sqlite3.Connection) -> None:
+    """Abre una transacción de escritura aunque Python ya hubiera empezado una."""
+    try:
+        if c.in_transaction:
+            c.commit()
+        c.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        if "transaction" not in str(exc).lower():
+            raise
+        c.rollback()
+        c.execute("BEGIN IMMEDIATE")
+
+
 def reward_referrer(c: sqlite3.Connection, invitee_uid: str, payment_operation_id: str) -> bool:
-    """Acredita una sola recompensa por el primer pago Premium verificado posterior a la atribución."""
+    """Acredita una sola recompensa por el primer pago Premium verificado posterior a la atribución.
+
+    No manda el caso a revisión: un Premium elegible se acredita solo.
+    ``admin_review`` (mismo teléfono u otra marca) tampoco bloquea el premio;
+    el admin sigue viendo la anomalía y puede revocar. ``not_eligible`` sí bloquea.
+    """
     if not payment_operation_id:
         return False
     try:
-        c.execute("BEGIN IMMEDIATE")
+        _begin_immediate(c)
         ref = c.execute(
             """SELECT id, referrer_id, rewarded, status, created_at
                FROM referrals WHERE referred_id=? AND rewarded=0
-                 AND status NOT IN (?, ?)""",
-            (invitee_uid, STATUS_NOT_ELIGIBLE, STATUS_REVIEW),
+                 AND status NOT IN (?)""",
+            (invitee_uid, STATUS_NOT_ELIGIBLE),
         ).fetchone()
         if not ref:
             c.rollback()
             return False
 
         payment = c.execute(
-            """SELECT operation_id, user_id, plan, status, verified_at
+            """SELECT operation_id, user_id, plan, status, verified_at, created_at
                FROM payment_operations WHERE operation_id=?""",
             (payment_operation_id,),
         ).fetchone()
@@ -261,28 +282,35 @@ def reward_referrer(c: sqlite3.Connection, invitee_uid: str, payment_operation_i
             c.rollback()
             return False
 
-        # No recompensar planes de anuncios / business
-        plan = (payment["plan"] or "").lower()
-        if plan.startswith("ad_") or plan in ("business", "ads", "anuncio"):
+        if _is_ad_plan(payment["plan"]):
             c.rollback()
             return False
 
-        # No atribuir recompensas por pagos anteriores a la invitación ni por renovaciones.
-        verified_at = payment["verified_at"] or _now()
-        if str(verified_at) < str(ref["created_at"]):
+        verified_at = payment["verified_at"] or payment["created_at"] or _now()
+        verified_dt = _parse_dt(verified_at)
+        created_dt = _parse_dt(ref["created_at"])
+        # El pago tiene que ser de después de la invitación (mismo segundo vale).
+        if verified_dt + timedelta(seconds=1) < created_dt:
             c.rollback()
             return False
-        earlier = c.execute(
-            """SELECT 1 FROM payment_operations
-               WHERE user_id=? AND status='verified'
-                 AND operation_id<>?
-                 AND COALESCE(verified_at, created_at) <= ?
-               LIMIT 1""",
-            (invitee_uid, payment_operation_id, verified_at),
-        ).fetchone()
-        if earlier:
-            c.rollback()
-            return False
+
+        others = c.execute(
+            """SELECT operation_id, plan, verified_at, created_at
+               FROM payment_operations
+               WHERE user_id=? AND status='verified' AND operation_id<>?""",
+            (invitee_uid, payment_operation_id),
+        ).fetchall()
+        for other in others:
+            if _is_ad_plan(other["plan"]):
+                continue
+            try:
+                other_dt = _parse_dt(other["verified_at"] or other["created_at"] or "")
+            except Exception:
+                continue
+            # Renovación: ya hubo otro Premium verificado después de la invitación.
+            if created_dt <= other_dt < verified_dt:
+                c.rollback()
+                return False
 
         referrer_id = ref["referrer_id"]
         row = c.execute("SELECT premium_until FROM users WHERE user_id=?", (referrer_id,)).fetchone()
@@ -290,28 +318,28 @@ def reward_referrer(c: sqlite3.Connection, invitee_uid: str, payment_operation_i
             c.rollback()
             return False
         current = row["premium_until"]
+        base = datetime.utcnow()
         if current:
             try:
-                base = _parse_dt(current)
-                if base < datetime.utcnow():
-                    base = datetime.now(timezone.utc)
+                parsed = _parse_dt(current)
+                if parsed > base:
+                    base = parsed
             except Exception:
-                base = datetime.now(timezone.utc)
-        else:
-            base = datetime.now(timezone.utc)
+                base = datetime.utcnow()
         until = (base + timedelta(days=REWARD_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
         t = _now()
         idempotency_key = f"ref_{ref['id']}_pay_{payment_operation_id}"
 
         c.execute("UPDATE users SET premium_until=?, updated_at=? WHERE user_id=?",
                   (until, t, referrer_id))
-        c.execute(
+        updated = c.execute(
             """UPDATE referrals SET rewarded=1, status=?, rewarded_at=?,
-               reward_payment_id=?, reward_idempotency_key=?, confirmed_at=?, updated_at=?
+               reward_payment_id=?, reward_idempotency_key=?, confirmed_at=?, updated_at=?,
+               inviter_notified=0, invitee_notified=0
                WHERE id=? AND rewarded=0""",
             (STATUS_REWARDED, t, payment_operation_id, idempotency_key, verified_at, t, ref["id"]),
         )
-        if c.execute("SELECT changes()").fetchone()[0] != 1:
+        if updated.rowcount != 1:
             c.rollback()
             return False
         c.commit()
@@ -322,7 +350,10 @@ def reward_referrer(c: sqlite3.Connection, invitee_uid: str, payment_operation_i
     except Exception as exc:
         logger.warning("reward_referrer failed for invitee=%s payment=%s: %s",
                        invitee_uid, payment_operation_id, exc)
-        c.rollback()
+        try:
+            c.rollback()
+        except Exception:
+            pass
         return False
 
 
@@ -336,12 +367,56 @@ def mark_referral_premium_active(c: sqlite3.Connection, invitee_uid: str, paymen
         c.execute(
             """UPDATE referrals
                SET status=?, confirmed_at=?, reward_payment_id=COALESCE(NULLIF(?, ''), reward_payment_id), updated_at=?
-               WHERE referred_id=? AND rewarded=0 AND status=?""",
-            (STATUS_PREMIUM_ACTIVE, t, payment_operation_id, t, invitee_uid, STATUS_REGISTERED),
+               WHERE referred_id=? AND rewarded=0 AND status IN (?, ?)""",
+            (STATUS_PREMIUM_ACTIVE, t, payment_operation_id, t, invitee_uid, STATUS_REGISTERED, STATUS_REVIEW),
         )
         c.commit()
     except Exception as exc:
         logger.warning("mark_referral_premium_active failed for %s: %s", invitee_uid, exc)
+
+
+def pending_reward_candidates(c: sqlite3.Connection) -> List[Dict[str, str]]:
+    """Referidos con un Premium verificado que todavía no recibieron los 3 días."""
+    rows = c.execute(
+        """SELECT id, referrer_id, referred_id, created_at, reward_payment_id
+           FROM referrals
+           WHERE rewarded=0 AND status IN (?, ?, ?)""",
+        (STATUS_REGISTERED, STATUS_PREMIUM_ACTIVE, STATUS_REVIEW),
+    ).fetchall()
+    found: List[Dict[str, str]] = []
+    for ref in rows:
+        try:
+            created_dt = _parse_dt(ref["created_at"])
+        except Exception:
+            continue
+        payments = c.execute(
+            """SELECT operation_id, plan, verified_at, created_at
+               FROM payment_operations
+               WHERE user_id=? AND status='verified'
+               ORDER BY COALESCE(verified_at, created_at) ASC""",
+            (ref["referred_id"],),
+        ).fetchall()
+        chosen = None
+        for payment in payments:
+            if _is_ad_plan(payment["plan"]):
+                continue
+            try:
+                paid_dt = _parse_dt(payment["verified_at"] or payment["created_at"] or "")
+            except Exception:
+                continue
+            if paid_dt + timedelta(seconds=1) < created_dt:
+                continue
+            chosen = payment["operation_id"]
+            break
+        if not chosen and ref["reward_payment_id"]:
+            chosen = ref["reward_payment_id"]
+        if chosen:
+            found.append({
+                "referrer_id": str(ref["referrer_id"]),
+                "referred_id": str(ref["referred_id"]),
+                "operation_id": str(chosen),
+            })
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +722,7 @@ def admin_adjust_reward(
     Deja registro de auditoría. No permite modificaciones silenciosas.
     """
     ref = c.execute(
-        "SELECT id, referrer_id, rewarded FROM referrals WHERE id=?", (referral_id,)
+        "SELECT id, referrer_id, referred_id, rewarded FROM referrals WHERE id=?", (referral_id,)
     ).fetchone()
     if not ref:
         return {"success": False, "error": "not_found"}
@@ -692,7 +767,12 @@ def admin_adjust_reward(
 
     _write_audit(c, admin_username, action_label, referral_id, notes)
     c.commit()
-    return {"success": True, "action": action_label}
+    return {
+        "success": True,
+        "action": action_label,
+        "referrer_id": ref["referrer_id"],
+        "referred_id": ref["referred_id"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -704,12 +784,25 @@ def _now() -> str:
 
 
 def _parse_dt(s: str) -> datetime:
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.strptime(s, fmt)
-        except ValueError:
-            continue
-    raise ValueError(f"Cannot parse datetime: {s!r}")
+    """Fecha naive en UTC. Acepta microsegundos y sufijo Z / +00:00."""
+    raw = str(s or "").strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        dt = None
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            raise ValueError(f"Cannot parse datetime: {s!r}")
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 def _display_name(first_name: Optional[str], username: Optional[str], uid: str) -> str:

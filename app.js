@@ -1,29 +1,68 @@
 const tg=window.Telegram?.WebApp;
-// Robust viewport for Android Telegram Mini App (Problem 6)
+// Viewport + safe area de Telegram. En Android el cliente dibuja Cerrar/menú
+// encima del WebView; env(safe-area-inset-*) suele ser 0 y hay que usar los
+// insets que publica telegram-web-app.js.
 (function _initViewport(){
   try{
+    const root=document.documentElement;
+    const applyBox=()=>{
+      let height=window.innerHeight;
+      let offsetTop=0;
+      if(tg){
+        const current=tg.viewportHeight||window.innerHeight;
+        const stable=tg.viewportStableHeight||current;
+        root.style.setProperty('--tg-viewport-stable-height', stable+'px');
+        root.style.setProperty('--tg-viewport-height', current+'px');
+        height=current;
+      }
+      if(window.visualViewport){
+        offsetTop=window.visualViewport.offsetTop||0;
+        height=Math.min(height, window.visualViewport.height||height);
+        root.style.setProperty('--vv-height', Math.round(window.visualViewport.height)+'px');
+        root.style.setProperty('--vv-offset-top', Math.round(offsetTop)+'px');
+      }
+      root.style.setProperty('--tg-keyboard-height', Math.round(height)+'px');
+      const app=document.getElementById('app');
+      if(app) app.style.minHeight=height+'px';
+    };
+    const applyInsets=()=>{
+      const sa=tg?.safeAreaInset||{};
+      const csa=tg?.contentSafeAreaInset||{};
+      const top=Math.max(Number(sa.top)||0, Number(csa.top)||0);
+      const bottom=Math.max(Number(sa.bottom)||0, Number(csa.bottom)||0);
+      const left=Math.max(Number(sa.left)||0, Number(csa.left)||0);
+      const right=Math.max(Number(sa.right)||0, Number(csa.right)||0);
+      root.style.setProperty('--tg-content-top', top+'px');
+      root.style.setProperty('--tg-safe-bottom', bottom+'px');
+      root.style.setProperty('--tg-safe-left', left+'px');
+      root.style.setProperty('--tg-safe-right', right+'px');
+      if(top) root.style.setProperty('--tg-content-safe-area-inset-top', top+'px');
+      if(bottom) root.style.setProperty('--tg-safe-area-inset-bottom', bottom+'px');
+    };
     if(tg){
       tg.ready();
       try{tg.expand();}catch(_){}
-      const applyH=()=>{
-        const h = (tg.viewportStableHeight || tg.viewportHeight || window.innerHeight) + 'px';
-        document.documentElement.style.setProperty('--tg-viewport-stable-height', h);
-        document.documentElement.style.setProperty('--app-height', h);
-        document.body.style.minHeight = h;
-        const app = document.getElementById('app');
-        if(app) app.style.minHeight = h;
-      };
-      applyH();
-      if(tg.onEvent) tg.onEvent('viewportChanged', applyH);
-      window.addEventListener('resize', applyH);
-      // Also use visualViewport if available (keyboard)
-      if(window.visualViewport){
-        window.visualViewport.addEventListener('resize', ()=>{
-          document.documentElement.style.setProperty('--vv-height', window.visualViewport.height + 'px');
-        });
+      try{tg.disableVerticalSwipes&&tg.disableVerticalSwipes();}catch(_){}
+      try{tg.setHeaderColor&&tg.setHeaderColor('#f6f4ff');}catch(_){}
+      try{tg.setBackgroundColor&&tg.setBackgroundColor('#f6f4ff');}catch(_){}
+      applyBox();
+      applyInsets();
+      if(tg.onEvent){
+        tg.onEvent('viewportChanged', ()=>{applyBox(); applyInsets();});
+        tg.onEvent('safeAreaChanged', applyInsets);
+        tg.onEvent('contentSafeAreaChanged', applyInsets);
       }
+      window.addEventListener('resize', applyBox);
+      if(window.visualViewport){
+        window.visualViewport.addEventListener('resize', applyBox);
+        window.visualViewport.addEventListener('scroll', applyBox);
+      }
+      // Los insets a veces llegan en 0 y se corrigen un momento después.
+      setTimeout(applyInsets, 300);
+      setTimeout(applyInsets, 1000);
     } else {
-      document.documentElement.style.setProperty('--tg-viewport-stable-height', '100dvh');
+      root.style.setProperty('--tg-viewport-stable-height', '100dvh');
+      root.style.setProperty('--tg-viewport-height', '100dvh');
     }
   }catch(e){console.warn('viewport init',e);}
 })();

@@ -835,6 +835,12 @@ def _log_operational_configuration():
         logger.warning("Could not start the Telegram backup worker", exc_info=True)
     # Expose photos_dir on app.state so ads router can use it for disk fallback
     app.state.photos_dir = _dating_photos_dir()
+    try:
+        granted = _grant_pending_referral_rewards()
+        if granted:
+            logger.info("Accredited %s pending referral reward(s) on startup", len(granted))
+    except Exception:
+        logger.warning("Could not grant pending referral rewards", exc_info=True)
 
 
 PURGE_INTERVAL_SECONDS = 6 * 60 * 60
@@ -1867,47 +1873,76 @@ def apply_referral(p: ReferralApply, request: Request):
     }
 
 
-def _reward_referrer(user_id: str, payment_operation_id: str = "") -> None:
-    """Give 3 days Premium to the referrer when referred user pays for the first time."""
+def _notify_referral_reward(referrer_id: str, invitee_id: str) -> None:
+    """Avisa por Telegram al invitador y al invitado cuando se acreditan los 3 días."""
+    if referrer_id:
+        notify_user(
+            referrer_id,
+            "🎁 <b>¡Recompensa de referido!</b>\n"
+            "Uno de tus amigos activó Premium gracias a tu código. "
+            "Te regalamos <b>3 días de Premium</b> extra. ¡Gracias por recomendar LiggaCuba! 💜",
+        )
+    if invitee_id:
+        notify_user(
+            invitee_id,
+            "✅ <b>Tu código de referido está activo.</b>\n"
+            "Tu amigo que te invitó ya recibió sus <b>3 días de Premium</b>. ¡Gracias por unirte a LiggaCuba! 🎉",
+        )
+
+
+def _grant_pending_referral_rewards() -> list:
+    """Acredita recompensas que se quedaron a medias (premium activo, sin los 3 días)."""
     c = db()
+    granted = []
     try:
-        # Marcar estado intermedio premium_active antes de acreditar
-        # Zip1 engine accepts optional payment_operation_id for better traceability
-        _referrals.mark_referral_premium_active(c, user_id, payment_operation_id or "")
-
-        # Acreditar recompensa atómica
-        rewarded = _referrals.reward_referrer(c, user_id, payment_operation_id or f"pay_{now()}")
-        if not rewarded:
-            c.close()
-            return
-
-        # Obtener referrer_id para notificaciones
-        ref_row = c.execute(
-            "SELECT referrer_id FROM referrals WHERE referred_id=? AND rewarded=1", (user_id,)
-        ).fetchone()
-        c.close()
-
-        if ref_row:
-            referrer_id = ref_row["referrer_id"]
-            # Notificación al invitador
-            notify_user(
-                referrer_id,
-                "🎁 <b>¡Recompensa de referido!</b>\n"
-                "Uno de tus amigos activó Premium gracias a tu código. "
-                "Te regalamos <b>3 días de Premium</b> extra. ¡Gracias por recomendar LiggaCuba! 💜",
-            )
-            # Notificación al invitado
-            notify_user(
-                user_id,
-                "✅ <b>Tu código de referido está activo.</b>\n"
-                "Tu amigo que te invitó ya recibió su recompensa. ¡Gracias por unirte a LiggaCuba! 🎉",
-            )
+        for item in _referrals.pending_reward_candidates(c):
+            _referrals.mark_referral_premium_active(c, item["referred_id"], item["operation_id"])
+            if _referrals.reward_referrer(c, item["referred_id"], item["operation_id"]):
+                granted.append(item)
     except Exception as exc:
-        logger.warning("_reward_referrer failed for %s: %s", user_id, exc)
+        logger.warning("pending referral rewards failed: %s", exc)
+    finally:
         try:
             c.close()
         except Exception:
             pass
+    for item in granted:
+        _notify_referral_reward(item.get("referrer_id") or "", item.get("referred_id") or "")
+    return granted
+
+
+def _reward_referrer(user_id: str, payment_operation_id: str = "") -> None:
+    """Give 3 days Premium to the referrer when referred user pays for the first time."""
+    c = db()
+    rewarded = False
+    try:
+        op_id = payment_operation_id or ""
+        _referrals.mark_referral_premium_active(c, user_id, op_id)
+        if op_id:
+            rewarded = _referrals.reward_referrer(c, user_id, op_id)
+        if rewarded:
+            ref_row = c.execute(
+                "SELECT referrer_id FROM referrals WHERE referred_id=? AND rewarded=1", (user_id,)
+            ).fetchone()
+        else:
+            ref_row = None
+    except Exception as exc:
+        logger.warning("_reward_referrer failed for %s: %s", user_id, exc)
+        ref_row = None
+        rewarded = False
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+    if rewarded and ref_row:
+        _notify_referral_reward(ref_row["referrer_id"], user_id)
+    # Si este pago no acreditó (o quedaron otros a medias), reintenta los pendientes.
+    try:
+        _grant_pending_referral_rewards()
+    except Exception as exc:
+        logger.warning("pending referral sweep failed for %s: %s", user_id, exc)
 
 
 @app.post("/api/situations/save")
@@ -3069,6 +3104,8 @@ def admin_adjust_reward(p: AdminRewardAdjust, request: Request):
         c.close()
     if not result.get("success"):
         raise HTTPException(400, result.get("error", "No se pudo ajustar"))
+    if p.grant and result.get("action") == "admin_grant_reward":
+        _notify_referral_reward(str(result.get("referrer_id") or ""), str(result.get("referred_id") or ""))
     return result
 
 

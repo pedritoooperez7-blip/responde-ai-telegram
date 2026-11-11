@@ -109,7 +109,54 @@ def test_payment_verified_before_attribution_cannot_reward():
     assert conn.execute("SELECT rewarded FROM referrals").fetchone()[0] == 0
 
 
-def test_self_referral_blocked():
+def test_isoformat_with_offset_still_rewards():
+    """Un verified_at con +00:00 no debe ordenarse 'antes' que la invitación."""
+    conn = database()
+    referrals.apply_referral(conn, "200", "REF100")
+    created = conn.execute("SELECT created_at FROM referrals").fetchone()[0]
+    base = datetime.datetime.strptime(created, "%Y-%m-%dT%H:%M:%S")
+    verified = (base + datetime.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S") + "+00:00"
+    conn.execute(
+        "INSERT INTO payment_operations VALUES(?,?,?,?,?,?)",
+        ("op-iso", "200", "monthly", "verified", verified, created),
+    )
+    conn.commit()
+    assert referrals.reward_referrer(conn, "200", "op-iso") is True
+
+
+def test_earlier_ad_payment_does_not_block_premium_reward():
+    conn = database()
+    referrals.apply_referral(conn, "200", "REF100")
+    created = conn.execute("SELECT created_at FROM referrals").fetchone()[0]
+    base = datetime.datetime.strptime(created, "%Y-%m-%dT%H:%M:%S")
+    ad_at = (base + datetime.timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    premium_at = (base + datetime.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%S.%f")
+    conn.execute(
+        "INSERT INTO payment_operations VALUES(?,?,?,?,?,?)",
+        ("op-ad", "200", "ad_weekly", "verified", ad_at, ad_at),
+    )
+    conn.execute(
+        "INSERT INTO payment_operations VALUES(?,?,?,?,?,?)",
+        ("op-prem", "200", "weekly", "verified", premium_at, premium_at),
+    )
+    conn.commit()
+    assert referrals.reward_referrer(conn, "200", "op-prem") is True
+
+
+def test_admin_review_still_rewards_verified_premium():
+    conn = database()
+    referrals.apply_referral(conn, "200", "REF100")
+    now = referrals._now()
+    conn.execute(
+        "UPDATE referrals SET status='admin_review', anomaly_flag=1 WHERE referred_id='200'"
+    )
+    conn.execute(
+        "INSERT INTO payment_operations VALUES(?,?,?,?,?,?)",
+        ("op-rev", "200", "weekly", "verified", now, now),
+    )
+    conn.commit()
+    assert referrals.reward_referrer(conn, "200", "op-rev") is True
+    assert conn.execute("SELECT status FROM referrals").fetchone()[0] == "rewarded"
     conn = database()
     result = referrals.apply_referral(conn, "100", "REF100")
     assert result["success"] is False

@@ -301,7 +301,9 @@
       const data = await fetchMessages(matchId, 0);
       S.messages  = data.messages || [];
       S.lastId    = data.last_id  || 0;
-      _paintMessages();
+      // La carga inicial pinta el campo disabled. Hay que reconstruir el chat
+      // con el input habilitado; si no, el teclado no abre en ningún móvil.
+      _paintFullChat();
       _scrollToBottom(true);
       markRead(matchId);
       _startPolling();
@@ -505,18 +507,6 @@
     textarea.onkeydown = (e) => {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); _doSend(textarea, sendBtn); }
     };
-
-    // Forzar apertura del teclado en dispositivos móviles / Telegram WebApp
-    const forceFocus = (e) => {
-      if (disabled) return;
-      // Evitar que el evento se trague en contenedores fixed
-      e.stopPropagation();
-      setTimeout(() => {
-        try { textarea.focus({ preventScroll: false }); } catch (_) { textarea.focus(); }
-      }, 10);
-    };
-    textarea.addEventListener('touchstart', forceFocus, { passive: true });
-    textarea.addEventListener('pointerdown', forceFocus);
 
     const sendBtn = el('button', { class: 'ch-send-btn', type: 'button',
       'aria-label': C('send'), disabled: !!disabled,
@@ -759,14 +749,12 @@
 /* ── LiggaCuba Chat ── */
 .ligga-chat-screen {
   position: fixed;
-  top: 0;
+  top: var(--vv-offset-top, 0px);
   left: 0;
   right: 0;
-  bottom: 0;
+  bottom: auto;
   width: 100%;
-  height: 100%;
-  height: 100dvh;
-  height: var(--tg-viewport-stable-height, 100dvh);
+  height: var(--tg-keyboard-height, var(--vv-height, var(--tg-viewport-height, 100dvh)));
   display: flex;
   flex-direction: column;
   background: var(--bg, #f6f4ff);
@@ -781,7 +769,7 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: calc(10px + env(safe-area-inset-top, 0px)) 14px 10px;
+  padding: calc(10px + max(env(safe-area-inset-top, 0px), var(--tg-content-safe-area-inset-top, 0px), var(--tg-content-top, 0px))) 14px 10px;
   background: var(--surface, #fff);
   border-bottom: 1px solid var(--line, #e9e5f5);
   flex-shrink: 0;
@@ -941,7 +929,7 @@
   display: flex;
   align-items: flex-end;
   gap: 8px;
-  padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
+  padding: 10px 14px calc(10px + max(env(safe-area-inset-bottom, 0px), var(--tg-safe-area-inset-bottom, 0px), var(--tg-safe-bottom, 0px)));
   background: var(--surface, #fff);
   border-top: 1px solid var(--line, #e9e5f5);
   flex-shrink: 0;
@@ -959,7 +947,7 @@
   border-radius: 21px;
   padding: 10px 14px;
   font: inherit;
-  font-size: 14px;
+  font-size: 16px;
   resize: none;
   background: #faf9ff;
   color: var(--text, #17151d);
@@ -969,9 +957,7 @@
   -webkit-user-select: text;
   user-select: text;
   pointer-events: auto;
-  -webkit-appearance: none;
-  appearance: none;
-  touch-action: manipulation;
+  touch-action: auto;
 }
 .ch-input:focus {
   outline: none;
