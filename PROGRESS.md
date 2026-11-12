@@ -2,8 +2,9 @@
 
 **Objetivo:** Auditar, asegurar, estabilizar y preparar el proyecto existente para producción real, sin cambiar concepto, lógica de negocio, comandos, flujos ni experiencia de usuario.
 
-**Rama actual:** `production-hardening`  
+**Rama actual:** `fix/tests-18-failures`  
 **Base:** `main` @ `4fabcdfdbdd659704e58cafa15f61d9e9ec5ffb7`  
+**PR:** #77 → `main`  
 **Fecha inicio:** 2026-11-12  
 
 ## Estado general
@@ -36,12 +37,12 @@
 | Suite | Resultado | Notas |
 |-------|-----------|-------|
 | `tests/test_payments_config.py` | 8/8 PASSED | Offline |
-| `tests/test_dating.py::...mutual_like...` | PASSED | Offline |
+| `tests/test_dating.py` | PASSED (suite offline) | Offline |
 | `tests/test_backup_sqlite.py` | 7/7 PASSED | Offline |
-| `tests/test_isolated.py` (pagos, AI, CORS) | NO EJECUTADA | Requiere FastAPI; proxy PyPI 502 en este entorno |
+| `tests/test_isolated.py` (pagos, AI, CORS) | NO EJECUTADA aquí | Requiere FastAPI; verificar en CI del PR #77 |
 
 ## Próxima tarea exacta
-- Publicar estos cambios en `production-hardening` y re-ejecutar la suite completa en CI.
+- CI verde en PR #77 y autorización explícita para merge a `main`.
 - FASE B: restauración atómica de backups.
 - Continuar auditoría de sesiones, error handling y Telegram.
 
@@ -55,9 +56,5 @@
 ## Riesgos conocidos
 - Volumen DB debe ser writable por uid 1001.
 - main.py monolítico.
-- Suite completa de isolated no verificada en este entorno por falta de FastAPI.
-- Restauración de backup aún escribe el destino antes de validar integridad (FASE B).
-id 1001.
-- main.py monolítico.
-- Algunos tests todavía desactualizados; se documentan y se corrigen de forma incremental.
+- Suite completa de isolated no verificada en este entorno por falta de FastAPI (depende de CI).
 - Restauración de backup aún escribe el destino antes de validar integridad (FASE B).
