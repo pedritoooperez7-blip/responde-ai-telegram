@@ -1366,7 +1366,12 @@ class TestAdminLoginHardening(unittest.TestCase):
 class TestOperationalConfigWarnings(unittest.TestCase):
     def test_warnings_are_listed_and_never_raise(self):
         from unittest.mock import patch
-        with patch.dict(os.environ, {"CORS_ORIGINS": "", "DB_PATH": ""}), \
+        with patch.dict(os.environ, {
+                 "CORS_ORIGINS": "",
+                 "DB_PATH": "",
+                 "PUBLIC_BASE_URL": "",
+                 "TELEGRAM_MINI_APP_URL": "",
+             }, clear=False), \
              patch.object(main, "ADMIN_KEY", "short"), patch.object(main, "SESSION_SECRET", ""), \
              patch.object(main, "BANDEC_ACCOUNT", ""), patch.object(main, "BPA_ACCOUNT", ""), \
              patch.object(main, "_cors_origins", []):
@@ -1385,6 +1390,58 @@ class TestOperationalConfigWarnings(unittest.TestCase):
         self.assertFalse(any(w.startswith("CORS_ORIGINS") for w in warnings), warnings)
         self.assertFalse(any(w.startswith("ADMIN_KEY") for w in warnings), warnings)
         self.assertFalse(any(w.startswith("DB_PATH") for w in warnings), warnings)
+
+
+class TestCorsOriginsSecurity(unittest.TestCase):
+    """Regression: never fall back to a wildcard that allows every origin."""
+
+    def test_empty_config_yields_empty_allow_list(self):
+        from unittest.mock import patch
+        with patch.object(main, "_cors_origins", []), \
+             patch.dict(os.environ, {
+                 "CORS_ORIGINS": "",
+                 "PUBLIC_BASE_URL": "",
+                 "TELEGRAM_MINI_APP_URL": "",
+             }, clear=False):
+            origins = main._cors_origins or main._default_cors_origins()
+        self.assertEqual(origins, [])
+        self.assertNotIn("*", origins)
+
+    def test_explicit_cors_origins_are_used(self):
+        from unittest.mock import patch
+        with patch.object(main, "_cors_origins", ["https://app.example.com", "https://mini.example.com"]):
+            origins = main._cors_origins or main._default_cors_origins()
+        self.assertEqual(origins, ["https://app.example.com", "https://mini.example.com"])
+        self.assertNotIn("*", origins)
+
+    def test_public_base_url_is_derived_when_cors_origins_empty(self):
+        from unittest.mock import patch
+        with patch.object(main, "_cors_origins", []), \
+             patch.dict(os.environ, {
+                 "PUBLIC_BASE_URL": "https://liggacuba.up.railway.app/path",
+                 "TELEGRAM_MINI_APP_URL": "",
+             }, clear=False):
+            origins = main._cors_origins or main._default_cors_origins()
+        self.assertEqual(origins, ["https://liggacuba.up.railway.app"])
+        self.assertNotIn("*", origins)
+
+    def test_middleware_allow_origins_never_contains_wildcard(self):
+        """Inspect the live CORSMiddleware configuration after import."""
+        from starlette.middleware.cors import CORSMiddleware
+        cors_mw = None
+        for middleware in main.app.user_middleware:
+            if getattr(middleware, "cls", None) is CORSMiddleware or (
+                hasattr(middleware, "cls") and getattr(middleware.cls, "__name__", "") == "CORSMiddleware"
+            ):
+                cors_mw = middleware
+                break
+        self.assertIsNotNone(cors_mw, "CORSMiddleware must be registered")
+        kwargs = getattr(cors_mw, "kwargs", None) or getattr(cors_mw, "options", None) or {}
+        allow = kwargs.get("allow_origins")
+        if allow is None:
+            self.skipTest("Cannot introspect allow_origins from middleware entry in this Starlette version")
+        self.assertNotIn("*", allow)
+        self.assertIsInstance(allow, list)
 
 
 class TestOcrRuntime(unittest.TestCase):
