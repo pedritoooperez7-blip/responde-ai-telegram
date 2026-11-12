@@ -5,58 +5,48 @@
 **Rama actual:** `production-hardening`  
 **Base:** `main` @ `4fabcdfdbdd659704e58cafa15f61d9e9ec5ffb7`  
 **Fecha inicio:** 2026-11-12  
-**Último push confirmado:** commit anterior + este
 
 ## Estado general
 
 | Fase | Estado | Notas |
 |------|--------|-------|
-| 1. Auditoría y diagnóstico completo | EN CURSO | Estructura, stack, puntos fuertes y áreas de revisión documentadas |
-| 2. Seguridad y protección de credenciales | EN CURSO | Dockerfile no-root añadido |
+| 1. Auditoría y diagnóstico completo | AVANZADA | Stack, puntos fuertes, tests baseline, hallazgos documentados |
+| 2. Seguridad y protección de credenciales | PARCIAL | Dockerfile no-root |
 | 3. Estabilidad y gestión de errores | Pendiente | |
 | 4. Optimización del rendimiento | Pendiente | |
-| 5. Calidad y mantenimiento del código | Pendiente | |
+| 5. Calidad y mantenimiento del código | EN CURSO | Tests alineados con comportamiento actual |
 | 6. Integración y fiabilidad de Telegram | Pendiente | |
-| 7. Pruebas automatizadas y prevención de regresiones | Pendiente | |
-| 8. Docker, configuración y despliegue | EN CURSO | Dockerfile endurecido |
+| 7. Pruebas automatizadas y prevención de regresiones | EN CURSO | Tests de pagos recuperados |
+| 8. Docker, configuración y despliegue | PARCIAL | no-root |
 | 9. Documentación técnica y operativa | Pendiente | |
 | 10. Auditoría final y validación | Pendiente | |
 
-## Hallazgos de auditoría (FASE 1) — resumen
+## Mejoras implementadas
 
-### Stack y arquitectura (confirmado)
-- FastAPI + Uvicorn, SQLite (WAL + busy_timeout), Mini App Telegram, multi-provider IA, pagos manuales, dating, ads, referrals, cleanup y backup a Telegram.
-- Despliegue Docker + Railway ya configurado con healthcheck.
-- Tests y CI presentes.
+1. **Dockerfile (security)**: proceso corre como usuario no-root `app` (uid/gid 1001).
+2. **Tests (quality)**:
+   - `test_payments_config.py`: actualizado rechazo de plan desconocido ("monthly" es válido; se usa "foobar").
+   - `test_isolated.py` (cambio local listo): helpers de pago ahora configuran `payment_phone` antes de crear operaciones, alineados con la regla de negocio actual.
 
-### Puntos fuertes (ya implementados)
-- Env vars sin defaults inseguros; .env.example completo.
-- hmac.compare_digest, rate limiters, security headers, webhook secret, validación de body size.
-- Health real, SQLite lock → 503, daemon workers, cifrado de claves IA.
-- Logging cuidadoso que evita secretos y PII en errores de proveedores.
-
-### Mejoras implementadas hasta ahora
-1. **Dockerfile**: se ejecuta como usuario no-root (`app` uid/gid 1001). Reduce superficie de ataque en caso de compromiso del contenedor. El volumen de DB debe ser writable por uid 1001 (práctica estándar).
-
-### Áreas todavía en revisión
-- Lectura detallada de flujos críticos de main.py / dating / payments.
-- Posibles mejoras de logging estructurado.
-- Cobertura de tests de edge cases.
-- Verificación de historial Git por secretos (rápida).
-- Timeouts y reintentos ya están razonablemente bien; confirmar cobertura completa.
-
-## Archivos modificados en esta rama
-- `PROGRESS.md` (nuevo)
-- `Dockerfile` (no-root user)
+## Pruebas ejecutadas
+- Offline suite inicial: varios fallos por tests desactualizados respecto a reglas de negocio recientes.
+- Tras correcciones de tests de pagos: grupos de PaymentProof / ManualReview / Cancellation / CurrencySeparation pasan (25 tests).
+- Fallos restantes conocidos (preexistentes):
+  - 2 en TestCompleteAIFlow (mocks / event logging)
+  - 1 en dating swipe/match
+  - 1 en backup_sqlite prune
 
 ## Próxima tarea exacta
-Continuar auditoría de seguridad de sesiones, admin auth y manejo de errores globales. Preparar cualquier corrección pequeña y segura de logging o validación si se encuentra algo concreto. Luego commit + push.
+- Completar push de `tests/test_isolated.py` actualizado.
+- Investigar fallos restantes de AI flow y dating sin alterar producto.
+- Continuar auditoría de sesiones, error handling y Telegram.
 
 ## Decisiones técnicas
-- Se mantiene el mismo CMD y las mismas variables de entorno.
-- No se cambió la arquitectura ni el runtime de uvicorn.
-- USER app solo afecta el proceso; permisos de volumen siguen siendo responsabilidad del operador.
+- No se ha modificado lógica de negocio ni contratos de API.
+- Solo se actualizaron tests para reflejar el comportamiento real actual del producto.
+- Se mantiene respeto estricto a "mismo producto".
 
 ## Riesgos conocidos
-- Si el volumen de `DB_PATH` se monta con ownership de root, el proceso no-root no podrá escribir. Documentar en deployment notes.
-- main.py monolítico → cambios mínimos y testeados.
+- Volumen DB debe ser writable por uid 1001.
+- main.py monolítico.
+- Algunos tests todavía desactualizados; se documentan y se corrigen de forma incremental.
