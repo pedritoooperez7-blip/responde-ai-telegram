@@ -860,7 +860,9 @@ class TestCompleteAIFlow(unittest.TestCase):
         calls = {"count": 0}
         def fail_if_timing_opens_extra_connection():
             calls["count"] += 1
-            if calls["count"] == 4:
+            # ban-check (current_user) + reservation + final persist + telemetry = 4.
+            # A 5th connection would be an unexpected critical write.
+            if calls["count"] == 5:
                 raise sqlite3.OperationalError("synthetic extra timing write failure")
             return real_db()
         payload = {
@@ -874,7 +876,7 @@ class TestCompleteAIFlow(unittest.TestCase):
             with patch.object(main, "db", side_effect=fail_if_timing_opens_extra_connection):
                 first = client.post("/api/generate-reply", headers=headers, json=payload)
                 self.assertEqual(first.status_code, 200, first.text)
-                self.assertEqual(calls["count"], 3, "la instrumentación no debe abrir una cuarta conexión")
+                self.assertEqual(calls["count"], 4, "ban-check + reservation + persist + telemetry; no 5th connection")
             replay = client.post("/api/generate-reply", headers=headers, json=payload)
             self.assertEqual(replay.status_code, 200, replay.text)
             self.assertEqual(replay.json(), first.json())
@@ -892,8 +894,8 @@ class TestCompleteAIFlow(unittest.TestCase):
         calls = {"count": 0}
         def fail_only_event_db():
             calls["count"] += 1
-            # reservation and final lock use the first two connections; event logging is third.
-            if calls["count"] == 3:
+            # 1=ban-check (current_user), 2=reservation, 3=final persist, 4=telemetry (best-effort).
+            if calls["count"] == 4:
                 raise sqlite3.OperationalError("test db logging failure")
             return real_db()
         with patch.object(main, "ai_generate_reply", return_value={
@@ -1153,6 +1155,9 @@ class TestQuotaRecovery(unittest.TestCase):
 class TestPaymentProofValidation(unittest.TestCase):
     def _pending_operation(self, uid):
         headers = auth(uid)
+        # La app exige teléfono de pago configurado antes de abrir una operación.
+        phone = client.post("/api/payment-phone", headers=headers, json={"phone": "52677163"})
+        self.assertEqual(phone.status_code, 200, phone.text)
         pending = client.post("/api/payments/pending", headers=headers, json={
             "user_id": uid, "plan": "weekly", "language": "es", "payment_method": "BANDEC"
         })
@@ -1231,6 +1236,8 @@ class TestManualPaymentReview(unittest.TestCase):
 
     def _pending(self, uid, plan="weekly"):
         headers = auth(uid)
+        phone = client.post("/api/payment-phone", headers=headers, json={"phone": "52677163"})
+        self.assertEqual(phone.status_code, 200, phone.text)
         response = client.post("/api/payments/pending", headers=headers, json={
             "user_id": uid, "plan": plan, "language": "es", "payment_method": "BANDEC"
         })
@@ -1279,6 +1286,8 @@ class TestManualPaymentReview(unittest.TestCase):
 class TestPaymentCancellation(unittest.TestCase):
     def _operation(self, uid):
         headers = auth(uid)
+        phone = client.post("/api/payment-phone", headers=headers, json={"phone": "52677163"})
+        self.assertEqual(phone.status_code, 200, phone.text)
         pending = client.post("/api/payments/pending", headers=headers, json={
             "user_id": uid, "plan": "weekly", "language": "es", "payment_method": "BPA"
         })
@@ -1366,7 +1375,12 @@ class TestAdminLoginHardening(unittest.TestCase):
 class TestOperationalConfigWarnings(unittest.TestCase):
     def test_warnings_are_listed_and_never_raise(self):
         from unittest.mock import patch
-        with patch.dict(os.environ, {"CORS_ORIGINS": "", "DB_PATH": ""}), \
+        with patch.dict(os.environ, {
+                 "CORS_ORIGINS": "",
+                 "DB_PATH": "",
+                 "PUBLIC_BASE_URL": "",
+                 "TELEGRAM_MINI_APP_URL": "",
+             }, clear=False), \
              patch.object(main, "ADMIN_KEY", "short"), patch.object(main, "SESSION_SECRET", ""), \
              patch.object(main, "BANDEC_ACCOUNT", ""), patch.object(main, "BPA_ACCOUNT", ""), \
              patch.object(main, "_cors_origins", []):
@@ -1385,6 +1399,58 @@ class TestOperationalConfigWarnings(unittest.TestCase):
         self.assertFalse(any(w.startswith("CORS_ORIGINS") for w in warnings), warnings)
         self.assertFalse(any(w.startswith("ADMIN_KEY") for w in warnings), warnings)
         self.assertFalse(any(w.startswith("DB_PATH") for w in warnings), warnings)
+
+
+class TestCorsOriginsSecurity(unittest.TestCase):
+    """Regression: never fall back to a wildcard that allows every origin."""
+
+    def test_empty_config_yields_empty_allow_list(self):
+        from unittest.mock import patch
+        with patch.object(main, "_cors_origins", []), \
+             patch.dict(os.environ, {
+                 "CORS_ORIGINS": "",
+                 "PUBLIC_BASE_URL": "",
+                 "TELEGRAM_MINI_APP_URL": "",
+             }, clear=False):
+            origins = main._cors_origins or main._default_cors_origins()
+        self.assertEqual(origins, [])
+        self.assertNotIn("*", origins)
+
+    def test_explicit_cors_origins_are_used(self):
+        from unittest.mock import patch
+        with patch.object(main, "_cors_origins", ["https://app.example.com", "https://mini.example.com"]):
+            origins = main._cors_origins or main._default_cors_origins()
+        self.assertEqual(origins, ["https://app.example.com", "https://mini.example.com"])
+        self.assertNotIn("*", origins)
+
+    def test_public_base_url_is_derived_when_cors_origins_empty(self):
+        from unittest.mock import patch
+        with patch.object(main, "_cors_origins", []), \
+             patch.dict(os.environ, {
+                 "PUBLIC_BASE_URL": "https://liggacuba.up.railway.app/path",
+                 "TELEGRAM_MINI_APP_URL": "",
+             }, clear=False):
+            origins = main._cors_origins or main._default_cors_origins()
+        self.assertEqual(origins, ["https://liggacuba.up.railway.app"])
+        self.assertNotIn("*", origins)
+
+    def test_middleware_allow_origins_never_contains_wildcard(self):
+        """Inspect the live CORSMiddleware configuration after import."""
+        from starlette.middleware.cors import CORSMiddleware
+        cors_mw = None
+        for middleware in main.app.user_middleware:
+            if getattr(middleware, "cls", None) is CORSMiddleware or (
+                hasattr(middleware, "cls") and getattr(middleware.cls, "__name__", "") == "CORSMiddleware"
+            ):
+                cors_mw = middleware
+                break
+        self.assertIsNotNone(cors_mw, "CORSMiddleware must be registered")
+        kwargs = getattr(cors_mw, "kwargs", None) or getattr(cors_mw, "options", None) or {}
+        allow = kwargs.get("allow_origins")
+        if allow is None:
+            self.skipTest("Cannot introspect allow_origins from middleware entry in this Starlette version")
+        self.assertNotIn("*", allow)
+        self.assertIsInstance(allow, list)
 
 
 class TestOcrRuntime(unittest.TestCase):
@@ -1508,6 +1574,8 @@ class TestAdminLoginThrottling(unittest.TestCase):
 class TestPaymentCurrencySeparation(unittest.TestCase):
     def _pending(self, uid, language="es"):
         headers = auth(uid)
+        phone = client.post("/api/payment-phone", headers=headers, json={"phone": "52677163"})
+        self.assertEqual(phone.status_code, 200, phone.text)
         response = client.post("/api/payments/pending", headers=headers, json={
             "user_id": uid, "plan": "weekly", "language": language, "payment_method": "BANDEC"
         })
@@ -1529,6 +1597,7 @@ class TestPaymentCurrencySeparation(unittest.TestCase):
         self.assertEqual(pricing.json()["plans"]["weekly"]["amount"], weekly["amount"])
         # Create an annual operation to ensure both displayed and charged values share config.
         headers = auth("pricing-annual-check-" + uuid.uuid4().hex[:6])
+        self.assertEqual(client.post("/api/payment-phone", headers=headers, json={"phone": "52677163"}).status_code, 200)
         response = client.post("/api/payments/pending", headers=headers, json={
             "user_id": "ignored", "plan": "annual", "language": "en", "payment_method": "BANDEC"
         })

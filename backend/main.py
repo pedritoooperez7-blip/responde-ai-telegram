@@ -29,7 +29,11 @@ _cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if 
 
 
 def _default_cors_origins() -> list:
-    """Without CORS_ORIGINS, fall back to this deployment's own origin (never a wildcard when it is known)."""
+    """Derive allowed origins from this deployment's public URLs when CORS_ORIGINS is unset.
+
+    Returns an empty list when no valid HTTPS origin can be derived. An empty
+    list means cross-origin requests are denied (no wildcard fallback).
+    """
     from urllib.parse import urlsplit
     found = []
     for name in ("PUBLIC_BASE_URL", "TELEGRAM_MINI_APP_URL"):
@@ -55,7 +59,7 @@ class _SelectiveGZip(GZipMiddleware):
 app.add_middleware(_SelectiveGZip, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins or _default_cors_origins() or ["*"],
+    allow_origins=_cors_origins or _default_cors_origins(),
     allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Authorization", "Content-Type", "X-Admin-Key", "X-Atajo-Key"],
@@ -802,8 +806,10 @@ def _run_user_cleanup() -> None:
 def check_operational_configuration() -> list[str]:
     """Log-only warnings about operational settings; never aborts startup."""
     warnings = []
-    if not _cors_origins:
-        warnings.append("CORS_ORIGINS is empty: every origin is allowed by default. Set the Mini App origin explicitly.")
+    if not _cors_origins and not _default_cors_origins():
+        warnings.append("CORS_ORIGINS is empty and no PUBLIC_BASE_URL/TELEGRAM_MINI_APP_URL origin could be derived: cross-origin requests are denied. Set CORS_ORIGINS (or PUBLIC_BASE_URL) to the Mini App origin.")
+    elif not _cors_origins:
+        warnings.append("CORS_ORIGINS is empty: using origin(s) derived from PUBLIC_BASE_URL/TELEGRAM_MINI_APP_URL. Prefer setting CORS_ORIGINS explicitly.")
     if not ADMIN_KEY:
         warnings.append("ADMIN_KEY is not configured: the admin panel and admin sessions are unavailable.")
     elif len(ADMIN_KEY) < 32:

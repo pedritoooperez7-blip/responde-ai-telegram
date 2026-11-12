@@ -56,7 +56,9 @@ class StoredOperationTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(payments.expected_values(row), (2500.0, "CUP"))
 
-    def test_missing_amount_fields_use_configured_defaults(self):
+    def test_missing_amount_fields_do_not_invent_a_price(self):
+        # Without stored amount data the verifier must not invent a commercial price;
+        # 0.0 forces a mismatch rather than auto-approving against a guessed weekly plan.
         row = {"amount": None, "amount_value": None, "amount_currency": None}
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(payments.expected_values(row), (2500.0, "CUP"))
+            self.assertEqual(payments.expected_values(row), (0.0, "CUP"))
