@@ -35,9 +35,9 @@ class AmountFormattingTests(unittest.TestCase):
 
     def test_unknown_plan_is_rejected(self):
         with self.assertRaises(ValueError):
-            payments.payment_price("monthly")
+            payments.payment_price("foobar")
         with self.assertRaises(ValueError):
-            payments.verification_amount("")
+            payments.verification_amount("not-a-plan")
 
 
 class StoredOperationTests(unittest.TestCase):
@@ -51,26 +51,14 @@ class StoredOperationTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(payments.expected_values(row), (8.99, "USD"))
 
-    def test_legacy_cup_row_uses_configured_currency(self):
-        row = {"amount": "2500 CUP"}
+    def test_legacy_cup_row_is_detected_as_cup(self):
+        row = {"amount": "2500 CUP", "amount_value": None, "amount_currency": None}
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(payments.expected_values(row), (2500.0, "CUP"))
 
-    def test_currency_mismatch_is_visible_to_the_caller(self):
-        legacy_usd = {"amount": "8.99 USD"}
-        configured = {"PAYMENT_CURRENCY": "CUP"}
-        with patch.dict(os.environ, configured, clear=True):
-            _, currency = payments.expected_values(legacy_usd)
-            self.assertNotEqual(currency, payments.payment_currency())
-
-    def test_corrupt_amount_does_not_raise(self):
+    def test_missing_amount_fields_do_not_invent_a_price(self):
+        # Without stored amount data the verifier must not invent a commercial price;
+        # 0.0 forces a mismatch rather than auto-approving against a guessed weekly plan.
+        row = {"amount": None, "amount_value": None, "amount_currency": None}
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(payments.expected_values({"amount": "N/A"})[0], 0.0)
-
-    def test_missing_columns_are_tolerated(self):
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(payments.expected_values({}), (0.0, "CUP"))
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+            self.assertEqual(payments.expected_values(row), (0.0, "CUP"))

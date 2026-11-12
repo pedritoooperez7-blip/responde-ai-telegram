@@ -190,10 +190,11 @@ class SwipeAndMatchTests(unittest.TestCase):
         urls = {x["type"]: x["url"] for x in matches[0]["contacts"]}
         self.assertEqual(urls["telegram"], "https://t.me/juan_test")
         self.assertEqual(urls["whatsapp"], "https://wa.me/5352677163")
-        # No existe ninguna tabla de mensajes: no hay chat interno.
+        # El producto expone contactos externos en el match y también mantiene
+        # chat interno (dating_messages). Ambas cosas son válidas y coexisten.
         tables = {r[0] for r in self.c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertNotIn("dating_messages", tables)
-        self.assertFalse([t for t in tables if "message" in t or "chat" in t])
+        self.assertIn("dating_matches", tables)
+        self.assertTrue("dating_messages" in tables or "dating_chat_presence" in tables)
 
     def test_only_shared_channels_are_revealed(self):
         self.c.execute("UPDATE dating_profiles SET share_telegram=0 WHERE user_id='2'")
