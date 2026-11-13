@@ -236,6 +236,15 @@
 .refer-apply-row input{flex:1;min-width:0}
 /* Monthly plan popular badge */
 .popular-pill{background:linear-gradient(135deg,#ff6b6b,#ff4d35);color:#fff}
+/* Logo image used where the LC brand-mark used to be */
+.brand-mark-logo{width:62px;height:62px;border-radius:20px;object-fit:cover;display:block;margin:0 auto 14px;box-shadow:0 8px 24px rgba(77,53,255,.18);background:#000}
+.brand-mark-logo.large{width:86px;height:86px;border-radius:28px;margin-bottom:0}
+.premium-head .brand-mark-logo{margin-bottom:14px}
+.more-head .brand-mark-logo{margin-bottom:12px}
+/* Stronger savings badge for annual plan */
+.save-pill.save-strong{background:linear-gradient(135deg,#168447,#0f6b38);color:#fff;font-size:10px;padding:5px 9px;letter-spacing:.02em}
+.plan .save-pill{margin-bottom:6px}
+
 
 /* ── Fullscreen Ad ───────────────────────────────── */
 .ad-fullscreen {
