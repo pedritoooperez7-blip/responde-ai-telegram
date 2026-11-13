@@ -672,6 +672,24 @@ def flag_anomaly(c: sqlite3.Connection, referral_id: int, reason: str) -> None:
     c.commit()
 
 
+_REVIEW_HOOK: Optional[Callable[[int, str], None]] = None
+
+
+def set_review_hook(hook: Optional[Callable[[int, str], None]]) -> None:
+    """main.py inyecta aquí el aviso al grupo de revisión (best-effort)."""
+    global _REVIEW_HOOK
+    _REVIEW_HOOK = hook
+
+
+def _announce_anomaly(referral_id: int, reason: str) -> None:
+    if not _REVIEW_HOOK:
+        return
+    try:
+        _REVIEW_HOOK(int(referral_id), str(reason or "anomaly"))
+    except Exception:
+        pass
+
+
 def resolve_anomaly(
     c: sqlite3.Connection,
     referral_id: int,

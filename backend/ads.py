@@ -200,8 +200,32 @@ def save_business_ad(conn: sqlite3.Connection, user_id: str, data: Dict[str, Any
     return conn.execute("SELECT * FROM ads WHERE id=?", (row["id"],)).fetchone()
 
 
+def apply_admin_action(conn: sqlite3.Connection, ad_id: int, action: str, reason: str = "",
+                       actor: str = "") -> Dict[str, Any]:
+    """Aplica una decisión de moderación. Única implementación (panel y Telegram)."""
+    action = (action or "").strip().lower()
+    mapping = {"approve": "approved", "reject": "rejected", "pause": "paused", "resume": "approved"}
+    if action not in mapping:
+        raise AdError("Acción no válida")
+    reason = re.sub(r"\s+", " ", reason or "").strip()[:300]
+    if action == "reject" and not reason:
+        raise AdError("Indica el motivo del rechazo para que el negocio pueda corregirlo")
+    row = conn.execute("SELECT * FROM ads WHERE id=?", (int(ad_id),)).fetchone()
+    if not row:
+        raise AdError("Anuncio no encontrado")
+    if action in {"approve", "resume"} and not (row["title"] and row["link_url"]):
+        raise AdError("El anuncio aún no tiene contenido")
+    conn.execute("UPDATE ads SET status=?,reject_reason=?,updated_at=? WHERE id=?",
+                 (mapping[action], reason if action == "reject" else None, _now(), row["id"]))
+    conn.commit()
+    return {"id": row["id"], "status": mapping[action], "reason": reason,
+            "owner_user_id": row["owner_user_id"], "business_name": row["business_name"],
+            "title": row["title"], "body": row["body"]}
+
+
 def build_router(*, current_user: Callable, connect: Callable, is_premium: Callable,
-                 admin: Callable, audit: Callable, payments: Any, request_limiter: Any = None):
+                 admin: Callable, audit: Callable, payments: Any, request_limiter: Any = None,
+                 notify: Optional[Callable] = None, review: Optional[Callable] = None):
     """Crea el APIRouter. ``main.py`` inyecta autenticación, base de datos y pagos."""
     from fastapi import APIRouter, HTTPException, Request
     from pydantic import BaseModel
@@ -229,6 +253,40 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
 
     class AdId(BaseModel):
         id: int
+
+    def _notify_user(fn, user_id: str, text: str):
+        if not fn or not user_id:
+            return
+        try:
+            fn(str(user_id), text)
+        except Exception:
+            pass
+
+    def _notify_review(fn, payload: Dict[str, Any]):
+        """Avisa al grupo de revisión sin bloquear la respuesta."""
+        if not fn:
+            return
+        import threading as _threading
+        def _run():
+            try:
+                fn("ad", payload)
+            except Exception:
+                pass
+        _threading.Thread(target=_run, daemon=True).start()
+
+    def _notify_ad_result(fn, result: Dict[str, Any]):
+        status = result.get("status")
+        uid = result.get("owner_user_id")
+        if not fn or not uid:
+            return
+        reason = result.get("reason") or ""
+        if status == "approved":
+            _notify_user(fn, uid, "✅ <b>Tu anuncio fue aprobado.</b>\nYa se está mostrando a quienes usan LiggaCuba sin Premium.")
+        elif status == "rejected":
+            motivo = f"\n\nMotivo: {reason}" if reason else ""
+            _notify_user(fn, uid, f"❌ <b>Tu anuncio fue rechazado.</b>{motivo}\n\nCorrígelo y vuelve a enviarlo a revisión.")
+        elif status == "paused":
+            _notify_user(fn, uid, "⏸ <b>Tu anuncio fue pausado.</b>\nPuedes corregirlo y volver a enviarlo a revisión.")
 
     def _conn():
         conn = connect()
@@ -293,6 +351,9 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
         try:
             row = save_business_ad(conn, uid, p.model_dump() if hasattr(p, "model_dump") else p.dict())
             conn.commit()
+            _notify_user(notify, uid, "📣 <b>Tu anuncio está en revisión.</b>\nTe avisaremos cuando administración lo apruebe.")
+            _notify_review(review, {"id": row["id"], "owner_user_id": uid,
+                                    "business_name": row["business_name"], "title": row["title"], "body": row["body"]})
             return business_view(row)
         except AdError as exc:
             conn.rollback()
@@ -356,26 +417,16 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
     @router.post("/api/admin/ads/action")
     def admin_action(p: AdAction, request: Request):
         ident = admin(request, "ads")
-        action = (p.action or "").strip().lower()
-        mapping = {"approve": "approved", "reject": "rejected", "pause": "paused", "resume": "approved"}
-        if action not in mapping:
-            raise HTTPException(400, "Acción no válida")
-        reason = re.sub(r"\s+", " ", p.reason or "").strip()[:300]
-        if action == "reject" and not reason:
-            raise HTTPException(400, "Indica el motivo del rechazo para que el negocio pueda corregirlo")
         conn = _conn()
         try:
-            row = conn.execute("SELECT * FROM ads WHERE id=?", (int(p.id),)).fetchone()
-            if not row:
-                raise HTTPException(404, "Anuncio no encontrado")
-            if action in {"approve", "resume"} and not (row["title"] and row["link_url"]):
-                raise HTTPException(409, "El anuncio aún no tiene contenido")
-            conn.execute("UPDATE ads SET status=?,reject_reason=?,updated_at=? WHERE id=?",
-                         (mapping[action], reason if action == "reject" else None, _now(), row["id"]))
-            conn.commit()
+            result = apply_admin_action(conn, int(p.id), p.action, p.reason, ident["username"])
+        except AdError as exc:
+            raise HTTPException(400, str(exc))
         finally:
             conn.close()
-        audit(ident["username"], "ad_" + action, p.id, {"reason": reason})
+        audit(ident["username"], "ad_" + (p.action or "").strip().lower(), p.id, {"reason": p.reason or ""})
+        _notify_ad_result(notify, result)
+        _notify_review(review, {"id": result["id"], "decision": result["status"], "reason": result["reason"]})
         return {"success": True}
 
     @router.post("/api/admin/ads/delete")

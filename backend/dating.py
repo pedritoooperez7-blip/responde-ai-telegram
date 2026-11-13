@@ -1179,7 +1179,8 @@ def _enrich_matches_with_chat(c: sqlite3.Connection, uid: str, matches: List[Dic
 
 def build_router(*, current_user: Callable, connect: Callable, is_premium: Callable, admin: Callable,
                  audit: Callable, notify: Callable, secret: Callable, photos_dir: Callable,
-                 free_daily_likes: int = 20, free_msg_limit: int = FREE_MSG_LIMIT):
+                 free_daily_likes: int = 20, free_msg_limit: int = FREE_MSG_LIMIT,
+                 review: Optional[Callable] = None):
     """Crea el APIRouter. ``main.py`` inyecta autenticación, base de datos y Telegram."""
     from fastapi import APIRouter, HTTPException, Request
     from fastapi.responses import FileResponse, Response
@@ -1255,6 +1256,17 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
     def fire_and_forget(user_id: str, text: str):
         threading.Thread(target=notify, args=(user_id, text), daemon=True).start()
 
+    def fire_review(kind: str, payload: Dict[str, Any]):
+        """Avisa al grupo de revisión sin bloquear la respuesta al usuario."""
+        if not review:
+            return
+        def _run():
+            try:
+                review(kind, payload)
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
+
     @router.get("/api/dating/config")
     def dating_config():
         return {"provinces": list(PROVINCES), "genders": list(GENDERS), "looking_for": list(LOOKING_FOR),
@@ -1292,8 +1304,13 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
         def work(c):
             require_active_profile(c, uid)
             jpeg = process_photo(parse_image_data_url(p.image))
-            return add_photo(c, uid, photos_dir(), jpeg)
-        return run(work)
+            result = add_photo(c, uid, photos_dir(), jpeg)
+            result["user_id"] = uid
+            return result
+        out = run(work)
+        fire_and_forget(uid, "📸 <b>Tu foto está en revisión.</b>\nLa revisaremos en breve y te avisaremos cuando esté publicada.")
+        fire_review("photo", out)
+        return out
 
     @router.delete("/api/dating/photos/{photo_id}")
     def dating_delete_photo(photo_id: int, request: Request):
@@ -1429,7 +1446,35 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
     def dating_report(p: ReportIn, request: Request):
         uid = current_user(request)
         throttle(report_limiter, uid, "Has enviado demasiados reportes hoy.")
-        return run(lambda c: report_user(c, uid, p.target, p.reason, p.details))
+        result = run(lambda c: report_user(c, uid, p.target, p.reason, p.details))
+        report_id = result.get("report_id") if isinstance(result, dict) else None
+        if not report_id:
+            # report_user no devuelve el id: se toma el reporte abierto más reciente
+            # del mismo usuario, que es exactamente el que se acaba de crear.
+            c = connect()
+            try:
+                row_id = c.execute(
+                    "SELECT id FROM dating_reports WHERE reporter_id=? AND status='open' ORDER BY id DESC LIMIT 1",
+                    (uid,),
+                ).fetchone()
+            finally:
+                c.close()
+            report_id = row_id["id"] if row_id else None
+        if report_id:
+            payload = {"report_id": report_id, "reporter_id": uid, "reason": p.reason, "details": p.details}
+            c = connect()
+            try:
+                row = c.execute(
+                    "SELECT p.public_id, p.display_name FROM dating_profiles p WHERE p.public_id=? OR p.user_id=?",
+                    (p.target, p.target),
+                ).fetchone()
+            finally:
+                c.close()
+            if row:
+                payload["reported_name"] = row["display_name"]
+                payload["reported_id"] = row["public_id"]
+            fire_review("report", payload)
+        return result
 
     @router.post("/api/dating/visibility")
     def dating_visibility(p: VisibleIn, request: Request):
