@@ -215,12 +215,22 @@ def db():
     return _db.connect(DB_PATH)
 
 
-def notify_user(user_id: str, text: str) -> None:
-    """Send a Telegram message to a user. Fails silently — never breaks the caller."""
+try:  # grupo único de revisión (comprobantes, fotos, reportes, anuncios, referidos)
+    from . import review_group as _review
+except ImportError:  # pragma: no cover
+    import review_group as _review
+
+
+def notify_user(user_id: str, text: str, app_button: bool = False) -> None:
+    """Send a Telegram message to a user. Fails silently — never breaks the caller.
+
+    ``app_button`` añade el botón que abre la Mini App (avisos de vencimiento y match).
+    """
     import threading
+    markup = _review.app_keyboard() if app_button else None
     def _send():
         try:
-            send_message(str(user_id), text)
+            send_message(str(user_id), text, markup)
         except Exception as exc:
             logger.debug("notify_user to %s failed: %s", user_id, exc)
     threading.Thread(target=_send, daemon=True).start()
@@ -478,6 +488,10 @@ def init_db():
         except sqlite3.IntegrityError:
             logger.error("Could not create %s because legacy payment duplicates exist; runtime duplicate checks remain enabled", index_name)
     _dating.init_schema(c)
+    try:
+        _review.ensure_schema(c)
+    except Exception:
+        logger.warning("Could not create the review group tables", exc_info=True)
     # New tables for price overrides and referral system
     c.executescript("""
     CREATE TABLE IF NOT EXISTS price_overrides(
@@ -887,7 +901,8 @@ def _run_premium_expiry_reminders() -> None:
                     continue
                 notify_user(uid,
                     "⏰ <b>Tu Premium vence pronto.</b>\n\n"
-                    "Tienes menos de 24 horas de acceso Premium. Renuévalo desde la app para no perder el acceso. 💜")
+                    "Tienes menos de 24 horas de acceso Premium. Renuévalo desde la app para no perder el acceso. 💜",
+                    app_button=True)
                 c.execute(
                     "INSERT OR REPLACE INTO premium_expiry_reminders(user_id, reminded_at, premium_until) VALUES(?,?,?)",
                     (uid, datetime.now(timezone.utc).isoformat(), until)
@@ -901,6 +916,73 @@ def _run_premium_expiry_reminders() -> None:
             c.close()
     except Exception:
         logger.warning("Premium expiry reminder failed; will retry next cycle", exc_info=True)
+
+
+def _run_lifecycle_notices() -> None:
+    """Avisos puntuales y no repetidos: Premium vencido y pago a punto de cancelarse.
+
+    Usa ``lifecycle_notices`` como control de idempotencia, igual que el
+    recordatorio de 24 h usa ``premium_expiry_reminders``.
+    """
+    try:
+        c = db()
+        try:
+            c.execute("""CREATE TABLE IF NOT EXISTS lifecycle_notices(
+                notice_key TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at TEXT NOT NULL)""")
+            c.commit()
+            current = datetime.now(timezone.utc)
+            # Premium recién vencido (últimas 48 h): un aviso por periodo.
+            expired = c.execute(
+                """SELECT user_id, premium_until FROM users
+                   WHERE premium_until IS NOT NULL AND premium_until <= ? AND premium_until >= ?""",
+                (current.isoformat(), (current - timedelta(hours=48)).isoformat()),
+            ).fetchall()
+            for row in expired:
+                key = f"premium_expired:{row['user_id']}:{row['premium_until']}"
+                if c.execute("SELECT 1 FROM lifecycle_notices WHERE notice_key=?", (key,)).fetchone():
+                    continue
+                notify_user(
+                    row["user_id"],
+                    "⚠️ <b>Tu Premium venció.</b>\n\n"
+                    "Tu cuenta volvió al plan gratuito: 3 análisis diarios y modos básicos. "
+                    "Puedes reactivarlo cuando quieras desde Premium. 💜",
+                    app_button=True,
+                )
+                c.execute(
+                    "INSERT OR REPLACE INTO lifecycle_notices(notice_key,user_id,created_at) VALUES(?,?,?)",
+                    (key, row["user_id"], current.isoformat()),
+                )
+                c.commit()
+            # Pago sin comprobante en el penúltimo día antes de cancelarse.
+            days = max(1, _env_int("PENDING_PAYMENT_DAYS", 3))
+            if days >= 2:
+                from_cutoff = (current - timedelta(days=days - 1)).isoformat()
+                to_cutoff = (current - timedelta(days=days)).isoformat()
+                stale = c.execute(
+                    """SELECT operation_id, user_id, amount, created_at FROM payment_operations
+                       WHERE status='pending' AND created_at <= ? AND created_at >= ?""",
+                    (from_cutoff, to_cutoff),
+                ).fetchall()
+                for row in stale:
+                    key = f"payment_cancel_warning:{row['operation_id']}"
+                    if c.execute("SELECT 1 FROM lifecycle_notices WHERE notice_key=?", (key,)).fetchone():
+                        continue
+                    notify_user(
+                        row["user_id"],
+                        "⏳ <b>Tu operación se cancela mañana.</b>\n\n"
+                        f"Operación <code>{row['operation_id']}</code> · {row['amount']}.\n"
+                        "Si ya pagaste, envía el comprobante hoy desde la app para que podamos verificarlo.",
+                        app_button=True,
+                    )
+                    c.execute(
+                        "INSERT OR REPLACE INTO lifecycle_notices(notice_key,user_id,created_at) VALUES(?,?,?)",
+                        (key, row["user_id"], current.isoformat()),
+                    )
+                    c.commit()
+        finally:
+            c.close()
+    except Exception:
+        logger.warning("Lifecycle notices failed; will retry next cycle", exc_info=True)
 
 
 def _run_retention_purge() -> None:
@@ -918,6 +1000,7 @@ def _run_retention_purge() -> None:
     except Exception:
         logger.warning("Telegram update retention purge failed; it will be retried on the next cycle", exc_info=True)
     _run_premium_expiry_reminders()
+    _run_lifecycle_notices()
 
 
 def start_background_purge() -> bool:
@@ -985,17 +1068,24 @@ def process_one_payment_archive() -> bool:
         c.close()
 
     try:
-        from html import escape
-        caption = (f"<b>Comprobante de pago</b>\nOperación: <code>{escape(str(operation_id))}</code>\n"
-                   f"Usuario: <code>{escape(str(_archive_user_for_operation(operation_id)))}</code>\n"
-                   f"Texto: {escape((job.get('proof_text') or '')[:700])}")
+        # Datos completos de la transferencia + botones de decisión.
+        # Telegram no admite teclado en un mensaje con foto: los botones van aparte.
+        caption = _review.payment_details(operation_id, connect=db)
         image = job.get('proof_image') or ''
         if image:
             raw = _validate_image_data_url(image)
-            result = send_photo(job['chat_id'], raw, "comprobante.jpg", caption)
+            short_caption = caption.split("\n")[0] + "\n" + caption.split("\n")[1]
+            result = send_photo(job['chat_id'], raw, "comprobante.jpg", short_caption[:900])
+            message_id = str(result.get('message_id') or '').strip()
+            if not message_id:
+                raise TelegramBotError("Telegram no devolvió message_id; se conserva el comprobante")
+            try:
+                _review.send_payment_buttons(operation_id, connect=db, chat_id=str(job['chat_id']))
+            except Exception:
+                logger.warning("No se pudieron enviar los botones del comprobante operation_id=%s", operation_id)
         else:
-            result = send_message(job['chat_id'], caption)
-        message_id = str(result.get('message_id') or '').strip()
+            result = _review.send_payment_review(operation_id, connect=db, chat_id=str(job['chat_id']))
+            message_id = str(result.get('message_id') or '').strip()
         if not message_id:
             raise TelegramBotError("Telegram no devolvió message_id; se conserva el comprobante")
         c = db()
@@ -1184,6 +1274,18 @@ async def telegram_webhook(request: Request):
             raise ValueError("update no es un objeto")
     except (ValueError, UnicodeDecodeError):
         raise HTTPException(400, "Update inválido")
+    if isinstance(update.get("callback_query"), dict):
+        try:
+            return {"ok": True, **_handle_review_callback(update)}
+        except Exception:
+            logger.warning("Review callback failed update_id=%s", update.get("update_id"), exc_info=True)
+            raise HTTPException(502, "No se pudo procesar la acción del grupo de revisión")
+    if isinstance(update.get("message"), dict):
+        try:
+            if _handle_review_reason_message(update):
+                return {"ok": True, "handled": True, "action": "review_reason"}
+        except Exception:
+            logger.warning("Review reason handling failed update_id=%s", update.get("update_id"), exc_info=True)
     try:
         outcome = handle_update(update)
         return {"ok": True, **outcome}
@@ -2142,9 +2244,16 @@ def atajo_pago(p: AtajoPayment, request: Request):
 
         if len(candidates) != 1:
             c.rollback()
+            status = "unmatched" if not candidates else "ambiguous"
+            _review_async("atajo_unmatched", {
+                "status": status, "matches": len(candidates), "phone": phone,
+                "amount": f"{amount_value:.2f}", "method": method, "destination": destination,
+                "transaction": transaction, "date": transfer_date,
+                "fingerprint": fingerprint[:16],
+            })
             return {
                 "success": False,
-                "status": "unmatched" if not candidates else "ambiguous",
+                "status": status,
                 "matches": len(candidates),
             }
 
@@ -2188,6 +2297,11 @@ def atajo_pago(p: AtajoPayment, request: Request):
             days = _payments.plan_days(matched["plan"])
             notify_user(matched["user_id"], f"🎉 <b>¡Premium activado!</b>\nTienes <b>{days} días</b> de acceso Premium en LiggaCuba. ¡Disfrútalo!")
             _reward_referrer(matched["user_id"], str(matched["operation_id"]))
+            _review_async("atajo_granted", {
+                "operation_id": matched["operation_id"], "phone": phone,
+                "amount": f"{amount_value:.2f}", "method": method, "destination": destination,
+                "transaction": transaction, "date": transfer_date,
+            })
         return result
     except sqlite3.IntegrityError:
         c.rollback()
@@ -2646,13 +2760,12 @@ def admin_admin_status(p:AdminStatus, request:Request):
 def admin_audit(request:Request):
     admin(request,"audit"); c=db(); rows=c.execute("SELECT actor,action,target,details,created_at FROM admin_audit ORDER BY id DESC LIMIT 200").fetchall(); c.close(); return {"items":[dict(r) for r in rows]}
 
-@app.post("/api/admin/payments/verify")
-def verify_payment(p:PaymentId, request:Request):
-    ident=admin(request,"payments")
+def _verify_payment_core(operation_id: str, actor: str) -> dict:
+    """Verifica un pago y activa el plan. Única implementación (panel y Telegram)."""
     c=db()
     try:
         c.execute("BEGIN IMMEDIATE")
-        row=c.execute("SELECT * FROM payment_operations WHERE operation_id=?",(p.operation_id,)).fetchone()
+        row=c.execute("SELECT * FROM payment_operations WHERE operation_id=?",(operation_id,)).fetchone()
         if not row:
             c.rollback()
             raise HTTPException(404,"Operación no encontrada")
@@ -2664,12 +2777,15 @@ def verify_payment(p:PaymentId, request:Request):
             raise HTTPException(409,"El plan de esta operación no es válido")
         # Reserve the operation atomically so a concurrent request cannot grant Premium twice.
         t=now()
-        cur=c.execute("UPDATE payment_operations SET status='processing',updated_at=? WHERE operation_id=? AND status IN ('pending','proof_submitted')",(t,p.operation_id))
+        cur=c.execute("UPDATE payment_operations SET status='processing',updated_at=? WHERE operation_id=? AND status IN ('pending','proof_submitted')",(t,operation_id))
         if cur.rowcount != 1:
             c.rollback()
             raise HTTPException(409,"La operación ya está siendo procesada")
         until=_apply_paid_plan(c,row["user_id"],row["plan"],t)
-        c.execute("UPDATE payment_operations SET status='verified',verified_at=?,updated_at=? WHERE operation_id=? AND status='processing'",(t,t,p.operation_id))
+        done=c.execute("UPDATE payment_operations SET status='verified',verified_at=?,updated_at=? WHERE operation_id=? AND status='processing'",(t,t,operation_id))
+        if done.rowcount != 1:
+            c.rollback()
+            raise HTTPException(409,"La operación ya fue verificada")
         c.commit()
     except HTTPException:
         raise
@@ -2680,22 +2796,235 @@ def verify_payment(p:PaymentId, request:Request):
         c.close()
     is_ad=_payments.is_ad_plan(row["plan"])
     key="ad_paid_until" if is_ad else "premium_until"
-    audit(ident["username"],"payment_verified",p.operation_id,{"user_id":row["user_id"],key:until})
+    audit(actor,"payment_verified",operation_id,{"user_id":row["user_id"],key:until})
     if is_ad:
         notify_user(row["user_id"], "✅ <b>¡Tu anuncio fue activado!</b>\nYa puedes editar tu anuncio desde <b>Más → Anunciar mi negocio</b>.")
     else:
         days = _payments.plan_days(row["plan"])
         notify_user(row["user_id"], f"🎉 <b>¡Premium activado!</b>\nTienes <b>{days} días</b> de acceso Premium en LiggaCuba. ¡Disfrútalo!")
-        _reward_referrer(row["user_id"], str(p.operation_id))
+        _reward_referrer(row["user_id"], str(operation_id))
     return {"success":True,"status":"verified",key:until,"plan":row["plan"]}
 
-@app.post("/api/admin/payments/reject")
-def reject_payment(p: PaymentReview, request:Request):
+
+def _review_photo_core(photo_id, approve: bool, reason: str, actor: str) -> dict:
+    """Aprueba o rechaza una foto de Citas (misma función que el panel)."""
+    c = db()
+    try:
+        result = _dating.admin_review_photo(
+            c, int(photo_id), bool(approve), reason or "", actor, _dating_photos_dir()
+        )
+    finally:
+        c.close()
+    uid = str(result.get("user_id") or "")
+    if uid:
+        if approve:
+            notify_user(uid, "✅ <b>Tu foto de Citas fue aprobada.</b>\nYa pueden verla al descubrir perfiles. 💜")
+        else:
+            motivo = f"\n\nMotivo: {reason}" if reason else ""
+            notify_user(uid, f"❌ <b>Tu foto de Citas no fue aprobada.</b>{motivo}\n\nSube otra que cumpla las reglas de contenido.")
+    audit(actor, "dating_photo_" + ("approved" if approve else "rejected"), str(photo_id), {"user_id": uid})
+    return result
+
+
+def _review_report_core(report_id, action: str, actor: str) -> dict:
+    """Suspende o descarta un reporte de Citas (misma función que el panel)."""
+    c = db()
+    try:
+        result = _dating.admin_resolve_report(c, int(report_id), action, actor)
+    finally:
+        c.close()
+    uid = str(result.get("user_id") or "")
+    if uid and action == "suspend":
+        notify_user(uid, "🚫 <b>Tu perfil de Citas fue suspendido.</b>\n\nUn reporte fue revisado por administración. "
+                         "Si crees que es un error, contacta a soporte por Telegram o WhatsApp.")
+    audit(actor, "dating_report_" + str(action), str(report_id), {"user_id": uid})
+    return result
+
+
+def _review_ad_core(ad_id, action: str, reason: str, actor: str) -> dict:
+    """Aplica una decisión de moderación sobre un anuncio (misma función que el panel).
+
+    Corrección: apply_admin_action mapea "resume" → status "approved" sin
+    devolver was_paused.  Leemos el estado previo ANTES de actuar para
+    distinguir una reactivación de una aprobación inicial.
+    apply_admin_action y _notify_ad_result no se modifican (evita
+    regresiones en el panel y en ads.py).
+    """
+    from . import ads as _ads_mod
+    conn = db()
+    try:
+        prev = conn.execute(
+            "SELECT status FROM ads WHERE id=?", (int(ad_id),)
+        ).fetchone()
+        was_paused = bool(prev and prev["status"] == "paused")
+        result = _ads_mod.apply_admin_action(conn, int(ad_id), action, reason, actor)
+    finally:
+        conn.close()
+    uid = str(result.get("owner_user_id") or "")
+    if uid:
+        status = result.get("status")
+        if status == "approved" and was_paused:
+            notify_user(uid, "✅ <b>Tu anuncio fue reactivado.</b>\n"
+                        "Ya se está mostrando de nuevo.")
+        elif status == "approved":
+            notify_user(uid, "✅ <b>Tu anuncio fue aprobado.</b>\n"
+                        "Ya se está mostrando a quienes usan LiggaCuba sin Premium.")
+        elif status == "rejected":
+            motivo = f"\n\nMotivo: {reason}" if reason else ""
+            notify_user(uid, f"❌ <b>Tu anuncio fue rechazado.</b>{motivo}\n\n"
+                        "Corrígelo y vuelve a enviarlo a revisión.")
+        elif status == "paused":
+            notify_user(uid, "⏸ <b>Tu anuncio fue pausado.</b>\n"
+                        "Puedes corregirlo y volver a enviarlo a revisión.")
+    audit(actor, "ad_" + str(action), str(ad_id), {"reason": reason or ""})
+    return result
+
+
+def _review_referral_core(referral_id, approve: bool, notes: str, actor: str) -> dict:
+    """Resuelve una anomalía de referido y avisa al invitador exactamente una vez.
+
+    resolve_anomaly espera action: str ("approve" | "reject"); se le pasa
+    la cadena correcta.  La notificación al invitador se envía tras cerrar
+    la conexión, usando el row leído antes del finally.
+    """
+    c = db()
+    try:
+        row = c.execute(
+            "SELECT r.referrer_id, r.referred_id FROM referrals r WHERE r.id=?",
+            (int(referral_id),)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Referido no encontrado")
+        # resolve_anomaly recibe cadena, nunca booleano.
+        action = "approve" if approve else "reject"
+        _referrals.resolve_anomaly(c, int(referral_id), actor, action, notes or "")
+    finally:
+        c.close()
+    referrer_id = str(row["referrer_id"] or "")
+    if referrer_id:
+        if approve:
+            notify_user(
+                referrer_id,
+                "🎁 <b>Tu referido fue aprobado.</b>\n"
+                "Administración revisó la invitación y quedó confirmada. "
+                "Recibirás los días de Premium cuando corresponda.",
+            )
+        else:
+            notify_user(
+                referrer_id,
+                "ℹ️ <b>Tu referido no fue aprobado.</b>\n"
+                "Administración revisó la invitación y no cumple las condiciones del programa.",
+            )
+    audit(actor, "referral_anomaly_" + ("approved" if approve else "rejected"),
+          str(referral_id), {"notes": notes or ""})
+    return {"success": True, "referral_id": int(referral_id)}
+
+
+def _handle_review_callback(update: dict) -> dict:
+    """Callback de un botón del grupo de revisión."""
+    data = str(((update.get("callback_query") or {}).get("data")) or "")
+    if not data.startswith(_review.CALLBACK_PREFIX + ":"):
+        return {"handled": False, "action": "unsupported_callback"}
+    return _review.handle_callback(
+        update, connect=db, admins=_admin_telegram_ids(),
+        verify_payment=_verify_payment_core, reject_payment=_reject_payment_core,
+        review_photo=_review_photo_core, resolve_report=_review_report_core,
+        ad_action=_review_ad_core, resolve_referral=_review_referral_core, audit=audit,
+    )
+
+
+def _handle_review_reason_message(update: dict) -> bool:
+    """Si un admin debía escribir el motivo de un rechazo, este mensaje lo completa."""
+    message = update.get("message") or {}
+    sender = (message.get("from") or {}).get("id")
+    admin_id = str(sender) if sender is not None else ""
+    if not admin_id or admin_id not in _admin_telegram_ids():
+        return False
+    chat_id = (message.get("chat") or {}).get("id")
+    text = (message.get("text") or "").strip()
+    if not text or text.startswith("/"):
+        return False
+    pending = _review.pending_action_for(db, admin_id, chat_id, text)
+    if not pending:
+        return False
+    _review.execute_action(
+        connect=db, admin_id=admin_id, chat_id=chat_id, message_id=message.get("message_id"),
+        action=pending["action"], target=pending["target"], reason=pending["reason"],
+        verify_payment=_verify_payment_core, reject_payment=_reject_payment_core,
+        review_photo=_review_photo_core, resolve_report=_review_report_core,
+        ad_action=_review_ad_core, resolve_referral=_review_referral_core, audit=audit,
+    )
+    return True
+
+
+def _review_async(kind: str, payload: dict) -> None:
+    """Aviso al grupo sin bloquear la respuesta (el atajo debe contestar rápido)."""
+    def _run():
+        try:
+            _review.notify(kind, payload, connect=db)
+        except Exception:
+            logger.warning("Review async notice failed kind=%s", kind, exc_info=True)
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _review_hook(kind: str, payload: dict) -> None:
+    """Envía al grupo lo que necesita decisión de administración."""
+    try:
+        if kind == "photo":
+            photo_id = int(payload.get("id") or 0)
+            if not photo_id:
+                return
+            raw = None
+            display_name = ""
+            c = db()
+            try:
+                row = c.execute(
+                    "SELECT ph.filename, p.display_name FROM dating_photos ph "
+                    "LEFT JOIN dating_profiles p ON p.user_id=ph.user_id WHERE ph.id=?",
+                    (photo_id,),
+                ).fetchone()
+            finally:
+                c.close()
+            if not row:
+                return
+            display_name = row["display_name"] or ""
+            raw = _dating.read_photo_bytes(_dating_photos_dir(), row["filename"])
+            _review.notify("photo", {"photo_id": photo_id, "user_id": str(payload.get("user_id") or ""),
+                                     "display_name": display_name, "image": raw}, connect=db)
+            return
+        _review.notify(kind, payload, connect=db)
+    except Exception:
+        logger.warning("Review hook failed kind=%s", kind, exc_info=True)
+
+
+def _referral_review_hook(referral_id: int, reason: str) -> None:
+    """Puente desde referrals.py hacia el grupo de revisión."""
+    try:
+        c = db()
+        try:
+            row = c.execute("SELECT referrer_id, referred_id FROM referrals WHERE id=?", (int(referral_id),)).fetchone()
+        finally:
+            c.close()
+        if not row:
+            return
+        _review.notify("referral", {"referral_id": int(referral_id), "reason": reason,
+                                    "referrer_id": row["referrer_id"], "referred_id": row["referred_id"]}, connect=db)
+    except Exception:
+        logger.warning("Referral review hook failed id=%s", referral_id, exc_info=True)
+
+
+@app.post("/api/admin/payments/verify")
+def verify_payment(p:PaymentId, request:Request):
     ident=admin(request,"payments")
+    return _verify_payment_core(p.operation_id, ident["username"])
+
+
+def _reject_payment_core(operation_id: str, actor: str, reason: str = "") -> dict:
+    """Rechaza un pago. Única implementación (panel y Telegram)."""
     c=db()
     try:
         c.execute("BEGIN IMMEDIATE")
-        row=c.execute("SELECT * FROM payment_operations WHERE operation_id=?",(p.operation_id,)).fetchone()
+        row=c.execute("SELECT * FROM payment_operations WHERE operation_id=?",(operation_id,)).fetchone()
         if not row:
             c.rollback()
             raise HTTPException(404,"Operación no encontrada")
@@ -2703,7 +3032,7 @@ def reject_payment(p: PaymentReview, request:Request):
             c.rollback()
             raise HTTPException(409,"Operación ya procesada")
         t=now()
-        cur=c.execute("UPDATE payment_operations SET status='rejected',updated_at=? WHERE operation_id=? AND status IN ('pending','proof_submitted')",(t,p.operation_id))
+        cur=c.execute("UPDATE payment_operations SET status='rejected',updated_at=? WHERE operation_id=? AND status IN ('pending','proof_submitted')",(t,operation_id))
         if cur.rowcount != 1:
             c.rollback()
             raise HTTPException(409,"La operación ya fue procesada")
@@ -2715,10 +3044,17 @@ def reject_payment(p: PaymentReview, request:Request):
         raise HTTPException(500,"No se pudo rechazar el pago")
     finally:
         c.close()
-    audit(ident["username"],"payment_rejected",p.operation_id,{"reason":p.reason,"user_id":row["user_id"]})
-    reason_text = f"\n\nMotivo: {p.reason}" if p.reason else ""
+    audit(actor,"payment_rejected",operation_id,{"reason":reason,"user_id":row["user_id"]})
+    reason_text = f"\n\nMotivo: {reason}" if reason else ""
     notify_user(row["user_id"], f"❌ <b>Tu pago no pudo ser verificado.</b>{reason_text}\n\nSi crees que es un error, contacta a soporte por Telegram o WhatsApp.")
     return {"success":True,"status":"rejected"}
+
+
+@app.post("/api/admin/payments/reject")
+def reject_payment(p: PaymentReview, request:Request):
+    ident=admin(request,"payments")
+    return _reject_payment_core(p.operation_id, ident["username"], p.reason or "")
+
 
 @app.get("/api/admin/payments/{operation_id}/proof")
 def admin_payment_proof(operation_id: str, request: Request):
@@ -3134,6 +3470,7 @@ def admin_flag_anomaly(request: Request, referral_id: int, reason: str = "manual
     c = db()
     try:
         _referrals.flag_anomaly(c, referral_id, f"admin:{ident['username']} – {reason}")
+        _referral_review_hook(int(referral_id), f"admin:{ident['username']} – {reason}")
     finally:
         c.close()
     return {"success": True}
@@ -3210,7 +3547,8 @@ def _dating_secret() -> str:
 
 def _dating_notify(user_id: str, text: str) -> None:
     try:
-        send_message(user_id, text)
+        # El aviso de match (y el resto de avisos de Citas) abre la Mini App.
+        send_message(user_id, text, _review.app_keyboard())
     except Exception as exc:  # el aviso es opcional: nunca debe romper el match
         logger.warning("Dating notification not delivered: error_type=%s", type(exc).__name__)
 
@@ -3218,10 +3556,15 @@ def _dating_notify(user_id: str, text: str) -> None:
 app.include_router(_dating.build_router(
     current_user=current_user, connect=db, is_premium=lambda uid: premium(uid), admin=admin, audit=audit,
     notify=_dating_notify, secret=_dating_secret, photos_dir=_dating_photos_dir,
-    free_daily_likes=_env_int("DATING_FREE_DAILY_LIKES", 20),
+    free_daily_likes=_env_int("DATING_FREE_DAILY_LIKES", 20), review=_review_hook,
 ))
 
 app.include_router(_ads.build_router(
     current_user=current_user, connect=db, is_premium=lambda uid: premium(uid), admin=admin, audit=audit,
-    payments=_payments,
+    payments=_payments, notify=_dating_notify, review=_review_hook,
 ))
+
+try:
+    _referrals.set_review_hook(_referral_review_hook)
+except Exception:
+    logger.warning("Could not register the referral review hook", exc_info=True)
