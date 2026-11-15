@@ -141,7 +141,8 @@
     ['#homeScreen', '#profileScreen', '#settingsScreen', '#moreScreen', '#premiumScreen', '#transferScreen', '#paymentMethodScreen', '#proofScreen', '#supportScreen', '#businessAdScreen', '#businessAdEditorScreen', '#statsScreen'].forEach(s => $(s)?.classList.add('hidden'));
     $('#datingScreen').classList.remove('hidden');
     $('.bottom-nav').classList.remove('hidden');
-    $$('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.nav === 'dating'));
+    $$('.nav-item').forEach(b => {const on = b.dataset.nav === 'dating'; b.classList.toggle('active', on); if(on) b.setAttribute('aria-current','page'); else b.removeAttribute('aria-current');});
+    if (typeof syncBackButton === 'function') syncBackButton();
   }
   // Las peticiones base se hacen en paralelo (antes eran 4 en cadena: config → me → feed → likes).
   function startBase() {
@@ -895,7 +896,9 @@
 
   // ---- arranque ---------------------------------------------------------
   const nav = $('[data-nav="dating"]');
-  if (nav) nav.onclick = openDating;
+  // app.js también asigna este botón, pero este script carga después y lo reemplaza.
+  // Conserva el háptico del rediseño y sigue abriendo Citas.
+  if (nav) nav.onclick = () => { try { if (typeof haptic === 'function') haptic('select'); } catch (_) {} openDating(); };
   window.openDating = openDating;
   window.warmDating = warmDating;
 })();
