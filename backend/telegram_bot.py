@@ -121,10 +121,15 @@ def send_message(chat_id: int | str, text: str, reply_markup: Optional[Dict[str,
     return bot_api_call("sendMessage", payload)
 
 
-def send_photo(chat_id: int | str, photo: bytes, filename: str = "comprobante.jpg", caption: str = "") -> Dict[str, Any]:
-    """Send a photo to Telegram using multipart/form-data without persisting it locally."""
+def send_photo(chat_id: int | str, photo: bytes, filename: str = "comprobante.jpg", caption: str = "", reply_markup: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Send a photo to Telegram using multipart/form-data without persisting it locally.
+
+    Optional ``reply_markup`` attaches inline buttons under the photo (Telegram supports this).
+    """
     boundary = "----LiggaCubaBoundary" + hashlib.sha256(os.urandom(16)).hexdigest()[:24]
     fields = {"chat_id": str(chat_id), "caption": (caption or "")[:900], "parse_mode": "HTML"}
+    if reply_markup is not None:
+        fields["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
     chunks = []
     for name, value in fields.items():
         chunks.append((f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").encode("utf-8"))

@@ -133,11 +133,11 @@ def _send(text: str, rows=None, chat_id: Optional[str] = None) -> Dict[str, Any]
     return _bot().send_message(chat, text, _kb(rows))
 
 
-def _send_photo(raw: bytes, caption: str, chat_id: Optional[str] = None) -> Dict[str, Any]:
+def _send_photo(raw: bytes, caption: str, chat_id: Optional[str] = None, reply_markup=None) -> Dict[str, Any]:
     chat = chat_id or review_chat_id()
     if not chat:
         return {}
-    return _bot().send_photo(chat, raw, "comprobante.jpg", caption)
+    return _bot().send_photo(chat, raw, "comprobante.jpg", caption, reply_markup=reply_markup)
 
 
 def _answer_callback(callback_id: str, text: str = "", alert: bool = False) -> None:
@@ -318,18 +318,27 @@ def _photo_item(payload: Dict[str, Any], connect: Optional[Callable]) -> bool:
             "SELECT 1 FROM telegram_review_notices WHERE dedupe_key=?", (key,)
         ).fetchone():
             return False
+
+        user_id = str(payload.get("user_id") or "").strip()
+        display = (payload.get("display_name") or "").strip() or "Sin nombre"
+        if user_id and user_id.isdigit():
+            user_line = f'👤 <b>Usuario:</b> <a href="tg://user?id={_esc(user_id)}">{_esc(display)}</a>'
+        else:
+            user_line = f"👤 <b>Usuario:</b> {_esc(display)}"
+
         caption = (
             "🖼 <b>Foto de Citas en revisión</b>\n"
-            f"Usuario: {_esc(payload.get('display_name') or 'Sin nombre')} · "
-            f"<code>{_esc(payload.get('user_id') or '—')}</code>"
+            f"{user_line}\n"
+            f"🆔 <b>ID:</b> <code>{_esc(user_id or '—')}</code>\n"
+            f"🔢 <b>Foto</b> #{_esc(photo_id)}"
         )
         raw = payload.get("image")
+        rows = _photo_rows(photo_id)
         if raw:
-            _send_photo(raw, caption)
+            # Foto + botones en el mismo mensaje
+            _send_photo(raw, caption, reply_markup=_kb(rows))
         else:
-            _send(caption)
-        # Telegram no admite teclado en un mensaje con foto: los botones van aparte.
-        _send(f"Revisión de la foto <b>#{_esc(photo_id)}</b>", _photo_rows(photo_id))
+            _send(caption, rows)
         if conn is not None:
             conn.execute(
                 "INSERT OR REPLACE INTO telegram_review_notices(dedupe_key,kind,created_at) VALUES(?,?,?)",
@@ -616,15 +625,203 @@ def clear_pending_reason(connect: Callable, admin_id: str, chat_id: Any) -> None
         conn.close()
 
 
-def _log(connect: Callable, admin_id: str, chat_id: Any, message_id: Any, action: str, target: str, result: str) -> None:
-    conn = connect()
+def _log(connect: Callable, admin_id: str, chat_id: Any, message_id: Any,
+         action: str, target: str, result: str) -> None:
     try:
-        ensure_schema(conn)
-        conn.execute(
-            """INSERT INTO telegram_review_log(admin_id,chat_id,message_id,action,target,result,created_at)
-               VALUES(?,?,?,?,?,?,?)""",
-            (str(admin_id), str(chat_id or ""), str(message_id or ""), action, str(target), result, _now()),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+        conn = connect()
+        try:
+            ensure_schema(conn)
+            conn.execute(
+                """INSERT INTO telegram_review_log(admin_id,chat_id,message_id,action,target,result,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (str(admin_id), str(chat_id), str(message_id or ""), action, str(target), str(result)[:200], _now()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("Could not persist review log", exc_info=True)
+
+
+def _actor(admin_id: str) -> str:
+    return f"tg:{admin_id}"
+
+
+INDIVIDUAL_ACTIONS = {
+    # (kind, verb) -> acción de negocio
+    ("pay", "ok"): "approve_payment",
+    ("pay", "no"): "reject_payment",
+    ("photo", "ok"): "approve_photo",
+    ("photo", "no"): "reject_photo",
+    ("report", "suspend"): "suspend_report",
+    ("report", "dismiss"): "dismiss_report",
+    ("ad", "ok"): "approve_ad",
+    ("ad", "no"): "reject_ad",
+    ("ref", "ok"): "approve_referral",
+    ("ref", "no"): "reject_referral",
+}
+
+REASON_REQUIRED = {("pay", "no"), ("photo", "no"), ("ad", "no")}
+
+
+def handle_callback(
+    update: Dict[str, Any],
+    *,
+    connect: Callable,
+    verify_payment: Callable,
+    reject_payment: Callable,
+    review_photo: Callable,
+    resolve_report: Callable,
+    ad_action: Callable,
+    resolve_referral: Callable,
+    audit: Optional[Callable] = None,
+    admins: Optional[set] = None,
+) -> Dict[str, Any]:
+    """Procesa un callback_query del grupo. Devuelve un resumen para el webhook."""
+    callback = (update or {}).get("callback_query") or {}
+    callback_id = str(callback.get("id") or "")
+    sender = (callback.get("from") or {}).get("id")
+    admin_id = str(sender) if sender is not None else ""
+    data = str(callback.get("data") or "")
+    message = callback.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+
+    if not data.startswith(CALLBACK_PREFIX + ":"):
+        return {"handled": False, "action": "unsupported_callback"}
+    if not admin_id:
+        return {"handled": False, "action": "missing_sender"}
+
+    allowed = admins if admins is not None else admin_ids()
+    if admin_id not in allowed:
+        _answer_callback(callback_id, "No tienes permiso para esta acción.", True)
+        if audit:
+            audit(_actor(admin_id), "review_callback_denied", data[:80], {"chat_id": str(chat_id)})
+        _log(connect, admin_id, chat_id, message_id, "denied", data[:120], "not_admin")
+        return {"handled": True, "action": "denied"}
+
+    parts = data.split(":")
+    if len(parts) != 4:
+        _answer_callback(callback_id, "Acción no válida.", True)
+        return {"handled": True, "action": "malformed"}
+    _, kind, verb, target = parts
+    action = INDIVIDUAL_ACTIONS.get((kind, verb))
+    if not action:
+        _answer_callback(callback_id, "Acción no válida.", True)
+        return {"handled": True, "action": "malformed"}
+
+    if (kind, verb) in REASON_REQUIRED:
+        _set_pending_reason(connect, admin_id, chat_id, f"{kind}:{verb}", target)
+        prompt = {
+            "pay": "Escribe el motivo del rechazo del pago (se le mostrará al usuario).",
+            "photo": "Escribe el motivo del rechazo de la foto (se le mostrará al usuario).",
+            "ad": "Escribe el motivo del rechazo del anuncio (lo verá el negocio).",
+        }[kind]
+        _send(prompt, chat_id=chat_id)
+        _answer_callback(callback_id, "Escribe el motivo en el chat.")
+        return {"handled": True, "action": "reason_requested", "target": target}
+
+    return execute_action(
+        connect=connect, admin_id=admin_id, chat_id=chat_id, message_id=message_id,
+        action=action, target=target, reason="", callback_id=callback_id, audit=audit,
+        verify_payment=verify_payment, reject_payment=reject_payment, review_photo=review_photo,
+        resolve_report=resolve_report, ad_action=ad_action, resolve_referral=resolve_referral,
+    )
+
+
+def execute_action(
+    *,
+    connect: Callable,
+    admin_id: str,
+    chat_id: Any,
+    message_id: Any,
+    action: str,
+    target: str,
+    reason: str,
+    callback_id: str = "",
+    audit: Optional[Callable] = None,
+    verify_payment: Callable,
+    reject_payment: Callable,
+    review_photo: Callable,
+    resolve_report: Callable,
+    ad_action: Callable,
+    resolve_referral: Callable,
+) -> Dict[str, Any]:
+    """Ejecuta la acción reutilizando las funciones del panel administrativo."""
+    actor = _actor(admin_id)
+    try:
+        if action == "approve_payment":
+            result: Dict[str, Any] = verify_payment(target, actor)
+        elif action == "reject_payment":
+            result = reject_payment(target, actor, reason)
+        elif action == "approve_photo":
+            result = review_photo(target, True, "", actor)
+        elif action == "reject_photo":
+            result = review_photo(target, False, reason, actor)
+        elif action in {"suspend_report", "dismiss_report"}:
+            result = resolve_report(target, "suspend" if action == "suspend_report" else "dismiss", actor)
+        elif action in {"approve_ad", "reject_ad"}:
+            result = ad_action(target, "approve" if action == "approve_ad" else "reject", reason, actor)
+        elif action in {"approve_referral", "reject_referral"}:
+            result = resolve_referral(target, action == "approve_referral", reason, actor)
+        else:
+            raise ValueError("Acción no soportada")
+    except Exception as exc:
+        detail = getattr(exc, "detail", None) or str(exc) or "No se pudo ejecutar la acción"
+        _answer_callback(callback_id, str(detail)[:190], True)
+        _log(connect, admin_id, chat_id, message_id, action, target, f"error:{detail}")
+        return {"handled": True, "action": action, "ok": False, "error": str(detail)[:200]}
+
+    _answer_callback(callback_id, "Hecho.")
+    _clear_buttons(chat_id, message_id)
+    _log(connect, admin_id, chat_id, message_id, action, target, "ok")
+    if audit:
+        try:
+            audit(actor, action, target, {"path": "telegram_group"})
+        except Exception:
+            logger.debug("audit from review group failed", exc_info=True)
+
+    # Confirmación en el grupo para fotos (motivo + si se avisó al usuario)
+    if action in {"approve_photo", "reject_photo"}:
+        uid = ""
+        notified = False
+        if isinstance(result, dict):
+            uid = str(result.get("user_id") or "")
+            notified = bool(uid)
+        if action == "approve_photo":
+            note = (
+                f"✅ <b>Foto #{_esc(target)} aprobada</b>\n"
+                f"Usuario: <code>{_esc(uid or '—')}</code>\n"
+            )
+            note += "📩 Aviso enviado al usuario." if notified else "⚠️ No se pudo identificar al usuario para avisar."
+        else:
+            motivo = (reason or "").strip() or "—"
+            note = (
+                f"❌ <b>Foto #{_esc(target)} rechazada</b>\n"
+                f"Usuario: <code>{_esc(uid or '—')}</code>\n"
+                f"Motivo: {_esc(motivo)}\n"
+            )
+            note += "📩 Motivo enviado al usuario." if notified else "⚠️ No se pudo enviar el aviso al usuario."
+        try:
+            _send(note, chat_id=chat_id)
+        except Exception:
+            logger.debug("photo decision notice failed", exc_info=True)
+
+    return {"handled": True, "action": action, "ok": True, "result": result}
+
+
+def pending_action_for(connect: Callable, admin_id: str, chat_id: Any, text: str) -> Optional[Dict[str, Any]]:
+    """Si el admin tenía un rechazo a medias, interpreta el texto como el motivo."""
+    pending = pending_reason(connect, admin_id, chat_id)
+    if not pending:
+        return None
+    reason = " ".join((text or "").split())[:300]
+    if not reason:
+        return None
+    clear_pending_reason(connect, admin_id, chat_id)
+    kind_verb = str(pending.get("action") or "")
+    kind, _, verb = kind_verb.partition(":")
+    action = INDIVIDUAL_ACTIONS.get((kind, verb))
+    if not action:
+        return None
+    return {"action": action, "target": str(pending.get("target") or ""), "reason": reason}
