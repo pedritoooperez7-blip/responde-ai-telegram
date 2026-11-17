@@ -2,14 +2,14 @@
 body{background:#f7f5fb}.admin-wrap{max-width:1000px;margin:auto;padding:22px 16px 50px}.admin-head{display:flex;align-items:center;gap:12px;margin-bottom:20px}.admin-head .brand-mark{margin:0;flex:none}.admin-head h1{font-size:22px;margin:0}.admin-head p{margin:4px 0;color:#777184;font-size:12px}.admin-login,.admin-panel,.admin-card{background:white;border-radius:20px;padding:18px;box-shadow:0 8px 25px #2820440d;margin:12px 0}.admin-login{max-width:460px;margin:28px auto}.admin-input{box-sizing:border-box;margin:6px 0 12px}.admin-btn{background:#4d35ff;color:white;padding:11px 14px;border-radius:12px;font-weight:800;border:0;cursor:pointer}.admin-btn.secondary{background:#f0edff;color:#4d35ff}.admin-btn.danger{background:#fff0f2;color:#b4233c}.admin-nav{display:flex;gap:8px;overflow:auto;margin:12px 0}.admin-nav button{white-space:nowrap;background:white;border:1px solid #e7e2f1;padding:10px 13px;border-radius:12px;font-weight:800}.admin-nav button.active{background:#4d35ff;color:white}.admin-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}.admin-stat{background:#f8f7fc;border-radius:15px;padding:14px}.admin-stat b{font-size:23px;display:block}.admin-stat span{font-size:11px;color:#777184}.admin-stat.warn{background:#fff8e6}.admin-stat.warn b{color:#92570a}.admin-stat.good{background:#edfdf4}.admin-stat.good b{color:#166534}.admin-stat.bad{background:#fff0f2}.admin-stat.bad b{color:#b4233c}.admin-table{width:100%;border-collapse:collapse;font-size:12px}.admin-table th,.admin-table td{text-align:left;padding:10px 7px;border-bottom:1px solid #eeeaf5;vertical-align:top;overflow-wrap:anywhere}.admin-table-wrap{overflow:auto}.admin-row{padding:12px 0;border-bottom:1px solid #eeeaf5}.admin-row:last-child{border:0}.admin-small{font-size:11px;color:#777184}.admin-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.admin-actions .admin-btn{font-size:11px;padding:8px 10px}.hidden{display:none!important}.admin-error{color:#b4233c;font-size:12px;min-height:18px}@media(max-width:500px){.admin-wrap{padding:15px 12px}.admin-table{min-width:650px}}
 </style></head><body><div class="admin-wrap"><header class="admin-head"><div class="brand-mark">LC</div><div><h1>LiggaCuba · Administración</h1><p>Gestión segura de usuarios, Premium y pagos</p><a href="/" style="font-size:12px">← Volver a LiggaCuba</a></div></header>
 <section id="loginBox" class="admin-login"><h2>Acceso de administrador</h2><p class="admin-small">Usa ADMIN_KEY de Railway para entrar por primera vez o las credenciales de un administrador creado.</p><label>Usuario (administradores secundarios)</label><input id="loginUser" class="admin-input" autocomplete="username" placeholder="Usuario"><label>Contraseña</label><input id="loginPass" class="admin-input" type="password" autocomplete="current-password" placeholder="Contraseña"><label>ADMIN_KEY principal (dejar vacío si usas usuario)</label><input id="masterKey" class="admin-input" type="password" autocomplete="current-password" placeholder="Clave principal de Railway"><button id="loginBtn" class="admin-btn">Entrar</button><p id="loginError" class="admin-error"></p></section>
-<section id="panel" class="hidden"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px"><div><b id="whoami">Administrador</b><div class="admin-small">Las acciones importantes quedan registradas.</div></div><button id="logout" class="admin-btn secondary">Cerrar sesión</button></div><nav class="admin-nav"><button data-tab="dashboard" class="active">Dashboard</button><button data-tab="users">Usuarios / Premium</button><button data-tab="payments">Pagos</button><button data-tab="admins">Administradores</button><button data-tab="audit">Historial</button><button data-tab="ai-monitor">Monitor de IA</button><button data-tab="providers">Proveedores IA</button><button data-tab="dating">Citas</button><button data-tab="ads">Anuncios</button><button data-tab="pricing">Precios</button><button data-tab="referrals">Referidos</button></nav><div id="content"></div></section></div>
+<section id="panel" class="hidden"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px"><div><b id="whoami">Administrador</b><div class="admin-small">Las acciones importantes quedan registradas.</div></div><button id="logout" class="admin-btn secondary">Cerrar sesión</button></div><nav class="admin-nav"><button data-tab="dashboard" class="active">Dashboard</button><button data-tab="users">Usuarios / Premium</button><button data-tab="payments">Pagos</button><button data-tab="admins">Administradores</button><button data-tab="audit">Historial</button><button data-tab="ai-monitor">Monitor de IA</button><button data-tab="providers">Proveedores IA</button><button data-tab="dating">Citas</button><button data-tab="bot-chats">💬 Chats de Bots</button><button data-tab="ads">Anuncios</button><button data-tab="pricing">Precios</button><button data-tab="referrals">Referidos</button></nav><div id="content"></div></section></div>
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];let token=sessionStorage.getItem('lc_admin_token')||'';if(!token&&localStorage.getItem('lc_admin_token')){token=localStorage.getItem('lc_admin_token');sessionStorage.setItem('lc_admin_token',token)}localStorage.removeItem('lc_admin_token');let perms=[];const fmtCubaDate=v=>{if(!v)return '—';const d=new Date(v);return Number.isNaN(d.getTime())?String(v):new Intl.DateTimeFormat('es-CU',{timeZone:'America/Havana',dateStyle:'short',timeStyle:'medium'}).format(d)};const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(path,opts={}){const headers={'Content-Type':'application/json',...(opts.headers||{})};if(token)headers.Authorization='Bearer '+token;const r=await fetch(path,{...opts,headers});const d=await r.json().catch(()=>({detail:'Respuesta inválida'}));if(!r.ok)throw Error(d.detail||'Error');return d}
 async function login(){const err=$('#loginError');err.textContent='';try{const master=$('#masterKey').value.trim();const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({username:$('#loginUser').value.trim(),password:$('#loginPass').value,master_key:master})});token=d.token;perms=d.permissions||[];sessionStorage.setItem('lc_admin_token',token);syncAdminNav();$('#masterKey').value='';sessionStorage.removeItem('lc_master_key');$('#loginBox').classList.add('hidden');$('#panel').classList.remove('hidden');$('#whoami').textContent=d.is_owner?'Administrador principal':d.username;await showTab('dashboard')}catch(e){err.textContent=e.message}}
 function can(p){return perms.includes(p)}
-function syncAdminNav(){$$('.admin-nav button').forEach(b=>{const need={users:'users',payments:'payments',admins:'admins',audit:'audit',dashboard:'stats','ai-monitor':'ai_analytics',providers:'settings',dating:'dating',ads:'ads',pricing:'settings',referrals:'users'}[b.dataset.tab];b.classList.toggle('hidden',!!need&&!can(need))})}
-async function showTab(tab){$$('.admin-nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));const c=$('#content');c.innerHTML='<div class="admin-card">Cargando…</div>';try{if(tab==='dashboard'){const d=await api('/api/admin/stats');
+function syncAdminNav(){$$('.admin-nav button').forEach(b=>{const need={users:'users',payments:'payments',admins:'admins',audit:'audit',dashboard:'stats','ai-monitor':'ai_analytics',providers:'settings',dating:'dating','bot-chats':'dating',ads:'ads',pricing:'settings',referrals:'users'}[b.dataset.tab];b.classList.toggle('hidden',!!need&&!can(need))})}
+async function showTab(tab){if(typeof window._bcTeardown==='function'){try{window._bcTeardown()}catch(e){}} $$('.admin-nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));const c=$('#content');c.innerHTML='<div class="admin-card">Cargando…</div>';try{if(tab==='dashboard'){const d=await api('/api/admin/stats');
 const sparkline=(data,color='#4d35ff')=>{if(!data||!data.length)return'<span class="admin-small">Sin datos aún</span>';const max=Math.max(...data.map(x=>x.count),1);const w=280,h=60,pad=4;const pts=data.map((x,i)=>`${pad+i*(w-pad*2)/(data.length-1||1)},${h-pad-(x.count/max)*(h-pad*2)}`).join(' ');const lastVal=data[data.length-1]?.count??0;const firstVal=data[0]?.count??0;const trend=lastVal>=firstVal?'↑':'↓';const trendColor=lastVal>=firstVal?'#22c55e':'#ef4444';return`<div style="position:relative"><svg viewBox="0 0 ${w} ${h}" style="width:100%;height:60px"><polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/><circle cx="${pad+(data.length-1)*(w-pad*2)/(data.length-1||1)}" cy="${h-pad-(lastVal/max)*(h-pad*2)}" r="4" fill="${color}"/></svg><div style="display:flex;justify-content:space-between;font-size:11px;color:#888;margin-top:2px"><span>${data[0]?.day?.slice(5)||''}</span><span style="color:${trendColor};font-weight:800">${trend} ${lastVal}</span><span>${data[data.length-1]?.day?.slice(5)||''}</span></div></div>`};
 const convRate=d.conversion?.rate_pct??'—';const convLast7=d.conversion?.last_7d??0;const retRate=d.retention_7d?.rate_pct??'—';const retCohort=d.retention_7d?.cohort_size??0;
 c.innerHTML=`<h2>Dashboard</h2>
@@ -45,6 +45,150 @@ else if(tab==='users'){const d=await api('/api/admin/users');c.innerHTML=`<h2>Us
 else if(tab==='payments'){const d=await api('/api/admin/payments');c.innerHTML=`<h2>Pagos recientes</h2><div class="admin-table-wrap"><table class="admin-table"><thead><tr><th>Operación</th><th>Usuario</th><th>Método</th><th>Importe</th><th>Estado</th><th>Comprobante / archivo</th><th>Fecha</th><th>Acción</th></tr></thead><tbody>${d.items.map(p=>`<tr><td>${esc(p.operation_id)}</td><td>${esc(p.user_id)}</td><td>${esc(p.payment_method||'—')}</td><td>${esc(p.amount)}</td><td>${esc(p.status)}</td><td>${p.archive_status==='sent'?`Archivado · chat ${esc(p.archive_chat_id||'—')} · mensaje ${esc(p.archive_message_id||'—')}`:p.archive_status==='queued'||p.archive_status==='retrying'?`Pendiente de archivo · intentos ${esc(p.archive_attempts||0)}${p.archive_last_error?`<br>Error: ${esc(p.archive_last_error)}`:''}`:`${p.proof_text?'Texto disponible':''}${p.has_proof_image?' · Imagen disponible':''}${!p.proof_text&&!p.has_proof_image?'Sin copia local':''}`}${p.proof_text||p.has_proof_image?`<br><button class="admin-btn secondary" data-proof="${esc(p.operation_id)}">Ver comprobante</button>`:''}</td><td>${esc(fmtCubaDate(p.created_at))}</td><td>${can('payments')&&['pending','proof_submitted'].includes(p.status)?`<button class="admin-btn" data-verify="${esc(p.operation_id)}">Verificar</button><button class="admin-btn danger" data-reject="${esc(p.operation_id)}">Rechazar</button>`:'—'}</td></tr>`).join('')}</tbody></table></div><p class="admin-small">Verificar un pago concede el Premium del plan asociado. Confirma primero que el dinero fue recibido.</p>`;$$('[data-verify]').forEach(b=>b.onclick=async()=>{if(!confirm('¿Confirmaste el ingreso real del dinero y deseas activar Premium?'))return;try{await api('/api/admin/payments/verify',{method:'POST',body:JSON.stringify({operation_id:b.dataset.verify,user_id:''})});alert('Pago verificado');showTab('payments')}catch(e){alert(e.message)}});$$('[data-reject]').forEach(b=>b.onclick=async()=>{const reason=prompt('Motivo del rechazo (opcional):')??null;if(reason===null)return;try{await api('/api/admin/payments/reject',{method:'POST',body:JSON.stringify({operation_id:b.dataset.reject,action:'reject',reason})});showTab('payments')}catch(e){alert(e.message)}});$$('[data-proof]').forEach(b=>b.onclick=async()=>{try{const proof=await api('/api/admin/payments/'+encodeURIComponent(b.dataset.proof)+'/proof');const modal=document.createElement('div');modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px';const body=document.createElement('div');body.style.cssText='background:#fff;color:#222;border-radius:16px;padding:18px;max-width:700px;width:100%;max-height:90vh;overflow:auto';const close=document.createElement('button');close.className='admin-btn secondary';close.textContent='Cerrar';close.onclick=()=>modal.remove();body.appendChild(close);if(proof.proof_text){const text=document.createElement('pre');text.style.cssText='white-space:pre-wrap;overflow-wrap:anywhere;margin:14px 0';text.textContent=proof.proof_text;body.appendChild(text)}if(proof.proof_image){const img=document.createElement('img');img.src=proof.proof_image;img.alt='Comprobante de pago';img.style.cssText='max-width:100%;height:auto;border-radius:10px';body.appendChild(img)}modal.appendChild(body);modal.onclick=e=>{if(e.target===modal)modal.remove()};document.body.appendChild(modal)}catch(e){alert(e.message||'No se pudo cargar el comprobante')}})}
 else if(tab==='admins'){if(!can('admins')){c.innerHTML='<div class="admin-card">No tienes permiso para administrar cuentas.</div>';return}const d=await api('/api/admin/admins');c.innerHTML=`<h2>Administradores</h2><div class="admin-card"><h3>Crear administrador</h3><label>Usuario</label><input id="newUser" class="admin-input" placeholder="usuario"><label>Contraseña (mínimo 10 caracteres)</label><input id="newPass" class="admin-input" type="password"><p><label><input type="checkbox" value="users" class="perm" checked> Usuarios</label> <label><input type="checkbox" value="premium" class="perm" checked> Premium</label> <label><input type="checkbox" value="payments" class="perm"> Pagos</label> <label><input type="checkbox" value="stats" class="perm"> Estadísticas</label> <label><input type="checkbox" value="audit" class="perm"> Historial</label> <label><input type="checkbox" value="ai_analytics" class="perm"> Monitor de IA</label> <label><input type="checkbox" value="dating" class="perm"> Citas (moderación)</label> <label><input type="checkbox" value="ads" class="perm"> Anuncios</label></p><button id="createAdmin" class="admin-btn">Crear administrador</button></div><h3>Administradores existentes</h3>${d.items.map(a=>`<div class="admin-row"><b>${esc(a.username)}</b><div class="admin-small">Permisos: ${esc(a.permissions.join(', '))} · ${a.is_active?'Activo':'Desactivado'}</div>${a.is_active?`<button class="admin-btn danger" data-disable="${esc(a.username)}">Desactivar</button>`:''}</div>`).join('')}`;$('#createAdmin').onclick=async()=>{try{const permissions=$$('.perm:checked').map(x=>x.value);await api('/api/admin/admins',{method:'POST',body:JSON.stringify({username:$('#newUser').value,password:$('#newPass').value,permissions})});alert('Administrador creado');showTab('admins')}catch(e){alert(e.message)}};$$('[data-disable]').forEach(b=>b.onclick=async()=>{if(!confirm('¿Desactivar este administrador?'))return;try{await api('/api/admin/admins/status',{method:'POST',body:JSON.stringify({username:b.dataset.disable,is_active:false})});showTab('admins')}catch(e){alert(e.message)}})}
 else if(tab==='dating'){if(!can('dating')){c.innerHTML='<div class="admin-card">No tienes permiso para moderar Citas.</div>';return}const d=await api('/api/admin/dating/overview');const s=d.stats;c.innerHTML=`<h2>Citas · moderación</h2><div class="admin-grid">${[['Perfiles',s.profiles],['Activos',s.active_profiles],['Fotos por revisar',s.pending_photos],['Reportes abiertos',s.open_reports],['Matches',s.matches]].map(x=>`<div class="admin-stat"><b>${esc(x[1])}</b><span>${x[0]}</span></div>`).join('')}</div><h3>Fotos pendientes</h3>${d.photos.length?d.photos.map(p=>`<div class="admin-card"><img src="${esc(p.url)}" alt="" style="max-width:220px;max-height:280px;border-radius:12px;display:block;margin-bottom:8px"><div class="admin-small">${esc(p.display_name)} · usuario ${esc(p.user_id)} · ${fmtCubaDate(p.created_at)}</div><button class="admin-btn" data-photo="${esc(p.id)}" data-act="approve">Aprobar</button> <button class="admin-btn secondary" data-photo="${esc(p.id)}" data-act="reject">Rechazar</button></div>`).join(''):'<div class="admin-card">No hay fotos pendientes.</div>'}<h3>Reportes abiertos</h3>${d.reports.length?d.reports.map(r=>`<div class="admin-card"><b>${esc(r.display_name||'Perfil eliminado')}</b> <span class="admin-small">(${esc(r.profile_status||'—')})</span><div class="admin-small">Motivo: ${esc(r.reason)} · reportó ${esc(r.reporter_id)} · ${fmtCubaDate(r.created_at)}</div>${r.details?`<p>${esc(r.details)}</p>`:''}<button class="admin-btn" data-report="${esc(r.id)}" data-act="suspend">Suspender perfil</button> <button class="admin-btn secondary" data-report="${esc(r.id)}" data-act="dismiss">Descartar</button></div>`).join(''):'<div class="admin-card">No hay reportes abiertos.</div>'}`;$$('[data-photo]').forEach(b=>b.onclick=async()=>{let reason='';if(b.dataset.act==='reject'){reason=prompt('Motivo del rechazo (se muestra al usuario):','Foto no permitida')||'';if(!reason)return}try{await api('/api/admin/dating/photos/'+encodeURIComponent(b.dataset.photo)+'/review',{method:'POST',body:JSON.stringify({action:b.dataset.act,reason})});showTab('dating')}catch(e){alert(e.message)}});$$('[data-report]').forEach(b=>b.onclick=async()=>{if(b.dataset.act==='suspend'&&!confirm('¿Suspender este perfil de Citas?'))return;try{await api('/api/admin/dating/reports/'+encodeURIComponent(b.dataset.report)+'/resolve',{method:'POST',body:JSON.stringify({action:b.dataset.act})});showTab('dating')}catch(e){alert(e.message)}})}
+else if(tab==='bot-chats'){
+if(!can('dating')){c.innerHTML='<div class="admin-card">No tienes permiso para ver los chats de bots.</div>';return}
+// ── Estado ──────────────────────────────────────────────────────────
+let _bcConvs=[],_bcSelMatch=null,_bcLastId=0,_bcPoll=null,_bcSending=false;
+function _bcEsc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function _bcTime(iso){if(!iso)return'';const d=new Date(iso.endsWith('Z')?iso:iso+'Z');return d.toLocaleTimeString('es-CU',{hour:'2-digit',minute:'2-digit'})}
+function _bcDate(iso){if(!iso)return'';const d=new Date(iso.endsWith('Z')?iso:iso+'Z');return d.toLocaleDateString('es-CU',{day:'2-digit',month:'short'})}
+// ── HTML base ────────────────────────────────────────────────────────
+c.innerHTML=`
+<style>
+.bc-conv-card{padding:10px 12px;border-radius:6px;cursor:pointer;border:1px solid transparent;margin-bottom:4px;transition:background .15s;position:relative}
+.bc-conv-card:hover{background:#eef2ff}.bc-conv-card.active{background:#e0e7ff;border-color:#a5b4fc}
+.bc-conv-card .bc-names{font-size:13px;font-weight:600;color:#333}
+.bc-conv-card .bc-preview{font-size:12px;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+.bc-conv-card .bc-badge{position:absolute;top:8px;right:10px;background:#ef4444;color:#fff;font-size:11px;font-weight:700;border-radius:999px;padding:2px 7px}
+.bc-msg{display:flex;margin-bottom:2px}.bc-msg.from-bot{justify-content:flex-end}.bc-msg.from-user{justify-content:flex-start}.bc-msg.from-system{justify-content:center}
+.bc-bubble{max-width:68%;padding:8px 12px;border-radius:14px;font-size:14px;line-height:1.45;word-break:break-word;white-space:pre-wrap}
+.from-bot .bc-bubble{background:#818cf8;color:#fff;border-bottom-right-radius:4px}
+.from-user .bc-bubble{background:#e5e7eb;color:#111;border-bottom-left-radius:4px}
+.from-system .bc-bubble{background:none;color:#9ca3af;font-size:12px;font-style:italic;text-align:center}
+.bc-meta{font-size:11px;color:rgba(255,255,255,.65);margin-top:3px;display:block;text-align:right}
+.from-user .bc-meta{color:#9ca3af;text-align:left}
+</style>
+<h2>💬 Chats de Bots</h2>
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px">
+  <label style="font-weight:600;white-space:nowrap">Filtrar por bot:</label>
+  <select id="bc-bot-filter" style="min-width:160px;padding:8px;border-radius:8px;border:1px solid #d9d4f0">
+    <option value="">— Todos —</option>
+  </select>
+  <button class="admin-btn secondary" id="bc-refresh">🔄 Actualizar</button>
+  <span id="bc-count" class="admin-small"></span>
+</div>
+<div style="display:flex;gap:14px;height:70vh;min-height:380px">
+  <div id="bc-list" style="width:270px;min-width:180px;overflow-y:auto;border:1px solid #ddd;border-radius:8px;background:#fafafa">
+    <div id="bc-list-inner" style="padding:8px"><p style="color:#aaa;padding:14px;text-align:center">Cargando…</p></div>
+  </div>
+  <div style="flex:1;display:flex;flex-direction:column;border:1px solid #ddd;border-radius:8px;overflow:hidden;background:#fff">
+    <div id="bc-header" style="padding:12px 16px;border-bottom:1px solid #eee;background:#f5f5f5;min-height:50px;display:flex;align-items:center">
+      <span style="color:#aaa;font-style:italic">Selecciona una conversación</span>
+    </div>
+    <div id="bc-msgs" style="flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:6px;background:#f9f9f9"></div>
+    <div id="bc-form" style="padding:10px;border-top:1px solid #eee;background:#fff;display:flex;gap:8px;align-items:flex-end">
+      <textarea id="bc-body" rows="2" placeholder="Escribe la respuesta del bot…"
+        style="flex:1;resize:vertical;padding:8px;border:1px solid #ccc;border-radius:6px;font-size:14px"
+        onkeydown="if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();document.getElementById('bc-send').click()}"></textarea>
+      <button id="bc-send" class="admin-btn" style="white-space:nowrap">Enviar como bot</button>
+    </div>
+  </div>
+</div>`;
+// ── Cargar filtro de bots ────────────────────────────────────────────
+api('/api/admin/dating/bots?limit=200').then(data=>{
+  const sel=document.getElementById('bc-bot-filter');
+  (data.bots||[]).forEach(b=>{const o=document.createElement('option');o.value=b.user_id;o.textContent=_bcEsc(b.display_name)+' ('+_bcEsc(b.gender)+', '+_bcEsc(b.province)+')';sel.appendChild(o)});
+}).catch(()=>{});
+// ── Cargar conversaciones ────────────────────────────────────────────
+async function _bcLoadConvs(){
+  const bot=document.getElementById('bc-bot-filter')?.value||'';
+  let url='/api/admin/dating/bots/conversations?limit=50';
+  if(bot)url+='&bot_user_id='+encodeURIComponent(bot);
+  document.getElementById('bc-list-inner').innerHTML='<p style="color:#aaa;padding:14px;text-align:center">Cargando…</p>';
+  try{
+    const data=await api(url);
+    _bcConvs=data.conversations||[];
+    const cnt=document.getElementById('bc-count');
+    if(cnt)cnt.textContent=_bcConvs.length+' de '+(data.total||0)+' conversaciones';
+    _bcRenderList();
+  }catch(e){document.getElementById('bc-list-inner').innerHTML='<p style="color:red;padding:10px">Error: '+_bcEsc(e.message)+'</p>'}
+}
+function _bcRenderList(){
+  const wrap=document.getElementById('bc-list-inner');
+  if(!_bcConvs.length){wrap.innerHTML='<p style="color:#aaa;padding:14px;text-align:center">No hay conversaciones con bots.</p>';return}
+  wrap.innerHTML='';
+  _bcConvs.forEach(conv=>{
+    const div=document.createElement('div');
+    div.className='bc-conv-card'+(conv.match_id===_bcSelMatch?' active':'');
+    div.dataset.matchId=conv.match_id;
+    const preview=conv.last_message?(conv.last_message.sender_id===conv.bot_id?'🤖 ':'👤 ')+conv.last_message.body.slice(0,45):'(sin mensajes)';
+    div.innerHTML='<div class="bc-names">🤖 '+_bcEsc(conv.bot_name)+' ↔ 👤 '+_bcEsc(conv.real_name)+'</div>'
+      +'<div class="bc-preview">'+_bcEsc(preview)+'</div>'
+      +'<div style="font-size:11px;color:#aaa;margin-top:2px">'+_bcDate(conv.matched_at)+'</div>'
+      +(conv.unread_from_user>0?'<span class="bc-badge">'+conv.unread_from_user+'</span>':'');
+    div.onclick=()=>_bcOpen(conv);
+    wrap.appendChild(div);
+  });
+}
+// ── Abrir conversación ───────────────────────────────────────────────
+async function _bcOpen(conv){
+  if(_bcPoll){clearInterval(_bcPoll);_bcPoll=null}
+  _bcSelMatch=conv.match_id;_bcLastId=0;
+  document.querySelectorAll('.bc-conv-card').forEach(el=>el.classList.toggle('active',parseInt(el.dataset.matchId)===conv.match_id));
+  const hdr=document.getElementById('bc-header');
+  if(hdr)hdr.innerHTML='<b>🤖 '+_bcEsc(conv.bot_name)+'</b> <span style="color:#9ca3af">responde a</span> <b>👤 '+_bcEsc(conv.real_name)+'</b> <span style="color:#9ca3af;font-size:12px">(match #'+conv.match_id+')</span>';
+  const msgs=document.getElementById('bc-msgs');if(msgs)msgs.innerHTML='';
+  const body=document.getElementById('bc-body');if(body){body.value='';body.disabled=false}
+  const send=document.getElementById('bc-send');if(send)send.disabled=false;
+  await _bcPoll2(conv);
+  _bcPoll=setInterval(()=>_bcPoll2(conv),5000);
+}
+// ── Polling ──────────────────────────────────────────────────────────
+async function _bcPoll2(conv){
+  if(!_bcSelMatch)return;
+  try{
+    const data=await api('/api/admin/dating/bots/conversations/'+_bcSelMatch+'/messages?after_id='+_bcLastId+'&limit=60');
+    if(data.messages&&data.messages.length){_bcAppend(data.messages,conv);_bcLastId=data.last_id}
+    // Modo solo lectura si el match está cerrado
+    const isActive=!data.match_status||data.match_status==='active';
+    const body=document.getElementById('bc-body');const send=document.getElementById('bc-send');
+    if(body)body.disabled=!isActive;if(send){send.disabled=!isActive;send.textContent=isActive?'Enviar como bot':'Match cerrado'}
+  }catch(_){}
+}
+function _bcAppend(msgs,conv){
+  const area=document.getElementById('bc-msgs');if(!area)return;
+  const atBottom=area.scrollHeight-area.scrollTop-area.clientHeight<60;
+  msgs.forEach(m=>{
+    if(area.querySelector('[data-msg-id="'+m.id+'"]'))return; // deduplicar
+    const isBot=m.sender_id===conv.bot_id,isSystem=m.is_system;
+    const cls=isSystem?'from-system':(isBot?'from-bot':'from-user');
+    const row=document.createElement('div');row.className='bc-msg '+cls;row.dataset.msgId=m.id;
+    const who=isSystem?'':(isBot?'<b>'+_bcEsc(conv.bot_name)+'</b> · ':'<b>'+_bcEsc(conv.real_name)+'</b> · ');
+    row.innerHTML='<div class="bc-bubble">'+_bcEsc(m.body)+'<span class="bc-meta">'+who+_bcTime(m.created_at)+'</span></div>';
+    area.appendChild(row);
+  });
+  if(atBottom)area.scrollTop=area.scrollHeight;
+}
+// ── Enviar respuesta ─────────────────────────────────────────────────
+document.getElementById('bc-send').onclick=async function(){
+  if(!_bcSelMatch||_bcSending)return;
+  const ta=document.getElementById('bc-body');const body=(ta?.value||'').trim();
+  if(!body){ta?.focus();return}
+  _bcSending=true;this.disabled=true;this.textContent='Enviando…';
+  try{
+    await api('/api/admin/dating/bots/reply',{method:'POST',body:JSON.stringify({match_id:_bcSelMatch,body})});
+    if(ta)ta.value='';ta?.focus();
+    const conv=_bcConvs.find(x=>x.match_id===_bcSelMatch);
+    if(conv)await _bcPoll2(conv);
+  }catch(e){alert('Error al enviar: '+_bcEsc(e.message))}
+  finally{_bcSending=false;this.disabled=false;this.textContent='Enviar como bot'}
+};
+document.getElementById('bc-refresh').onclick=_bcLoadConvs;
+document.getElementById('bc-bot-filter').onchange=_bcLoadConvs;
+// ── Limpiar al salir ─────────────────────────────────────────────────
+window._bcTeardown=function(){if(_bcPoll){clearInterval(_bcPoll);_bcPoll=null}};
+_bcLoadConvs();
+}
 else if(tab==='ai-monitor'){
 if(!can('ai_analytics')){c.innerHTML='<div class="admin-card">No tienes permiso para consultar el monitor de IA.</div>';return}
 const d=await api('/api/admin/ai-monitor'),s=d.summary;

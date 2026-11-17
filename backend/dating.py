@@ -12,6 +12,9 @@ Decisiones de diseño
   que el perfil aparezca en el feed de otras personas.
 * Los perfiles se identifican hacia fuera con un ``public_id`` opaco; el ID de
   Telegram nunca viaja a otros usuarios.
+* [Fase 1-4] Los bots de citas (is_bot=1) tienen auto-like y no requieren
+  cuenta Telegram real. El admin los gestiona desde el panel y puede responder
+  desde el grupo de control de Telegram.
 
 La lógica de negocio (funciones que reciben una conexión sqlite3) no depende de
 FastAPI, así que se puede probar sin levantar el servidor. ``build_router`` crea
@@ -60,6 +63,10 @@ MAX_MINOR_REPORTS_PER_DAY = 3
 FREE_MSG_LIMIT = int(os.getenv("DATING_FREE_MSG_LIMIT", "8"))
 MSG_RATE_PER_MINUTE = int(os.getenv("DATING_MSG_RATE_PER_MINUTE", "10"))
 
+# ── Bots — control de proporción en el feed ───────────────────────────────────
+# Máximo bots por página de feed. 0 = ocultar bots del feed.
+BOT_FEED_MAX = int(os.getenv("DATING_BOTS_PER_FEED", "3"))
+
 GENDERS = ("hombre", "mujer", "otro")
 LOOKING_FOR = ("hombres", "mujeres", "todos")
 LOOKING_TO_GENDER = {"hombres": "hombre", "mujeres": "mujer"}
@@ -87,7 +94,9 @@ CREATE TABLE IF NOT EXISTS dating_profiles(
   visible INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'active',
   accepted_terms_at TEXT NOT NULL,
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  is_bot INTEGER NOT NULL DEFAULT 0,
+  bot_notes TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS dating_photos(
   id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, filename TEXT NOT NULL,
@@ -106,6 +115,7 @@ CREATE TABLE IF NOT EXISTS dating_matches(
   status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, ended_at TEXT,
   UNIQUE(user_a,user_b)
 );
+CREATE INDEX IF NOT EXISTS idx_dating_matches_status ON dating_matches(status,user_a,user_b);
 CREATE TABLE IF NOT EXISTS dating_blocks(
   blocker_id TEXT NOT NULL, blocked_id TEXT NOT NULL, created_at TEXT NOT NULL,
   PRIMARY KEY(blocker_id,blocked_id)
@@ -159,6 +169,15 @@ def init_schema(connection: sqlite3.Connection) -> None:
     if "prefs" not in columns:
         connection.execute("ALTER TABLE dating_profiles ADD COLUMN prefs TEXT NOT NULL DEFAULT '{}'")
         connection.commit()
+    if "is_bot" not in columns:
+        connection.execute("ALTER TABLE dating_profiles ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0")
+        connection.commit()
+    if "bot_notes" not in columns:
+        connection.execute("ALTER TABLE dating_profiles ADD COLUMN bot_notes TEXT NOT NULL DEFAULT ''")
+        connection.commit()
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dating_profiles_bot ON dating_profiles(is_bot,status,visible)"
+    )
     # Share-to-earn: tabla de bonus de likes por compartir estado
     connection.executescript("""
     CREATE TABLE IF NOT EXISTS dating_share_earn(
@@ -467,7 +486,6 @@ def add_photo(c: sqlite3.Connection, uid: str, photos_dir: str, jpeg: bytes, now
         raise DatingError(f"Máximo {MAX_PHOTOS} fotos.", 409, "photo_limit")
     filename = uuid.uuid4().hex + ".jpg"
     # Con R2 configurado la foto va a la nube; si R2 falla o no está configurado, se guarda en disco
-    # (el servidor busca primero en disco y luego en R2, así que ambas ubicaciones conviven).
     if not _storage.put(filename, jpeg):
         os.makedirs(photos_dir, exist_ok=True)
         with open(os.path.join(photos_dir, filename), "wb") as handle:
@@ -621,15 +639,58 @@ def overview(c: sqlite3.Connection, uid: str, secret: str) -> Dict[str, Any]:
 # Feed, swipes y matches
 # ---------------------------------------------------------------------------
 
+def _interleave_bots(candidates: List[Any], bot_max: int) -> List[Any]:
+    """Intercala bots en la lista de candidatos con proporción controlada.
+
+    Reglas:
+    - El primer bot nunca aparece antes de la posición 2 (índice 2).
+    - Luego un bot cada 3 posiciones.
+    - Total de bots en la página ≤ bot_max.
+    - Si bot_max == 0 se devuelven solo los reales.
+    """
+    if bot_max <= 0:
+        return [c for c in candidates if not c[2]["is_bot"]]
+
+    bots  = [c for c in candidates if     c[2]["is_bot"]]
+    reals = [c for c in candidates if not c[2]["is_bot"]]
+
+    bots_to_use = bots[:bot_max]
+    if not bots_to_use:
+        return reals
+
+    result: List[Any] = []
+    bot_idx = 0
+    real_idx = 0
+    pos = 0
+
+    while real_idx < len(reals) or bot_idx < len(bots_to_use):
+        # Insertar bot: a partir de pos 2 y luego cada 3, si quedan bots
+        if (pos >= 2 and (pos - 2) % 3 == 0
+                and bot_idx < len(bots_to_use)
+                and real_idx < len(reals)):  # solo intercalar si hay reales
+            result.append(bots_to_use[bot_idx])
+            bot_idx += 1
+        elif real_idx < len(reals):
+            result.append(reals[real_idx])
+            real_idx += 1
+        else:
+            # Si se agotaron los reales, no poner más bots
+            break
+        pos += 1
+
+    return result
+
+
 def candidate_feed(c: sqlite3.Connection, uid: str, secret: str, limit: int = 10, today: Optional[date] = None) -> List[Dict[str, Any]]:
     uid = str(uid)
     me = require_active_profile(c, uid)
     if not c.execute("SELECT 1 FROM dating_photos WHERE user_id=?", (uid,)).fetchone():
         raise DatingError("Sube al menos una foto para ver perfiles.", 409, "no_photo")
     my_age = age_from(me["birth_date"], today)
+    # Bots aparecen sin foto aprobada (usan fotos opcionales o ninguna en MVP)
     sql = (
         "SELECT p.* FROM dating_profiles p WHERE p.user_id != ? AND p.status='active' AND p.visible=1 "
-        "AND EXISTS(SELECT 1 FROM dating_photos ph WHERE ph.user_id=p.user_id AND ph.status='approved') "
+        "AND (p.is_bot=1 OR EXISTS(SELECT 1 FROM dating_photos ph WHERE ph.user_id=p.user_id AND ph.status='approved')) "
         "AND NOT EXISTS(SELECT 1 FROM dating_swipes s WHERE s.user_id=? AND s.target_id=p.user_id) "
         "AND NOT EXISTS(SELECT 1 FROM dating_blocks b WHERE (b.blocker_id=? AND b.blocked_id=p.user_id) "
         "OR (b.blocker_id=p.user_id AND b.blocked_id=?)) "
@@ -662,7 +723,9 @@ def candidate_feed(c: sqlite3.Connection, uid: str, secret: str, limit: int = 10
         candidates.append((row["province"] == me["province"], score, row))
     # sort estable: la misma provincia primero, luego más afinidad; el azar de SQL desempata
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return [card(c, row, secret, me["province"], my_prefs) for _same, _score, row in candidates[:limit]]
+    # Intercalar bots con proporción controlada
+    mixed = _interleave_bots(candidates, BOT_FEED_MAX)
+    return [card(c, row, secret, me["province"], my_prefs) for _same, _score, row in mixed[:limit]]
 
 
 def likes_today(c: sqlite3.Connection, uid: str, today: Optional[date] = None) -> int:
@@ -710,20 +773,6 @@ def grant_share_earn(c: sqlite3.Connection, uid: str, today: Optional[str] = Non
     return {"granted": True, "already_granted": False, "bonus": SHARE_EARN_BONUS, "earn_date": today}
 
 
-
-
-
-# Override with proper Cuba timezone when available
-try:
-    from zoneinfo import ZoneInfo as _ZI
-    _CUBA_TZ = _ZI("America/Havana")
-    def _cuba_today() -> date:  # noqa: F811
-        from datetime import timezone as _tz
-        return datetime.now(_tz.utc).astimezone(_CUBA_TZ).date()
-except Exception:
-    pass  # already defined above
-
-
 def record_swipe(c: sqlite3.Connection, uid: str, target_public_id: str, action: str, daily_limit: int,
                  is_premium: bool, now: Optional[str] = None) -> Dict[str, Any]:
     uid = str(uid)
@@ -747,6 +796,10 @@ def record_swipe(c: sqlite3.Connection, uid: str, target_public_id: str, action:
         if action == "like" and not is_premium and likes_today(c, uid) >= eff_limit:
             raise DatingError("Llegaste al límite diario de likes. Mejora a Premium para likes ilimitados.", 403, "daily_limit")
         c.execute("INSERT INTO dating_swipes(user_id,target_id,action,created_at) VALUES(?,?,?,?)", (uid, tid, action, now))
+        # Bots hacen like automático de vuelta: todo like a un bot genera match inmediato
+        if action == "like" and target["is_bot"]:
+            if not c.execute("SELECT 1 FROM dating_swipes WHERE user_id=? AND target_id=?", (tid, uid)).fetchone():
+                c.execute("INSERT INTO dating_swipes(user_id,target_id,action,created_at) VALUES(?,?,?,?)", (tid, uid, "like", now))
         matched = False
         match_row_id = None
         if action == "like" and c.execute(
@@ -778,6 +831,7 @@ def record_swipe(c: sqlite3.Connection, uid: str, target_public_id: str, action:
         result["match_public_id"] = target["public_id"]
         if match_row_id is not None:
             result["match_id"] = match_row_id
+        result["_target_is_bot"] = bool(target["is_bot"])
     return result
 
 
@@ -878,7 +932,6 @@ def report_user(c: sqlite3.Connection, uid: str, target_public_id: str, reason: 
     if c.execute("SELECT 1 FROM dating_reports WHERE reporter_id=? AND reported_id=? AND status='open'", (uid, tid)).fetchone():
         return {"success": True, "duplicate": True}
     if reason == "minor":
-        # "Parece menor" oculta el perfil al instante: se limita para que no sirva para ocultar perfiles ajenos en masa.
         since = ((_utcnow() if now is None else datetime.fromisoformat(now)) - timedelta(days=1)).isoformat()
         recent = c.execute("SELECT COUNT(*) FROM dating_reports WHERE reporter_id=? AND reason='minor' AND created_at>=?", (uid, since)).fetchone()[0]
         if recent >= MAX_MINOR_REPORTS_PER_DAY:
@@ -902,10 +955,22 @@ def set_visibility(c: sqlite3.Connection, uid: str, visible: bool) -> None:
 
 
 def delete_dating_data(c: sqlite3.Connection, uid: str, photos_dir: str) -> None:
-    """Borra el perfil, fotos, swipes, matches y bloqueos de la persona. Conserva reportes (seguridad)."""
+    """Borra el perfil, fotos, swipes, matches y bloqueos de la persona. Conserva reportes (seguridad).
+
+    FIX C2: borra dating_messages antes que dating_matches para evitar
+    huérfanos con FK activas.
+    """
     uid = str(uid)
     files = [r["filename"] for r in c.execute("SELECT filename FROM dating_photos WHERE user_id=?", (uid,)).fetchall()]
+    # 1. Obtener match_ids del usuario
+    match_ids = [int(r["id"]) for r in c.execute(
+        "SELECT id FROM dating_matches WHERE user_a=? OR user_b=?", (uid, uid)).fetchall()]
     c.execute("DELETE FROM dating_photos WHERE user_id=?", (uid,))
+    # 2. Borrar mensajes antes de borrar los matches (FK)
+    if match_ids:
+        marks = ",".join("?" * len(match_ids))
+        c.execute(f"DELETE FROM dating_messages WHERE match_id IN ({marks})", match_ids)
+        c.execute(f"DELETE FROM dating_chat_presence WHERE match_id IN ({marks})", match_ids)
     c.execute("DELETE FROM dating_swipes WHERE user_id=? OR target_id=?", (uid, uid))
     c.execute("DELETE FROM dating_matches WHERE user_a=? OR user_b=?", (uid, uid))
     c.execute("DELETE FROM dating_blocks WHERE blocker_id=? OR blocked_id=?", (uid, uid))
@@ -984,11 +1049,251 @@ def admin_restore_profile(c: sqlite3.Connection, user_id: str, now: Optional[str
 def admin_stats(c: sqlite3.Connection) -> Dict[str, int]:
     one = lambda sql: c.execute(sql).fetchone()[0]
     return {
-        "profiles": one("SELECT COUNT(*) FROM dating_profiles"),
-        "active_profiles": one("SELECT COUNT(*) FROM dating_profiles WHERE status='active'"),
+        "profiles": one("SELECT COUNT(*) FROM dating_profiles WHERE is_bot=0"),
+        "active_profiles": one("SELECT COUNT(*) FROM dating_profiles WHERE status='active' AND is_bot=0"),
         "pending_photos": one("SELECT COUNT(*) FROM dating_photos WHERE status='pending'"),
         "open_reports": one("SELECT COUNT(*) FROM dating_reports WHERE status='open'"),
         "matches": one("SELECT COUNT(*) FROM dating_matches WHERE status='active'"),
+        # Campos de bots (nuevos — no rompen admin.html existente)
+        "bots": one("SELECT COUNT(*) FROM dating_profiles WHERE is_bot=1"),
+        "active_bots": one("SELECT COUNT(*) FROM dating_profiles WHERE is_bot=1 AND status='active'"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Bots de citas — funciones de administración (Fase 1-4)
+# ---------------------------------------------------------------------------
+
+_BOT_REQUIRED_FIELDS = ("display_name", "birth_date", "gender", "looking_for", "province")
+
+# Valores válidos para el bot (el admin usa los mismos que el perfil de usuario)
+_BOT_VALID_GENDERS = set(GENDERS)
+_BOT_VALID_LOOKING = set(LOOKING_FOR)
+_BOT_VALID_PROVINCES = set(PROVINCES)
+
+
+def _validate_bot_data(data: Dict[str, Any]) -> None:
+    """Valida los campos obligatorios y el formato del perfil de bot.
+
+    FIX L1-L4: valida género, provincia, fecha de nacimiento y edad mínima 18.
+    """
+    for field in _BOT_REQUIRED_FIELDS:
+        if not str(data.get(field, "") or "").strip():
+            raise DatingError(f"El campo '{field}' es obligatorio.", 400, "missing_field")
+
+    # Fecha de nacimiento válida y edad >= 18
+    birth_str = str(data.get("birth_date", "") or "").strip()
+    try:
+        birth = date.fromisoformat(birth_str)
+    except ValueError:
+        raise DatingError("La fecha de nacimiento del bot no es válida (usa YYYY-MM-DD).", 400, "invalid_birth_date")
+    age = age_from(birth.isoformat())
+    if age < MIN_AGE:
+        raise DatingError(f"El bot debe tener al menos {MIN_AGE} años (fecha de nacimiento demasiado reciente).", 400, "underage_bot")
+    if age > MAX_AGE:
+        raise DatingError("La fecha de nacimiento del bot no es válida.", 400, "invalid_birth_date")
+
+    # Género válido (hombre / mujer / otro — igual que los usuarios reales)
+    gender = str(data.get("gender", "") or "").strip().lower()
+    if gender not in _BOT_VALID_GENDERS:
+        raise DatingError(f"Género no válido. Usa: {', '.join(sorted(_BOT_VALID_GENDERS))}.", 400, "invalid_gender")
+
+    # looking_for válido (hombres / mujeres / todos)
+    looking = str(data.get("looking_for", "") or "").strip().lower()
+    if looking not in _BOT_VALID_LOOKING:
+        raise DatingError(f"looking_for no válido. Usa: {', '.join(sorted(_BOT_VALID_LOOKING))}.", 400, "invalid_looking_for")
+
+    # Provincia válida (exactamente como aparece en PROVINCES)
+    province = str(data.get("province", "") or "").strip()
+    if province not in _BOT_VALID_PROVINCES:
+        raise DatingError(f"Provincia no válida. Revisa los nombres exactos de PROVINCES.", 400, "invalid_province")
+
+    # Rango de edad coherente
+    try:
+        min_age = int(data.get("min_age") or MIN_AGE)
+        max_age = int(data.get("max_age") or MAX_AGE)
+    except (TypeError, ValueError):
+        raise DatingError("El rango de edad no es válido.", 400)
+    if min_age > max_age:
+        raise DatingError("La edad mínima no puede ser mayor que la máxima.", 400)
+
+
+def admin_create_bot(c: sqlite3.Connection, data: Dict[str, Any], now: Optional[str] = None) -> Dict[str, Any]:
+    """Crea un perfil de bot de citas. No requiere cuenta de Telegram real.
+
+    FIX L1-L4: llama a _validate_bot_data que ahora valida todos los campos.
+    FIX L6: interests serializado como List[str].
+    """
+    _validate_bot_data(data)
+    now = now or _now()
+    bot_user_id = "bot_" + uuid.uuid4().hex[:20]
+    public_id = uuid.uuid4().hex[:16]
+    display_name = str(data["display_name"]).strip()
+    birth_date = str(data["birth_date"]).strip()
+    gender = str(data["gender"]).strip().lower()
+    looking_for = str(data["looking_for"]).strip().lower()
+    province = str(data["province"]).strip()
+    municipality = str(data.get("municipality") or "").strip()
+    bio = str(data.get("bio") or "").strip()[:MAX_BIO]
+    # FIX L6: solo strings, nada anidado
+    raw_interests = data.get("interests") or []
+    interests = json.dumps(
+        [str(i)[:20] for i in (raw_interests if isinstance(raw_interests, list) else []) if isinstance(i, str)][:MAX_INTERESTS],
+        ensure_ascii=False,
+    )
+    whatsapp = str(data.get("whatsapp") or "").strip()
+    share_telegram = 1 if data.get("share_telegram") else 0
+    bot_notes = str(data.get("bot_notes") or "").strip()
+    status = str(data.get("status") or "active")
+    if status not in ("active", "inactive", "suspended"):
+        status = "active"
+    try:
+        min_age = max(MIN_AGE, min(MAX_AGE, int(data.get("min_age") or MIN_AGE)))
+        max_age = max(MIN_AGE, min(MAX_AGE, int(data.get("max_age") or MAX_AGE)))
+    except (TypeError, ValueError):
+        min_age, max_age = MIN_AGE, MAX_AGE
+    c.execute(
+        "INSERT INTO dating_profiles("
+        "user_id, public_id, display_name, birth_date, gender, looking_for, province, municipality,"
+        "bio, interests, min_age, max_age, whatsapp, share_telegram, prefs,"
+        "accepted_terms_at, created_at, updated_at, is_bot, bot_notes, status, visible"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            bot_user_id, public_id, display_name, birth_date, gender, looking_for,
+            province, municipality, bio, interests,
+            min_age, max_age,
+            whatsapp, share_telegram, "{}",
+            now, now, now,
+            1,
+            bot_notes,
+            status,
+            1 if data.get("visible", True) else 0,
+        ),
+    )
+    c.commit()
+    row = c.execute("SELECT * FROM dating_profiles WHERE user_id=?", (bot_user_id,)).fetchone()
+    return dict(row)
+
+
+def admin_list_bots(c: sqlite3.Connection, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+    """Lista todos los perfiles marcados como bots."""
+    rows = c.execute(
+        "SELECT * FROM dating_profiles WHERE is_bot=1 ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (limit, offset),
+    ).fetchall()
+    total = c.execute("SELECT COUNT(*) FROM dating_profiles WHERE is_bot=1").fetchone()[0]
+    return {"bots": [dict(r) for r in rows], "total": total, "limit": limit, "offset": offset}
+
+
+def admin_update_bot(c: sqlite3.Connection, user_id: str, data: Dict[str, Any], now: Optional[str] = None) -> Dict[str, Any]:
+    """Actualiza un perfil de bot. Solo permite modificar bots (is_bot=1).
+
+    FIX L4: nunca escribe None en columnas NOT NULL.
+    FIX L5: compatible con pydantic v1/v2 (exclude_unset).
+    """
+    row = c.execute("SELECT * FROM dating_profiles WHERE user_id=? AND is_bot=1", (str(user_id),)).fetchone()
+    if not row:
+        raise DatingError("Bot no encontrado.", 404, "not_found")
+    now = now or _now()
+    allowed = {
+        "display_name", "birth_date", "gender", "looking_for", "province", "municipality",
+        "bio", "interests", "min_age", "max_age", "whatsapp", "share_telegram",
+        "visible", "status", "bot_notes",
+    }
+    updates: Dict[str, Any] = {}
+    for k, v in data.items():
+        if k not in allowed or v is None:  # FIX L4: nunca escribir None
+            continue
+        if k == "interests":
+            raw = v if isinstance(v, list) else []
+            updates[k] = json.dumps([str(i)[:20] for i in raw if isinstance(i, str)][:MAX_INTERESTS], ensure_ascii=False)
+        elif k in ("share_telegram", "visible"):
+            updates[k] = 1 if v else 0
+        elif k == "status":
+            updates[k] = v if v in ("active", "inactive", "suspended") else row["status"]
+        elif k == "gender":
+            updates[k] = v if v in _BOT_VALID_GENDERS else row["gender"]
+        elif k == "looking_for":
+            updates[k] = v if v in _BOT_VALID_LOOKING else row["looking_for"]
+        elif k == "province":
+            updates[k] = v if v in _BOT_VALID_PROVINCES else row["province"]
+        else:
+            updates[k] = v
+    if not updates:
+        return dict(row)
+    updates["updated_at"] = now
+    set_clause = ", ".join(f"{k}=?" for k in updates)
+    values = list(updates.values()) + [str(user_id)]
+    c.execute(f"UPDATE dating_profiles SET {set_clause} WHERE user_id=?", values)
+    c.commit()
+    return dict(c.execute("SELECT * FROM dating_profiles WHERE user_id=?", (str(user_id),)).fetchone())
+
+
+def admin_delete_bot(c: sqlite3.Connection, user_id: str, photos_dir: Optional[str] = None) -> Dict[str, Any]:
+    """Elimina un bot y todos sus datos asociados de forma transaccional.
+
+    FIX C1: borra dating_messages ANTES de dating_matches para no violar FK.
+    El orden es: mensajes → presencia → matches → swipes → bloqueos → reportes
+                 → fotos (archivos) → perfil.
+    """
+    uid = str(user_id)
+    row = c.execute("SELECT * FROM dating_profiles WHERE user_id=? AND is_bot=1", (uid,)).fetchone()
+    if not row:
+        raise DatingError("Bot no encontrado.", 404, "not_found")
+
+    # Recopilar IDs de matches y archivos de fotos ANTES de la transacción
+    match_ids = [int(r["id"]) for r in c.execute(
+        "SELECT id FROM dating_matches WHERE user_a=? OR user_b=?", (uid, uid)).fetchall()]
+    photo_files = [r["filename"] for r in c.execute(
+        "SELECT filename FROM dating_photos WHERE user_id=?", (uid,)).fetchall()]
+
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        # 1. Mensajes (FK apunta a dating_matches → borrar primero)
+        if match_ids:
+            marks = ",".join("?" * len(match_ids))
+            msgs_deleted = c.execute(
+                f"DELETE FROM dating_messages WHERE match_id IN ({marks})", match_ids
+            ).rowcount
+            c.execute(f"DELETE FROM dating_chat_presence WHERE match_id IN ({marks})", match_ids)
+        else:
+            msgs_deleted = 0
+
+        # 2. Matches
+        matches_deleted = c.execute(
+            "DELETE FROM dating_matches WHERE user_a=? OR user_b=?", (uid, uid)
+        ).rowcount
+
+        # 3. Swipes
+        c.execute("DELETE FROM dating_swipes WHERE user_id=? OR target_id=?", (uid, uid))
+
+        # 4. Bloqueos
+        c.execute("DELETE FROM dating_blocks WHERE blocker_id=? OR blocked_id=?", (uid, uid))
+
+        # 5. Reportes (el bot puede haber sido reportado)
+        c.execute("DELETE FROM dating_reports WHERE reported_id=?", (uid,))
+
+        # 6. Fotos (registro en BD)
+        c.execute("DELETE FROM dating_photos WHERE user_id=?", (uid,))
+
+        # 7. Perfil
+        c.execute("DELETE FROM dating_profiles WHERE user_id=?", (uid,))
+
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+
+    # 8. Borrar archivos físicos (fuera de la transacción: fallo no-crítico)
+    if photos_dir:
+        for fname in photo_files:
+            _remove_file(photos_dir, fname)
+
+    return {
+        "deleted": True,
+        "user_id": uid,
+        "matches_deleted": matches_deleted,
+        "messages_deleted": msgs_deleted,
     }
 
 
@@ -1022,12 +1327,16 @@ def get_messages(
     after_id: int = 0,
     limit: int = 40,
 ) -> Dict[str, Any]:
-    """Devuelve mensajes del match paginados por after_id (polling incremental)."""
+    """Devuelve mensajes del match paginados por after_id (polling incremental).
+
+    FIX L7: limit nunca negativo (LIMIT -1 en SQLite = sin límite).
+    """
     _require_active_match(c, uid, match_id)
     touch_chat_presence(c, uid, match_id)
+    safe_limit = max(1, min(100, int(limit or 40)))
     rows = c.execute(
         "SELECT * FROM dating_messages WHERE match_id=? AND id>? ORDER BY id LIMIT ?",
-        (int(match_id), int(after_id), min(100, int(limit or 40)))
+        (int(match_id), int(after_id), safe_limit)
     ).fetchall()
     messages = [
         {
@@ -1053,14 +1362,7 @@ def post_message(
     is_premium_user: bool,
     now: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Envía un mensaje al match.
-
-    Reglas:
-    - Match debe estar active y el usuario debe ser parte de él.
-    - Bloquea enlaces (_LINK_RE).
-    - Aplica límite de mensajes para free users.
-    - Solo texto (sin imágenes en el MVP).
-    """
+    """Envía un mensaje al match."""
     uid = str(uid)
     now = now or _now()
 
@@ -1174,14 +1476,222 @@ def _enrich_matches_with_chat(c: sqlite3.Connection, uid: str, matches: List[Dic
 
 
 # ---------------------------------------------------------------------------
+# Chats de bots — funciones de administración (Fase 3)
+# ---------------------------------------------------------------------------
+
+def admin_bot_conversations(
+    c: sqlite3.Connection,
+    bot_user_id: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Lista los matches activos que involucran bots, con el último mensaje.
+
+    FIX L13: añade u.user_id != b.user_id para evitar producto cartesiano en
+    el improbable caso de un match bot↔bot.
+    """
+    base_sql = (
+        "SELECT m.id AS match_id, m.user_a, m.user_b, m.created_at AS matched_at, "
+        "       b.user_id AS bot_id, b.display_name AS bot_name, b.public_id AS bot_public_id, "
+        "       u.user_id AS real_id, u.display_name AS real_name, u.public_id AS real_public_id "
+        "FROM dating_matches m "
+        "JOIN dating_profiles b ON b.user_id IN (m.user_a, m.user_b) AND b.is_bot=1 "
+        "JOIN dating_profiles u ON u.user_id IN (m.user_a, m.user_b) AND u.is_bot=0 "
+        "   AND u.user_id != b.user_id "
+        "WHERE m.status='active' "
+    )
+    params: List[Any] = []
+    if bot_user_id:
+        base_sql += "AND b.user_id=? "
+        params.append(str(bot_user_id))
+    base_sql += "ORDER BY m.created_at DESC LIMIT ? OFFSET ?"
+    params.extend([int(limit), int(offset)])
+
+    rows = c.execute(base_sql, params).fetchall()
+    total_sql = (
+        "SELECT COUNT(*) FROM dating_matches m "
+        "JOIN dating_profiles b ON b.user_id IN (m.user_a, m.user_b) AND b.is_bot=1 "
+        "JOIN dating_profiles u ON u.user_id IN (m.user_a, m.user_b) AND u.is_bot=0 "
+        "   AND u.user_id != b.user_id "
+        "WHERE m.status='active'"
+    )
+    total_params: List[Any] = []
+    if bot_user_id:
+        total_sql += " AND b.user_id=?"
+        total_params.append(str(bot_user_id))
+    total = c.execute(total_sql, total_params).fetchone()[0]
+
+    conversations = []
+    for r in rows:
+        mid = r["match_id"]
+        last = c.execute(
+            "SELECT * FROM dating_messages WHERE match_id=? AND is_system=0 ORDER BY id DESC LIMIT 1",
+            (mid,),
+        ).fetchone()
+        unread = c.execute(
+            "SELECT COUNT(*) FROM dating_messages "
+            "WHERE match_id=? AND sender_id=? AND read_at IS NULL AND is_system=0",
+            (mid, r["real_id"]),
+        ).fetchone()[0]
+        conversations.append({
+            "match_id":        mid,
+            "matched_at":      r["matched_at"],
+            "bot_id":          r["bot_id"],
+            "bot_name":        r["bot_name"],
+            "bot_public_id":   r["bot_public_id"],
+            "real_id":         r["real_id"],
+            "real_name":       r["real_name"],
+            "real_public_id":  r["real_public_id"],
+            "unread_from_user": unread,
+            "last_message": {
+                "id":         last["id"],
+                "sender_id":  last["sender_id"],
+                "body":       last["body"],
+                "created_at": last["created_at"],
+            } if last else None,
+        })
+    return {"conversations": conversations, "total": total, "limit": limit, "offset": offset}
+
+
+def admin_bot_messages(
+    c: sqlite3.Connection,
+    match_id: int,
+    after_id: int = 0,
+    limit: int = 60,
+) -> Dict[str, Any]:
+    """Devuelve los mensajes de un match con bot para el panel de admin.
+
+    FIX L11: funciona aunque el match esté cerrado (elimina el filtro status='active').
+    """
+    row = c.execute(
+        "SELECT m.*, m.status AS match_status, "
+        "       b.user_id AS bot_id, b.display_name AS bot_name, "
+        "       u.user_id AS real_id, u.display_name AS real_name "
+        "FROM dating_matches m "
+        "JOIN dating_profiles b ON b.user_id IN (m.user_a, m.user_b) AND b.is_bot=1 "
+        "JOIN dating_profiles u ON u.user_id IN (m.user_a, m.user_b) AND u.is_bot=0 "
+        "   AND u.user_id != b.user_id "
+        "WHERE m.id=?",
+        (int(match_id),),
+    ).fetchone()
+    if not row:
+        raise DatingError("Conversación de bot no encontrada.", 404, "not_found")
+
+    messages_rows = c.execute(
+        "SELECT * FROM dating_messages WHERE match_id=? AND id>? ORDER BY id LIMIT ?",
+        (int(match_id), int(after_id), min(200, max(1, int(limit)))),
+    ).fetchall()
+    messages = [
+        {
+            "id":         m["id"],
+            "sender_id":  m["sender_id"],
+            "body":       m["body"],
+            "created_at": m["created_at"],
+            "read_at":    m["read_at"],
+            "is_system":  bool(m["is_system"]),
+        }
+        for m in messages_rows
+    ]
+    last_id = messages[-1]["id"] if messages else int(after_id)
+    return {
+        "match_id":     int(match_id),
+        "match_status": row["match_status"],
+        "bot_id":       row["bot_id"],
+        "bot_name":     row["bot_name"],
+        "real_id":      row["real_id"],
+        "real_name":    row["real_name"],
+        "messages":     messages,
+        "last_id":      last_id,
+    }
+
+
+def admin_bot_reply(
+    c: sqlite3.Connection,
+    match_id: int,
+    body: str,
+    actor: str,
+    now: Optional[str] = None,
+) -> Dict[str, Any]:
+    """El admin envía un mensaje como si fuera el bot en el match indicado.
+
+    FIX L12: operación envuelta en BEGIN IMMEDIATE para evitar escrituras
+    intercaladas de dos admins simultáneos.
+    """
+    now = now or _now()
+    body = str(body or "").strip()
+    if not body:
+        raise DatingError("El mensaje no puede estar vacío.")
+    if len(body) > 2000:
+        raise DatingError("El mensaje es demasiado largo (máximo 2000 caracteres).")
+
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        row = c.execute(
+            "SELECT m.*, "
+            "       b.user_id AS bot_id, b.display_name AS bot_name, "
+            "       u.user_id AS real_id "
+            "FROM dating_matches m "
+            "JOIN dating_profiles b ON b.user_id IN (m.user_a, m.user_b) AND b.is_bot=1 "
+            "JOIN dating_profiles u ON u.user_id IN (m.user_a, m.user_b) AND u.is_bot=0 "
+            "   AND u.user_id != b.user_id "
+            "WHERE m.id=? AND m.status='active'",
+            (int(match_id),),
+        ).fetchone()
+        if not row:
+            raise DatingError("Conversación de bot activa no encontrada.", 404, "not_found")
+
+        bot_id = row["bot_id"]
+        real_id = row["real_id"]
+
+        # Marcar como leídos los mensajes del usuario real
+        c.execute(
+            "UPDATE dating_messages SET read_at=? "
+            "WHERE match_id=? AND sender_id=? AND read_at IS NULL AND is_system=0",
+            (now, int(match_id), real_id),
+        )
+
+        # Insertar el mensaje como el bot
+        cur = c.execute(
+            "INSERT INTO dating_messages(match_id, sender_id, body, created_at, is_system) VALUES(?,?,?,?,0)",
+            (int(match_id), bot_id, body, now),
+        )
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+
+    return {
+        "id":         cur.lastrowid,
+        "match_id":   int(match_id),
+        "sender_id":  bot_id,
+        "bot_name":   row["bot_name"],
+        "real_id":    real_id,
+        "body":       body,
+        "created_at": now,
+        "actor":      actor,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Rutas HTTP
 # ---------------------------------------------------------------------------
 
 def build_router(*, current_user: Callable, connect: Callable, is_premium: Callable, admin: Callable,
                  audit: Callable, notify: Callable, secret: Callable, photos_dir: Callable,
                  free_daily_likes: int = 20, free_msg_limit: int = FREE_MSG_LIMIT,
-                 review: Optional[Callable] = None):
-    """Crea el APIRouter. ``main.py`` inyecta autenticación, base de datos y Telegram."""
+                 review: Optional[Callable] = None,
+                 bot_control: Optional[Callable] = None):
+    """Crea el APIRouter. ``main.py`` inyecta autenticación, base de datos y Telegram.
+
+    ``bot_control(event, payload)`` — callable opcional inyectado por ``main.py``
+    que reenvía eventos al grupo de control de Telegram de los bots de citas.
+    Si es ``None`` los eventos se silencian sin error.
+
+    Eventos emitidos:
+      - ``"bot_match"``   → nuevo match entre usuario y bot
+      - ``"bot_message"`` → el usuario escribió un mensaje a un bot
+      - ``"bot_admin_reply"`` → el admin respondió desde el panel web
+    """
     from fastapi import APIRouter, HTTPException, Request
     from fastapi.responses import FileResponse, Response
     from pydantic import BaseModel
@@ -1238,6 +1748,52 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
     class ResolveIn(BaseModel):
         action: str
 
+    # --- Bots ---------------------------------------------------------------
+    class BotCreateIn(BaseModel):
+        display_name: str
+        birth_date: str
+        gender: str
+        looking_for: str
+        province: str
+        municipality: str = ""
+        bio: str = ""
+        interests: List[str] = []
+        min_age: int = 18
+        max_age: int = 99
+        whatsapp: str = ""
+        share_telegram: bool = False
+        visible: bool = True
+        status: str = "active"
+        bot_notes: str = ""
+
+    class BotUpdateIn(BaseModel):
+        display_name: Optional[str] = None
+        birth_date: Optional[str] = None
+        gender: Optional[str] = None
+        looking_for: Optional[str] = None
+        province: Optional[str] = None
+        municipality: Optional[str] = None
+        bio: Optional[str] = None
+        interests: Optional[List[str]] = None
+        min_age: Optional[int] = None
+        max_age: Optional[int] = None
+        whatsapp: Optional[str] = None
+        share_telegram: Optional[bool] = None
+        visible: Optional[bool] = None
+        status: Optional[str] = None
+        bot_notes: Optional[str] = None
+
+    class BotReplyIn(BaseModel):
+        match_id: int
+        body: str
+        actor: Optional[str] = None
+
+    def _model_dump(model, exclude_unset: bool = False) -> Dict[str, Any]:
+        """Compatibilidad pydantic v1 / v2."""
+        if hasattr(model, "model_dump"):
+            return model.model_dump(exclude_unset=exclude_unset)
+        return model.dict(exclude_unset=exclude_unset)
+
     def throttle(limiter, key: str, message: str):
         allowed, retry = limiter.check(key)
         if not allowed:
@@ -1254,6 +1810,9 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
             c.close()
 
     def fire_and_forget(user_id: str, text: str):
+        # No notificar a bots (no tienen Telegram real)
+        if str(user_id).startswith("bot_"):
+            return
         threading.Thread(target=notify, args=(user_id, text), daemon=True).start()
 
     def fire_review(kind: str, payload: Dict[str, Any]):
@@ -1265,6 +1824,17 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
                 review(kind, payload)
             except Exception:
                 pass
+        threading.Thread(target=_run, daemon=True).start()
+
+    def fire_bot_control(event: str, payload: Dict[str, Any]):
+        """Reenvía un evento al grupo de control de bots (BOTS_CONTROL_GROUP_ID)."""
+        if not bot_control:
+            return
+        def _run():
+            try:
+                bot_control(event, payload)
+            except Exception as exc:
+                logger.debug("fire_bot_control error: %s", exc)
         threading.Thread(target=_run, daemon=True).start()
 
     @router.get("/api/dating/config")
@@ -1289,7 +1859,7 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
             existing = get_profile(c, uid)
             if existing and existing["status"] == "suspended":
                 raise DatingError("Tu perfil de Citas está suspendido. Contacta a soporte.", 403, "suspended")
-            cleaned = clean_profile(p.model_dump() if hasattr(p, "model_dump") else p.dict(),
+            cleaned = clean_profile(_model_dump(p),
                                     _username_of(c, uid), existing=bool(existing),
                                     locked_birth_date=existing["birth_date"] if existing else None)
             upsert_profile(c, uid, cleaned)
@@ -1333,7 +1903,7 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
         path = os.path.join(photos_dir(), os.path.basename(row["filename"]))
         if os.path.isfile(path):
             return FileResponse(path, media_type="image/jpeg", headers=headers)
-        data = _storage.get(row["filename"])  # foto guardada en Cloudflare R2
+        data = _storage.get(row["filename"])
         if data is None:
             raise HTTPException(404, "Foto no encontrada")
         return Response(content=data, media_type="image/jpeg", headers=headers)
@@ -1363,9 +1933,6 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
 
     @router.post("/api/dating/share-earn")
     def dating_share_earn(request: Request):
-        """El cliente llama a este endpoint después de que el usuario comparte su estado.
-        Registra el bonus del día (idempotente) y devuelve los likes restantes actualizados.
-        """
         uid = current_user(request)
 
         def work(c):
@@ -1384,16 +1951,24 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
 
         def work(c):
             result = record_swipe(c, uid, p.target, p.action, free_daily_likes, premium)
+            target_is_bot = result.pop("_target_is_bot", False)
             if result.get("matched"):
                 other = c.execute("SELECT * FROM dating_profiles WHERE public_id=?", (result["match_public_id"],)).fetchone()
                 result["match"] = card(c, other, secret())
                 result["match"]["contacts"] = contact_links(other, _username_of(c, other["user_id"]))
                 if result.get("match_id") is not None:
                     result["match"]["match_id"] = result["match_id"]
-            return result
-        result = run(work)
+            return result, target_is_bot
+        result, target_is_bot = run(work)
         match_id_for_link = result.get("match_id")
+
+        # Notificaciones de match
         for user_id in result.pop("notify", []):
+            if str(user_id).startswith("bot_"):
+                continue  # los bots no tienen Telegram
+            if target_is_bot and str(user_id) != uid:
+                # No notificar al bot (ya es bot_)
+                continue
             link_hint = ""
             if match_id_for_link is not None:
                 link_hint = f"\nAbre la Mini App (startapp=chat_{match_id_for_link}) para chatear."
@@ -1403,6 +1978,37 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
                 user_id,
                 "💜 <b>¡Tienes un nuevo match en LiggaCuba Citas!</b>" + link_hint,
             )
+
+        # Notificar al grupo de control si fue match con bot
+        if result.get("matched") and target_is_bot and match_id_for_link:
+            def _notify_bot_match(mid=match_id_for_link, u=uid):
+                try:
+                    c2 = connect()
+                    try:
+                        row = c2.execute(
+                            "SELECT b.user_id AS bot_id, b.display_name AS bot_name, "
+                            "       u2.display_name AS real_name "
+                            "FROM dating_matches m "
+                            "JOIN dating_profiles b ON b.user_id IN (m.user_a, m.user_b) AND b.is_bot=1 "
+                            "JOIN dating_profiles u2 ON u2.user_id IN (m.user_a, m.user_b) AND u2.is_bot=0 "
+                            "   AND u2.user_id != b.user_id "
+                            "WHERE m.id=?",
+                            (mid,),
+                        ).fetchone()
+                        if row:
+                            fire_bot_control("bot_match", {
+                                "match_id":  mid,
+                                "bot_id":    row["bot_id"],
+                                "bot_name":  row["bot_name"],
+                                "real_id":   u,
+                                "real_name": row["real_name"],
+                            })
+                    finally:
+                        c2.close()
+                except Exception as exc:
+                    logger.debug("_notify_bot_match error: %s", exc)
+            threading.Thread(target=_notify_bot_match, daemon=True).start()
+
         result.pop("match_public_id", None)
         return result
 
@@ -1449,8 +2055,6 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
         result = run(lambda c: report_user(c, uid, p.target, p.reason, p.details))
         report_id = result.get("report_id") if isinstance(result, dict) else None
         if not report_id:
-            # report_user no devuelve el id: se toma el reporte abierto más reciente
-            # del mismo usuario, que es exactamente el que se acaba de crear.
             c = connect()
             try:
                 row_id = c.execute(
@@ -1527,6 +2131,43 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
             "✅ <b>Tu perfil de Citas ha sido reactivado.</b>\n\nYa puedes usar Citas con normalidad. ¡Mucho éxito! 💜")
         return {"success": True}
 
+    # --- bots de citas (Fase 1-4) -------------------------------------------
+
+    @router.post("/api/admin/dating/bots")
+    def admin_bots_create(p: BotCreateIn, request: Request):
+        """Crea un nuevo perfil de bot de citas."""
+        ident = admin(request, "dating")
+        data = _model_dump(p)
+        result = run(lambda c: admin_create_bot(c, data))
+        audit(ident["username"], "dating_bot_created", result["user_id"], {"display_name": result["display_name"]})
+        return result
+
+    @router.get("/api/admin/dating/bots")
+    def admin_bots_list(request: Request, limit: int = 100, offset: int = 0):
+        """Lista todos los perfiles de bots."""
+        admin(request, "dating")
+        return run(lambda c: admin_list_bots(c, limit=limit, offset=offset))
+
+    @router.put("/api/admin/dating/bots/{user_id}")
+    def admin_bots_update(user_id: str, p: BotUpdateIn, request: Request):
+        """Actualiza los campos de un bot existente."""
+        ident = admin(request, "dating")
+        # FIX L5: exclude_unset=True para no sobreescribir con None campos no enviados
+        data = _model_dump(p, exclude_unset=True)
+        result = run(lambda c: admin_update_bot(c, user_id, data))
+        audit(ident["username"], "dating_bot_updated", user_id, data)
+        return result
+
+    @router.delete("/api/admin/dating/bots/{user_id}")
+    def admin_bots_delete(user_id: str, request: Request):
+        """Elimina un bot y todos sus datos asociados (matches, mensajes, fotos)."""
+        ident = admin(request, "dating")
+        result = run(lambda c: admin_delete_bot(c, user_id, photos_dir()))
+        audit(ident["username"], "dating_bot_deleted", user_id,
+              {"matches_deleted": result.get("matches_deleted", 0),
+               "messages_deleted": result.get("messages_deleted", 0)})
+        return result
+
     # --- chat interno -------------------------------------------------------
     msg_rate_limiter = _limits.SlidingWindowLimiter(
         int(os.getenv("DATING_MSG_RATE_PER_MINUTE", str(MSG_RATE_PER_MINUTE))), 60
@@ -1548,13 +2189,16 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
 
         def work(c):
             msg = post_message(c, uid, match_id, p.body, free_msg_limit, premium_user)
-            # Notificar al otro usuario (fire_and_forget, solo si no tiene el chat abierto)
             match_row = c.execute(
                 "SELECT * FROM dating_matches WHERE id=?", (match_id,)
             ).fetchone()
-            if match_row:
-                other_id = match_row["user_b"] if match_row["user_a"] == uid else match_row["user_a"]
-                # No notificar si el destinatario tiene el chat abierto (poll reciente)
+            if not match_row:
+                return {"message": msg}
+
+            other_id = match_row["user_b"] if match_row["user_a"] == uid else match_row["user_a"]
+
+            # Notificar al usuario real (si no tiene el chat abierto)
+            if not str(other_id).startswith("bot_"):
                 if not is_chat_open(c, other_id, match_id, window_seconds=15):
                     sender_row = c.execute(
                         "SELECT display_name FROM dating_profiles WHERE user_id=?", (uid,)
@@ -1565,6 +2209,27 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
                         f"💬 <b>{sender_name} te envió un mensaje en LiggaCuba Citas.</b>\n"
                         f"Abre la Mini App para leer y responder (startapp=chat_{match_id}).",
                     )
+
+            # Si el destinatario ES un bot → reenviar al grupo de control
+            if str(other_id).startswith("bot_"):
+                bot_row = c.execute(
+                    "SELECT display_name FROM dating_profiles WHERE user_id=?", (other_id,)
+                ).fetchone()
+                sender_row = c.execute(
+                    "SELECT display_name FROM dating_profiles WHERE user_id=?", (uid,)
+                ).fetchone()
+                control_payload = {
+                    "match_id":    match_id,
+                    "bot_id":      other_id,
+                    "bot_name":    bot_row["display_name"] if bot_row else other_id,
+                    "real_id":     uid,
+                    "real_name":   sender_row["display_name"] if sender_row else uid,
+                    "message_id":  msg["id"],
+                    "body":        p.body,
+                    "created_at":  msg["created_at"],
+                }
+                fire_bot_control("bot_message", control_payload)
+
             return {"message": msg}
 
         return run(work)
@@ -1574,5 +2239,70 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
         uid = current_user(request)
         run(lambda c: mark_messages_read(c, uid, match_id))
         return {"success": True}
+
+    # --- admin: chats de bots (Fase 3) -------------------------------------
+
+    @router.get("/api/admin/dating/bots/conversations")
+    def admin_bots_conversations(
+        request: Request,
+        bot_user_id: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ):
+        """Lista todos los matches activos que involucran bots."""
+        admin(request, "dating")
+        return run(lambda c: admin_bot_conversations(c, bot_user_id=bot_user_id, limit=limit, offset=offset))
+
+    @router.get("/api/admin/dating/bots/conversations/{match_id}/messages")
+    def admin_bots_messages(
+        match_id: int,
+        request: Request,
+        after_id: int = 0,
+        limit: int = 60,
+    ):
+        """Devuelve los mensajes de un match con bot (panel admin).
+        FIX L11: funciona aunque el match esté cerrado.
+        """
+        admin(request, "dating")
+        return run(lambda c: admin_bot_messages(c, match_id, after_id=after_id, limit=limit))
+
+    @router.post("/api/admin/dating/bots/reply")
+    def admin_bots_reply(p: BotReplyIn, request: Request):
+        """El admin responde como si fuera el bot en un match."""
+        ident = admin(request, "dating")
+        raw_actor = (p.actor or "").replace("\r", " ").replace("\n", " ").strip()
+        actor = raw_actor[:80] if raw_actor.startswith("tg:") and len(raw_actor) <= 80 else ident["username"]
+        result = run(lambda c: admin_bot_reply(c, p.match_id, p.body, actor))
+        audit(ident["username"], "dating_bot_reply", p.match_id, {"body_len": len(p.body)})
+
+        # Notificar al usuario real vía Telegram (si no tiene el chat abierto)
+        def _notify_user_and_group(res=result, actor=actor):
+            try:
+                c2 = connect()
+                try:
+                    real_id  = res["real_id"]
+                    bot_name = res["bot_name"]
+                    mid      = res["match_id"]
+                    if not is_chat_open(c2, real_id, mid, window_seconds=30):
+                        notify(
+                            real_id,
+                            f"💬 <b>{bot_name} te envió un mensaje en LiggaCuba Citas.</b>\n"
+                            f"Abre la Mini App para leer y responder (startapp=chat_{mid}).",
+                        )
+                    # Registrar en el grupo de control
+                    fire_bot_control("bot_admin_reply", {
+                        "match_id":  mid,
+                        "bot_id":    res["sender_id"],
+                        "bot_name":  bot_name,
+                        "real_id":   real_id,
+                        "body":      res["body"],
+                        "actor":     actor,
+                    })
+                finally:
+                    c2.close()
+            except Exception as exc:
+                logger.debug("_notify_user_and_group error: %s", exc)
+        threading.Thread(target=_notify_user_and_group, daemon=True).start()
+        return result
 
     return router
