@@ -21,6 +21,24 @@ except ImportError:  # Support running uvicorn with backend/ as the working dire
     from telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo, send_document
 logger = logging.getLogger(__name__)
 
+# [Bots de citas] Controlador del grupo de control. No sustituye handle_update.
+try:
+    from .telegram_bot import (
+        TelegramBot as _DatingTelegramBot,
+        claim_update as _tg_claim_update,
+        release_update as _tg_release_update,
+        init_processed_updates as _tg_init_processed,
+    )
+except ImportError:
+    from telegram_bot import (
+        TelegramBot as _DatingTelegramBot,
+        claim_update as _tg_claim_update,
+        release_update as _tg_release_update,
+        init_processed_updates as _tg_init_processed,
+    )
+
+_dating_bot = _DatingTelegramBot()
+
 ai_generate_reply = _provider_generate_reply
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1286,6 +1304,35 @@ async def telegram_webhook(request: Request):
                 return {"ok": True, "handled": True, "action": "review_reason"}
         except Exception:
             logger.warning("Review reason handling failed update_id=%s", update.get("update_id"), exc_info=True)
+    # El grupo de control de bots no es un chat de usuario: no debe pasar por handle_update
+    # (ese camino manda el aviso de "próximamente"). El claim evita duplicar el reply si Telegram reintenta.
+    _ctrl_group = getattr(_dating_bot, "bots_control_group_id", None)
+    _ctrl_kind = ""
+    if _ctrl_group:
+        for _kind in ("message", "edited_message"):
+            _msg = update.get(_kind)
+            if isinstance(_msg, dict) and str((_msg.get("chat") or {}).get("id", "")) == str(_ctrl_group):
+                _ctrl_kind = _kind
+                break
+    if _ctrl_kind:
+        if _ctrl_kind != "message":
+            return {"ok": True, "handled": True, "action": "bots_control_ignored"}
+        update_id = update.get("update_id")
+        if not isinstance(update_id, int):
+            return {"ok": True, "handled": False, "reason": "missing_update_id"}
+        _tg_init_processed()
+        if not _tg_claim_update(update_id):
+            return {"ok": True, "handled": False, "reason": "duplicate_update"}
+        delivered = False
+        try:
+            delivered = bool(_dating_bot.process_update_from_main(update))
+        except Exception:
+            logger.warning("Bots control reply failed update_id=%s", update_id, exc_info=True)
+            delivered = False
+        if not delivered:
+            _tg_release_update(update_id)
+            raise HTTPException(502, "No se pudo entregar la respuesta del bot")
+        return {"ok": True, "handled": True, "action": "bots_control"}
     try:
         outcome = handle_update(update)
         return {"ok": True, **outcome}
@@ -3568,6 +3615,7 @@ app.include_router(_dating.build_router(
     current_user=current_user, connect=db, is_premium=lambda uid: premium(uid), admin=admin, audit=audit,
     notify=_dating_notify, secret=_dating_secret, photos_dir=_dating_photos_dir,
     free_daily_likes=_env_int("DATING_FREE_DAILY_LIKES", 20), review=_review_hook,
+    bot_control=_dating_bot.send_bot_control_event,
 ))
 
 app.include_router(_ads.build_router(

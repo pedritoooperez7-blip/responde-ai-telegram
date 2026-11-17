@@ -7,6 +7,13 @@ Security model:
   update (Telegram retries on non-200) is acknowledged without double actions.
 - The bot never touches the Mini App user database: /start only sends the
   welcome message and does not create users or sessions.
+
+[Fase 5 — Bots de citas]
+- Clase ``TelegramBot`` (al final del módulo) para el grupo de control de bots
+  de citas: reenvía bot_message / bot_match / bot_admin_reply y procesa replies
+  del grupo con tag [BOT_CHAT:<match_id>].
+- Usa TELEGRAM_BOT_TOKEN (mismo token que el resto del bot).
+- No reemplaza handle_update / send_message / verify_webhook_secret.
 """
 from __future__ import annotations
 
@@ -15,12 +22,13 @@ import hmac
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -397,3 +405,240 @@ def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
         release_update(update_id)
         raise
 
+
+
+# =============================================================================
+# Fase 5 — Control de bots de citas (grupo de Telegram + replies)
+# =============================================================================
+# Esta sección coexiste con las funciones de módulo de arriba.
+# main.py instancia:  _dating_bot = TelegramBot()
+# y pasa:             bot_control=_dating_bot.send_bot_control_event
+# y llama en webhook: _dating_bot.process_update_from_main(update)
+
+_CONTROL_TAG_RE = re.compile(r"\[BOT_CHAT:(\d+)\]")
+
+
+def _esc(s: Any) -> str:
+    """Escapa caracteres HTML especiales para parse_mode HTML de Telegram."""
+    return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _validate_control_group_id(raw: str) -> Optional[str]:
+    """Valida que el ID del grupo de control sea un entero negativo."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        val = int(raw)
+    except ValueError:
+        logger.error(
+            "BOTS_CONTROL_GROUP_ID no es un entero ('%s'). Los eventos de bots se silenciarán.",
+            raw,
+        )
+        return None
+    if val >= 0:
+        logger.error(
+            "BOTS_CONTROL_GROUP_ID es positivo (%d). Debe ser un ID negativo (grupo/supergrupo).",
+            val,
+        )
+        return None
+    return str(val)
+
+
+def _parse_admin_ids(raw: str) -> Set[str]:
+    """Parsea BOTS_CONTROL_ADMIN_IDS: lista de IDs numéricos separados por coma."""
+    ids: Set[str] = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if part:
+            try:
+                ids.add(str(int(part)))
+            except ValueError:
+                logger.warning("BOTS_CONTROL_ADMIN_IDS: '%s' no es un ID válido.", part)
+    return ids
+
+
+class TelegramBot:
+    """Control de bots de citas: notificaciones al grupo y replies desde Telegram.
+
+    No sustituye a send_message / handle_update del módulo. Solo gestiona
+    el grupo BOTS_CONTROL_GROUP_ID y las respuestas admin → usuario vía API interna.
+    """
+
+    def __init__(
+        self,
+        token: Optional[str] = None,
+        bots_control_group_id: Optional[str] = None,
+        admin_api_token: Optional[str] = None,
+        internal_base_url: Optional[str] = None,
+    ) -> None:
+        # Preferir TELEGRAM_BOT_TOKEN (estándar del repo); BOT_TOKEN como fallback
+        self.token = (
+            token
+            or (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+            or (os.getenv("BOT_TOKEN") or "").strip()
+        )
+        raw_ctrl = bots_control_group_id or os.getenv("BOTS_CONTROL_GROUP_ID", "")
+        self.bots_control_group_id = _validate_control_group_id(raw_ctrl)
+        self.admin_api_token = admin_api_token or (os.getenv("ADMIN_API_TOKEN") or os.getenv("ADMIN_KEY") or "")
+        configured_base = (internal_base_url or os.getenv("INTERNAL_BASE_URL") or "").strip()
+        if not configured_base:
+            # El proceso escucha ${PORT:-10000} (Dockerfile / railway.json), no el 8000.
+            configured_base = "http://127.0.0.1:" + (os.getenv("PORT") or "10000").strip()
+        self.internal_base_url = configured_base.rstrip("/")
+        self.control_admin_ids: Set[str] = _parse_admin_ids(os.getenv("BOTS_CONTROL_ADMIN_IDS", ""))
+        self.admin_api_header = os.getenv("ADMIN_API_HEADER", "X-Admin-Key")
+        if not self.token:
+            logger.warning("TelegramBot (bots): no hay TELEGRAM_BOT_TOKEN/BOT_TOKEN — eventos de bots silenciados.")
+
+    def _api_url(self, method: str) -> str:
+        return f"{TELEGRAM_API_BASE}/bot{self.token}/{method}"
+
+    def _post_telegram(self, method: str, payload: Dict[str, Any], timeout: float = 10.0) -> Dict[str, Any]:
+        if not self.token:
+            return {}
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            self._api_url(method),
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            if not body.get("ok"):
+                logger.warning("Telegram %s no OK: %s", method, str(body)[:200])
+            return body if isinstance(body, dict) else {}
+        except Exception as exc:
+            logger.debug("Telegram %s error: %s", method, exc)
+            return {}
+
+    def send_bot_control_event(self, event: str, payload: Dict[str, Any]) -> None:
+        """Reenvía eventos de bots al grupo de control. Se pasa como bot_control= a dating.build_router."""
+        if not self.bots_control_group_id or not self.token:
+            return
+        try:
+            mid = payload.get("match_id", "?")
+            if event == "bot_message":
+                tag = f"[BOT_CHAT:{mid}]"
+                body_preview = _esc(str(payload.get("body", ""))[:300])
+                text = (
+                    f"💬 <b>Mensaje para el bot</b> {tag}\n"
+                    f"Bot: <b>{_esc(payload.get('bot_name', '?'))}</b>\n"
+                    f"De: <b>{_esc(payload.get('real_name', '?'))}</b> "
+                    f"(<code>{_esc(payload.get('real_id', '?'))}</code>)\n"
+                    f"Match ID: <code>{_esc(mid)}</code>\n\n"
+                    f"{body_preview}\n\n"
+                    f"<i>↩️ Responde a ESTE mensaje para contestar como el bot.</i>"
+                )
+            elif event == "bot_match":
+                text = (
+                    f"💜 <b>Nuevo match con bot</b>\n"
+                    f"Bot: <b>{_esc(payload.get('bot_name', '?'))}</b>\n"
+                    f"Usuario: <b>{_esc(payload.get('real_name', '?'))}</b> "
+                    f"(<code>{_esc(payload.get('real_id', '?'))}</code>)\n"
+                    f"Match ID: <code>{_esc(mid)}</code>"
+                )
+            elif event == "bot_admin_reply":
+                body_preview = _esc(str(payload.get("body", ""))[:300])
+                text = (
+                    f"✅ <b>Respuesta enviada como bot</b>\n"
+                    f"Bot: <b>{_esc(payload.get('bot_name', '?'))}</b>\n"
+                    f"Para: <code>{_esc(payload.get('real_id', '?'))}</code>\n"
+                    f"Por: <b>{_esc(payload.get('actor', '?'))}</b>\n\n"
+                    f"{body_preview}"
+                )
+            else:
+                text = f"ℹ️ Evento bots: <code>{_esc(event)}</code>\n<pre>{_esc(json.dumps(payload, ensure_ascii=False)[:500])}</pre>"
+
+            self._post_telegram(
+                "sendMessage",
+                {
+                    "chat_id": self.bots_control_group_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
+            )
+        except Exception as exc:
+            logger.debug("send_bot_control_event error (event=%s): %s", event, exc)
+
+    def process_update_from_main(self, update: Dict[str, Any]) -> bool:
+        """Procesa replies del grupo de control.
+
+        Devuelve False solo si había que entregar una respuesta y el POST interno falló
+        (el caller debe soltar el claim para que Telegram reintente).
+        Sin tag, sin texto o sin permiso: True, y no se envía nada.
+        """
+        try:
+            message = update.get("message")
+            if not isinstance(message, dict):
+                return True
+            chat_id = str((message.get("chat") or {}).get("id", ""))
+            if self.bots_control_group_id and chat_id == str(self.bots_control_group_id):
+                return self._handle_control_message(message)
+            return True
+        except Exception as exc:
+            logger.debug("process_update_from_main error: %s", exc)
+            return False
+
+    def _handle_control_message(self, message: Dict[str, Any]) -> bool:
+        """Solo actúa sobre replies a mensajes que llevan el tag [BOT_CHAT:N]."""
+        reply = message.get("reply_to_message") or {}
+        reply_text = (reply.get("text") or reply.get("caption") or "") if reply else ""
+        m = _CONTROL_TAG_RE.search(reply_text)
+        if not m:
+            logger.debug("_handle_control_message: sin tag BOT_CHAT, ignorado.")
+            return True
+
+        from_user = message.get("from") or {}
+        actor_id = str(from_user.get("id", ""))
+        if self.control_admin_ids and actor_id not in self.control_admin_ids:
+            logger.warning(
+                "Reply en grupo de control de ID no autorizado: %s", actor_id
+            )
+            return True
+
+        match_id = int(m.group(1))
+        reply_text_body = (message.get("text") or "").strip()
+        if not reply_text_body:
+            return True
+
+        actor_name = from_user.get("username") or from_user.get("first_name") or actor_id
+        actor_name = str(actor_name).replace("\r", " ").replace("\n", " ").strip()[:64]
+        return self._post_bot_reply(match_id, reply_text_body, actor=f"tg:{actor_name}")
+
+    def _post_bot_reply(self, match_id: int, body: str, actor: str = "telegram_admin") -> bool:
+        """POST interno a /api/admin/dating/bots/reply."""
+        url = f"{self.internal_base_url}/api/admin/dating/bots/reply"
+        payload = json.dumps(
+            {"match_id": match_id, "body": body, "actor": actor},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.admin_api_token and self.admin_api_header:
+            headers[self.admin_api_header] = self.admin_api_token
+
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                status = getattr(resp, "status", 200)
+                if status not in (200, 201):
+                    raw = resp.read()[:200]
+                    logger.warning(
+                        "_post_bot_reply falló: match_id=%d status=%s body=%s",
+                        match_id, status, raw,
+                    )
+                    return False
+            logger.info("_post_bot_reply OK: match_id=%d actor=%s", match_id, actor)
+            return True
+        except urllib.error.HTTPError as exc:
+            logger.warning(
+                "_post_bot_reply HTTPError: match_id=%d status=%s body=%s",
+                match_id, exc.code, (exc.read() or b"")[:200],
+            )
+            return False
+        except Exception as exc:
+            logger.error("_post_bot_reply error: match_id=%d %s", match_id, exc)
+            return False
