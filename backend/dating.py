@@ -562,13 +562,31 @@ def _approved_photo_urls(c: sqlite3.Connection, user_id: str, secret: str) -> Li
     return [photo_url(secret, r["id"]) for r in rows]
 
 
+def _bot_portrait_url(row: sqlite3.Row) -> Optional[str]:
+    """Retrato de respaldo si el bot no tiene foto. La tarjeta se ve como la de cualquier persona."""
+    if not row["is_bot"]:
+        return None
+    kind = str(row["gender"] or "")
+    if kind not in ("hombre", "mujer"):
+        kind = "mujer"
+    path = os.path.join(os.path.dirname(__file__), "bot_portraits", f"{kind}.jpg")
+    if not os.path.isfile(path):
+        return None
+    return f"/api/dating/photo/portrait/{kind}"
+
+
 def card(c: sqlite3.Connection, row: sqlite3.Row, secret: str, viewer_province: str = "",
          viewer_prefs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    photos = _approved_photo_urls(c, row["user_id"], secret)
+    if not photos:
+        fallback = _bot_portrait_url(row)
+        if fallback:
+            photos = [fallback]
     out = {
         "public_id": row["public_id"], "display_name": row["display_name"], "age": age_from(row["birth_date"]),
         "province": row["province"], "municipality": row["municipality"], "bio": row["bio"],
         "interests": json.loads(row["interests"] or "[]"),
-        "photos": _approved_photo_urls(c, row["user_id"], secret),
+        "photos": photos,
         "same_province": bool(viewer_province) and row["province"] == viewer_province,
     }
     if viewer_prefs is not None:
@@ -641,15 +659,14 @@ def overview(c: sqlite3.Connection, uid: str, secret: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _interleave_bots(candidates: List[Any], bot_max: int) -> List[Any]:
-    """Pone todos los bots delante. Sin cupo, posición ni perfiles reales.
+    """El bot ocupa su lugar como cualquier perfil, no va fijo de primero.
 
-    bot_max se ignora: un bot activo y visible sale aunque el feed de
-    personas esté vacío.
+    Si por el límite de la página se quedaría fuera, entra en el último
+    puesto. Así la prueba lo ve, pero no destaca como tarjeta especial.
+    bot_max se ignora.
     """
     del bot_max
-    bots = [c for c in candidates if c[2]["is_bot"]]
-    reals = [c for c in candidates if not c[2]["is_bot"]]
-    return bots + reals
+    return candidates
 
 
 def candidate_feed(c: sqlite3.Connection, uid: str, secret: str, limit: int = 10, today: Optional[date] = None) -> List[Dict[str, Any]]:
@@ -702,10 +719,18 @@ def candidate_feed(c: sqlite3.Connection, uid: str, secret: str, limit: int = 10
         if wants_near and row["province"] == me["province"] and me["municipality"] and row["municipality"].lower() == me["municipality"].lower():
             score += 2
         candidates.append((row["province"] == me["province"], score, row))
-    # Personas: misma provincia primero, luego afinidad. Los bots van todos delante.
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    mixed = _interleave_bots(candidates, BOT_FEED_MAX)
-    return [card(c, row, secret, me["province"], my_prefs) for _same, _score, row in mixed[:limit]]
+    # Mismo orden que las personas. Si empatan, la persona real va antes: el bot no abre el mazo.
+    candidates.sort(key=lambda item: (item[0], item[1], 0 if item[2]["is_bot"] else 1), reverse=True)
+    ordered = _interleave_bots(candidates, BOT_FEED_MAX)
+    page = ordered[:limit]
+    if not any(item[2]["is_bot"] for item in page):
+        bots = [item for item in ordered if item[2]["is_bot"]]
+        if bots:
+            if len(page) < limit:
+                page.append(bots[0])
+            elif page:
+                page[-1] = bots[0]
+    return [card(c, row, secret, me["province"], my_prefs) for _same, _score, row in page]
 
 
 def likes_today(c: sqlite3.Connection, uid: str, today: Optional[date] = None) -> int:
@@ -1994,6 +2019,15 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
         uid = current_user(request)
         run(lambda c: delete_photo(c, uid, photos_dir(), photo_id))
         return {"success": True}
+
+    @router.get("/api/dating/photo/portrait/{kind}")
+    def dating_bot_portrait(kind: str):
+        if kind not in ("hombre", "mujer"):
+            raise HTTPException(404, "Foto no encontrada")
+        path = os.path.join(os.path.dirname(__file__), "bot_portraits", f"{kind}.jpg")
+        if not os.path.isfile(path):
+            raise HTTPException(404, "Foto no encontrada")
+        return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
 
     @router.get("/api/dating/photo/{photo_id}")
     def dating_photo(photo_id: int, e: int = 0, s: str = ""):
