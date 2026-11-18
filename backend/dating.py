@@ -308,7 +308,7 @@ def in_common(mine: Dict[str, Any], theirs: Dict[str, Any]) -> int:
 
 def age_from(birth_date: str, today: Optional[date] = None) -> int:
     born = date.fromisoformat(birth_date)
-    today = today or _today()
+    today = today or _cuba_today()
     return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
 
 
@@ -338,7 +338,7 @@ def _clean_text(value: Any, maximum: int, field: str, required: bool = False) ->
 def clean_profile(data: Dict[str, Any], telegram_username: str = "", existing: bool = False,
                   today: Optional[date] = None, locked_birth_date: Optional[str] = None) -> Dict[str, Any]:
     """Valida el perfil. Si ``locked_birth_date`` viene, la fecha de nacimiento no se puede cambiar."""
-    today = today or _today()
+    today = today or _cuba_today()
     if locked_birth_date:
         sent = str(data.get("birth_date") or "")
         if sent and sent != locked_birth_date:
@@ -1297,6 +1297,102 @@ def admin_delete_bot(c: sqlite3.Connection, user_id: str, photos_dir: Optional[s
     }
 
 
+def admin_add_bot_photo(
+    c: sqlite3.Connection,
+    user_id: str,
+    photos_dir: str,
+    jpeg: bytes,
+    now: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Agrega una foto a un bot de citas y la aprueba automáticamente (sin revisión manual).
+
+    Los bots son perfiles artificiales controlados por el admin; sus fotos no
+    pasan por el flujo de moderación normal.
+    """
+    uid = str(user_id)
+    row = c.execute(
+        "SELECT * FROM dating_profiles WHERE user_id=? AND is_bot=1", (uid,)
+    ).fetchone()
+    if not row:
+        raise DatingError("Bot no encontrado.", 404, "not_found")
+
+    count = c.execute(
+        "SELECT COUNT(*) FROM dating_photos WHERE user_id=? AND status!='rejected'",
+        (uid,),
+    ).fetchone()[0]
+    if count >= MAX_PHOTOS:
+        raise DatingError(f"El bot ya tiene el máximo de {MAX_PHOTOS} fotos.", 409, "photo_limit")
+
+    position = c.execute(
+        "SELECT COALESCE(MAX(position),-1)+1 FROM dating_photos WHERE user_id=?", (uid,)
+    ).fetchone()[0]
+
+    filename = uuid.uuid4().hex + ".jpg"
+    if not _storage.put(filename, jpeg):
+        os.makedirs(photos_dir, exist_ok=True)
+        with open(os.path.join(photos_dir, filename), "wb") as handle:
+            handle.write(jpeg)
+
+    now = now or _now()
+    cur = c.execute(
+        "INSERT INTO dating_photos(user_id,filename,position,status,reviewed_at,reviewed_by,created_at) "
+        "VALUES(?,?,?,'approved',?,?,?)",
+        (uid, filename, position, now, "admin_bot_manager", now),
+    )
+    c.commit()
+    return {"id": cur.lastrowid, "status": "approved", "user_id": uid}
+
+
+def admin_delete_bot_photo(
+    c: sqlite3.Connection,
+    user_id: str,
+    photo_id: int,
+    photos_dir: str,
+) -> Dict[str, Any]:
+    """Elimina una foto de un bot. Solo funciona sobre bots (is_bot=1)."""
+    uid = str(user_id)
+    bot_row = c.execute(
+        "SELECT 1 FROM dating_profiles WHERE user_id=? AND is_bot=1", (uid,)
+    ).fetchone()
+    if not bot_row:
+        raise DatingError("Bot no encontrado.", 404, "not_found")
+
+    photo_row = c.execute(
+        "SELECT * FROM dating_photos WHERE id=? AND user_id=?",
+        (int(photo_id), uid),
+    ).fetchone()
+    if not photo_row:
+        raise DatingError("Foto no encontrada en este bot.", 404, "not_found")
+
+    c.execute("DELETE FROM dating_photos WHERE id=?", (int(photo_id),))
+    c.commit()
+    _remove_file(photos_dir, photo_row["filename"])
+    return {"deleted": True, "photo_id": photo_id}
+
+
+def admin_list_bot_photos(
+    c: sqlite3.Connection,
+    user_id: str,
+    secret: str,
+) -> List[Dict[str, Any]]:
+    """Lista todas las fotos de un bot con URLs firmadas."""
+    uid = str(user_id)
+    rows = c.execute(
+        "SELECT * FROM dating_photos WHERE user_id=? ORDER BY position, id",
+        (uid,),
+    ).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "status": r["status"],
+            "position": r["position"],
+            "url": photo_url(secret, r["id"]),
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Chat interno — funciones de negocio
 # ---------------------------------------------------------------------------
@@ -1482,60 +1578,90 @@ def _enrich_matches_with_chat(c: sqlite3.Connection, uid: str, matches: List[Dic
 def admin_bot_conversations(
     c: sqlite3.Connection,
     bot_user_id: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    search: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
 ) -> Dict[str, Any]:
-    """Lista los matches activos que involucran bots, con el último mensaje.
+    """Lista los matches que involucran bots, con el último mensaje.
 
-    FIX L13: añade u.user_id != b.user_id para evitar producto cartesiano en
-    el improbable caso de un match bot↔bot.
+    FIX L13: u.user_id != b.user_id evita producto cartesiano en match bot↔bot.
+    FIX L14: muestra TODOS los matches (no solo 'active') para que el panel no
+             aparezca vacío cuando hay matches cerrados/unmatched con bots.
+             Se añade status_filter ('active'|'unmatched'|'all') para filtrar.
+    FIX L15: ordena por actividad reciente (último mensaje DESC) en lugar de
+             fecha de match, para que los chats más activos aparezcan primero.
+    FIX L16: soporte de búsqueda por nombre de bot o nombre de usuario real.
     """
-    base_sql = (
-        "SELECT m.id AS match_id, m.user_a, m.user_b, m.created_at AS matched_at, "
-        "       b.user_id AS bot_id, b.display_name AS bot_name, b.public_id AS bot_public_id, "
-        "       u.user_id AS real_id, u.display_name AS real_name, u.public_id AS real_public_id "
+    # Construir condición de estado
+    if status_filter and status_filter != "all":
+        status_cond = "AND m.status=? "
+        status_params_val: List[Any] = [status_filter]
+    else:
+        # Mostrar todos los matches con bots (activos y cerrados)
+        status_cond = ""
+        status_params_val = []
+
+    base_join = (
         "FROM dating_matches m "
         "JOIN dating_profiles b ON b.user_id IN (m.user_a, m.user_b) AND b.is_bot=1 "
         "JOIN dating_profiles u ON u.user_id IN (m.user_a, m.user_b) AND u.is_bot=0 "
         "   AND u.user_id != b.user_id "
-        "WHERE m.status='active' "
+        "LEFT JOIN dating_messages lm ON lm.id = ("
+        "  SELECT MAX(id) FROM dating_messages WHERE match_id=m.id AND is_system=0"
+        ") "
     )
-    params: List[Any] = []
-    if bot_user_id:
-        base_sql += "AND b.user_id=? "
-        params.append(str(bot_user_id))
-    base_sql += "ORDER BY m.created_at DESC LIMIT ? OFFSET ?"
-    params.extend([int(limit), int(offset)])
 
-    rows = c.execute(base_sql, params).fetchall()
-    total_sql = (
-        "SELECT COUNT(*) FROM dating_matches m "
-        "JOIN dating_profiles b ON b.user_id IN (m.user_a, m.user_b) AND b.is_bot=1 "
-        "JOIN dating_profiles u ON u.user_id IN (m.user_a, m.user_b) AND u.is_bot=0 "
-        "   AND u.user_id != b.user_id "
-        "WHERE m.status='active'"
-    )
-    total_params: List[Any] = []
+    search_cond = ""
+    search_params: List[Any] = []
+    if search:
+        search_cond = "AND (b.display_name LIKE ? OR u.display_name LIKE ?) "
+        patt = f"%{search}%"
+        search_params = [patt, patt]
+
+    bot_cond = ""
+    bot_params: List[Any] = []
     if bot_user_id:
-        total_sql += " AND b.user_id=?"
-        total_params.append(str(bot_user_id))
-    total = c.execute(total_sql, total_params).fetchone()[0]
+        bot_cond = "AND b.user_id=? "
+        bot_params = [str(bot_user_id)]
+
+    where_clause = "WHERE 1=1 " + status_cond + bot_cond + search_cond
+
+    all_params: List[Any] = status_params_val + bot_params + search_params
+
+    base_sql = (
+        "SELECT m.id AS match_id, m.user_a, m.user_b, m.created_at AS matched_at, "
+        "       m.status AS match_status, m.ended_at, "
+        "       b.user_id AS bot_id, b.display_name AS bot_name, b.public_id AS bot_public_id, "
+        "       u.user_id AS real_id, u.display_name AS real_name, u.public_id AS real_public_id, "
+        "       lm.id AS lm_id, lm.sender_id AS lm_sender, lm.body AS lm_body, lm.created_at AS lm_at "
+        + base_join
+        + where_clause
+        + "ORDER BY COALESCE(lm.created_at, m.created_at) DESC LIMIT ? OFFSET ?"
+    )
+
+    rows = c.execute(base_sql, all_params + [int(limit), int(offset)]).fetchall()
+
+    total_sql = "SELECT COUNT(*) " + base_join + where_clause
+    total = c.execute(total_sql, all_params).fetchone()[0]
 
     conversations = []
     for r in rows:
         mid = r["match_id"]
-        last = c.execute(
-            "SELECT * FROM dating_messages WHERE match_id=? AND is_system=0 ORDER BY id DESC LIMIT 1",
-            (mid,),
-        ).fetchone()
         unread = c.execute(
             "SELECT COUNT(*) FROM dating_messages "
             "WHERE match_id=? AND sender_id=? AND read_at IS NULL AND is_system=0",
             (mid, r["real_id"]),
         ).fetchone()[0]
+        msg_count = c.execute(
+            "SELECT COUNT(*) FROM dating_messages WHERE match_id=? AND is_system=0",
+            (mid,),
+        ).fetchone()[0]
         conversations.append({
             "match_id":        mid,
+            "match_status":    r["match_status"],
             "matched_at":      r["matched_at"],
+            "ended_at":        r["ended_at"],
             "bot_id":          r["bot_id"],
             "bot_name":        r["bot_name"],
             "bot_public_id":   r["bot_public_id"],
@@ -1543,12 +1669,13 @@ def admin_bot_conversations(
             "real_name":       r["real_name"],
             "real_public_id":  r["real_public_id"],
             "unread_from_user": unread,
+            "message_count":   msg_count,
             "last_message": {
-                "id":         last["id"],
-                "sender_id":  last["sender_id"],
-                "body":       last["body"],
-                "created_at": last["created_at"],
-            } if last else None,
+                "id":         r["lm_id"],
+                "sender_id":  r["lm_sender"],
+                "body":       r["lm_body"],
+                "created_at": r["lm_at"],
+            } if r["lm_id"] else None,
         })
     return {"conversations": conversations, "total": total, "limit": limit, "offset": offset}
 
@@ -2168,6 +2295,35 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
                "messages_deleted": result.get("messages_deleted", 0)})
         return result
 
+    # --- fotos de bots -------------------------------------------------------
+
+    @router.get("/api/admin/dating/bots/{user_id}/photos")
+    def admin_bots_photos_list(user_id: str, request: Request):
+        """Lista las fotos de un bot con URLs firmadas."""
+        admin(request, "dating")
+        return {"photos": run(lambda c: admin_list_bot_photos(c, user_id, secret()))}
+
+    @router.post("/api/admin/dating/bots/{user_id}/photos")
+    def admin_bots_photos_add(user_id: str, p: PhotoIn, request: Request):
+        """Sube y aprueba automáticamente una foto para un bot de citas.
+
+        El cuerpo debe ser JSON con campo ``image`` en formato data-URL
+        (``data:image/jpeg;base64,...``).
+        """
+        ident = admin(request, "dating")
+        jpeg = process_photo(parse_image_data_url(p.image))
+        result = run(lambda c: admin_add_bot_photo(c, user_id, photos_dir(), jpeg))
+        audit(ident["username"], "dating_bot_photo_added", user_id, {"photo_id": result["id"]})
+        return result
+
+    @router.delete("/api/admin/dating/bots/{user_id}/photos/{photo_id}")
+    def admin_bots_photos_delete(user_id: str, photo_id: int, request: Request):
+        """Elimina una foto de un bot."""
+        ident = admin(request, "dating")
+        result = run(lambda c: admin_delete_bot_photo(c, user_id, photo_id, photos_dir()))
+        audit(ident["username"], "dating_bot_photo_deleted", user_id, {"photo_id": photo_id})
+        return result
+
     # --- chat interno -------------------------------------------------------
     msg_rate_limiter = _limits.SlidingWindowLimiter(
         int(os.getenv("DATING_MSG_RATE_PER_MINUTE", str(MSG_RATE_PER_MINUTE))), 60
@@ -2246,12 +2402,25 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
     def admin_bots_conversations(
         request: Request,
         bot_user_id: Optional[str] = None,
+        status_filter: Optional[str] = None,
+        search: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
     ):
-        """Lista todos los matches activos que involucran bots."""
+        """Lista los matches que involucran bots (activos y cerrados).
+
+        FIX L14: ahora devuelve todos los matches, no solo status='active'.
+        Parámetros opcionales: bot_user_id, status_filter ('active'|'unmatched'|'all'), search.
+        """
         admin(request, "dating")
-        return run(lambda c: admin_bot_conversations(c, bot_user_id=bot_user_id, limit=limit, offset=offset))
+        return run(lambda c: admin_bot_conversations(
+            c,
+            bot_user_id=bot_user_id,
+            status_filter=status_filter,
+            search=search,
+            limit=limit,
+            offset=offset,
+        ))
 
     @router.get("/api/admin/dating/bots/conversations/{match_id}/messages")
     def admin_bots_messages(

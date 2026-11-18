@@ -254,7 +254,7 @@ def notify_user(user_id: str, text: str, app_button: bool = False) -> None:
     threading.Thread(target=_send, daemon=True).start()
 
 
-def now(): return datetime.utcnow().isoformat()
+def now(): return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 try:  # los reinicios diarios y las estadísticas del día usan la fecha de Cuba (los registros siguen en UTC)
     from zoneinfo import ZoneInfo
     CUBA_TZ = ZoneInfo("America/Havana")
@@ -266,6 +266,27 @@ def cuba_day_start_utc() -> str:
     d = datetime.now(timezone.utc).astimezone(CUBA_TZ).date()
     return datetime(d.year, d.month, d.day, tzinfo=CUBA_TZ).astimezone(timezone.utc).replace(tzinfo=None).isoformat()
 def today(): return cuba_today()
+def cuba_n_days_ago_date(n: int) -> str:
+    """Fecha de hace N días completos en hora de Cuba (YYYY-MM-DD), para usar como corte en agrupaciones por día."""
+    return (datetime.now(timezone.utc).astimezone(CUBA_TZ) - timedelta(days=n)).date().isoformat()
+
+
+def cuba_sqlite_day_modifier() -> str:
+    """Modificador SQLite para date(col, …) que convierte timestamps UTC naive a fecha local de Cuba.
+
+    Calcula el offset actual de America/Havana vía ZoneInfo (p. ej. '-5 hours').
+    Cuba no aplica DST desde hace décadas, pero si el offset cambiara en el futuro
+    este helper se adapta solo. No es perfecto para datos históricos que crucen
+    un cambio de offset, pero es preferible a hardcodear '-5 hours'.
+    """
+    now_cuba = datetime.now(timezone.utc).astimezone(CUBA_TZ)
+    offset = now_cuba.utcoffset() or timedelta(0)
+    total_seconds = int(offset.total_seconds())
+    hours = total_seconds // 3600
+    if hours == 0:
+        return "+0 hours"
+    # SQLite acepta p.ej. '-5 hours' o '+2 hours'
+    return f"{hours:+d} hours"
 
 
 def _quota_charge_is_from_today(connection, log_id, uid: str) -> bool:
@@ -589,10 +610,7 @@ def premium(uid):
     p=user(uid).get("premium_until")
     if not p: return False
     try:
-        expiry = datetime.fromisoformat(p)
-        if expiry.tzinfo is not None:
-            return datetime.now(expiry.tzinfo) < expiry
-        return datetime.utcnow() < expiry
+        return _utc_datetime() < _utc_datetime(p)
     except (ValueError, TypeError): return False
 
 
@@ -615,8 +633,7 @@ def consume(uid, module, mode):
         is_premium = False
         if until:
             try:
-                expiry = datetime.fromisoformat(until)
-                is_premium = (datetime.now(expiry.tzinfo) < expiry) if expiry.tzinfo else (datetime.utcnow() < expiry)
+                is_premium = _utc_datetime() < _utc_datetime(until)
             except (ValueError, TypeError):
                 is_premium = False
         if not is_premium and used >= FREE_DAILY_LIMIT:
@@ -1946,13 +1963,13 @@ def user_stats(request: Request):
     ).fetchall()
     rows_week = c.execute(
         "SELECT mode, COUNT(*) n FROM usage_logs WHERE user_id=? AND used_at>=? GROUP BY mode",
-        (uid, (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S"))
+        (uid, (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S"))
     ).fetchall()
     rows_days = c.execute(
         """SELECT date(used_at) d, COUNT(*) n FROM usage_logs
            WHERE user_id=? AND used_at>=?
            GROUP BY date(used_at) ORDER BY d""",
-        (uid, (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S"))
+        (uid, (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S"))
     ).fetchall()
     # Best mode
     all_modes = {r["mode"]: r["n"] for r in rows_all if r["mode"]}
@@ -3143,11 +3160,12 @@ def admin_stats(request: Request):
         pending_payments= c.execute("SELECT COUNT(*) n FROM payment_operations WHERE status IN ('pending','proof_submitted')").fetchone()["n"]
 
         # ── Nuevos usuarios por día (últimos 14 días) ────────────────────────
-        cutoff_14 = (datetime.now(timezone.utc) - timedelta(days=13)).date().isoformat()
+        cutoff_14 = cuba_n_days_ago_date(13)
+        _cuba_mod = cuba_sqlite_day_modifier()  # p.ej. '-5 hours' desde ZoneInfo
         new_by_day_rows = c.execute(
-            """SELECT substr(created_at,1,10) day, COUNT(*) n
-               FROM users WHERE substr(created_at,1,10) >= ?
-               GROUP BY substr(created_at,1,10) ORDER BY day""",
+            f"""SELECT date(created_at, '{_cuba_mod}') day, COUNT(*) n
+               FROM users WHERE date(created_at, '{_cuba_mod}') >= ?
+               GROUP BY date(created_at, '{_cuba_mod}') ORDER BY day""",
             (cutoff_14,)
         ).fetchall()
         new_users_by_day = [{"day": r["day"], "count": r["n"]} for r in new_by_day_rows]
@@ -3188,9 +3206,9 @@ def admin_stats(request: Request):
 
         # ── Uso diario últimos 14 días (para gráfica de actividad) ───────────
         usage_by_day_rows = c.execute(
-            """SELECT substr(used_at,1,10) day, COUNT(*) n
-               FROM usage_logs WHERE substr(used_at,1,10) >= ?
-               GROUP BY substr(used_at,1,10) ORDER BY day""",
+            f"""SELECT date(used_at, '{_cuba_mod}') day, COUNT(*) n
+               FROM usage_logs WHERE date(used_at, '{_cuba_mod}') >= ?
+               GROUP BY date(used_at, '{_cuba_mod}') ORDER BY day""",
             (cutoff_14,)
         ).fetchall()
         usage_by_day = [{"day": r["day"], "count": r["n"]} for r in usage_by_day_rows]
@@ -3278,12 +3296,13 @@ def admin_ai_monitor(request: Request):
           FROM ai_generation_events e LEFT JOIN users u ON u.user_id=e.user_id
           ORDER BY e.id DESC LIMIT 100
         """).fetchall()
-        days = c.execute("""
-          SELECT substr(created_at,1,10) day,
+        _cuba_mod = cuba_sqlite_day_modifier()
+        days = c.execute(f"""
+          SELECT date(created_at, '{_cuba_mod}') day,
                  SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) successes,
                  SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) failures
-          FROM ai_generation_events WHERE created_at >= ? GROUP BY substr(created_at,1,10) ORDER BY day
-        """, ((datetime.now(timezone.utc)-timedelta(days=6)).isoformat(),)).fetchall()
+          FROM ai_generation_events WHERE date(created_at, '{_cuba_mod}') >= ? GROUP BY date(created_at, '{_cuba_mod}') ORDER BY day
+        """, (cuba_n_days_ago_date(6),)).fetchall()
         total=int(totals["total"] or 0); successes=int(totals["successes"] or 0); failures=int(totals["failures"] or 0)
         return {
           "summary":{"today_events":total,"successes":successes,"failures":failures,

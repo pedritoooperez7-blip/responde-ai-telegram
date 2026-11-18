@@ -157,14 +157,16 @@
   }
 
   function dateLabel(iso) {
+    const CUBA = 'America/Havana';
     const d = new Date(iso + (iso.endsWith('Z') ? '' : 'Z'));
+    const cubaDate = d.toLocaleDateString('es-CU', { timeZone: CUBA, year: 'numeric', month: '2-digit', day: '2-digit' });
     const now = new Date();
-    const isToday = d.toDateString() === now.toDateString();
-    const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
-    const isYesterday = d.toDateString() === yesterday.toDateString();
-    if (isToday) return 'Hoy';
-    if (isYesterday) return 'Ayer';
-    return d.toLocaleDateString('es-CU', { day: 'numeric', month: 'long' });
+    const todayDate = now.toLocaleDateString('es-CU', { timeZone: CUBA, year: 'numeric', month: '2-digit', day: '2-digit' });
+    const yesterday = new Date(now.getTime() - 86400000);
+    const yesterdayDate = yesterday.toLocaleDateString('es-CU', { timeZone: CUBA, year: 'numeric', month: '2-digit', day: '2-digit' });
+    if (cubaDate === todayDate) return 'Hoy';
+    if (cubaDate === yesterdayDate) return 'Ayer';
+    return d.toLocaleDateString('es-CU', { day: 'numeric', month: 'long', timeZone: CUBA });
   }
 
   function msgTime(iso) {

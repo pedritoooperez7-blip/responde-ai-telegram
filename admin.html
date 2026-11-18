@@ -44,132 +44,507 @@ ${d.dating?`<div class="admin-card"><b>Citas</b><div class="admin-grid" style="m
 else if(tab==='users'){const d=await api('/api/admin/users');c.innerHTML=`<h2>Usuarios y Premium</h2><input id="userSearch" class="admin-input" placeholder="Buscar por ID, nombre o username"><div id="userRows"></div>`;const draw=items=>$('#userRows').innerHTML=items.map(u=>`<div class="admin-row"><b>${esc(u.first_name||u.username||'Usuario')} · ${esc(u.user_id)}</b><div class="admin-small">@${esc(u.username||'—')} · Teléfono: ${esc(u.payment_phone||'—')}<br>Premium: ${u.premium?'Activo':'Inactivo'} · Vence: ${esc(fmtCubaDate(u.premium_until))}${u.banned?`<br><b style="color:#c0392b">BANEADO</b> desde ${esc(fmtCubaDate(u.banned_at))} · sus datos se borran 48 h después del baneo`:''}</div>${can('premium')?`<div class="admin-actions"><button class="admin-btn" data-prem="grant" data-uid="${esc(u.user_id)}">Activar 7 días</button><button class="admin-btn secondary" data-prem="extend" data-days="7" data-uid="${esc(u.user_id)}">Extender 7 días</button><button class="admin-btn secondary" data-prem="extend" data-days="365" data-uid="${esc(u.user_id)}">Extender 1 año</button><button class="admin-btn danger" data-prem="revoke" data-uid="${esc(u.user_id)}">Retirar Premium</button></div>`:''}${can('users')?`<div class="admin-actions">${u.banned?`<button class="admin-btn" data-ban="unban" data-uid="${esc(u.user_id)}">Desbanear</button>`:`<button class="admin-btn danger" data-ban="ban" data-uid="${esc(u.user_id)}">Banear</button>`}<button class="admin-btn danger" data-ban="delete" data-uid="${esc(u.user_id)}">Borrar usuario y datos</button></div>`:''}</div>`).join('')||'<p>Sin usuarios.</p>';draw(d.items);$('#userSearch').oninput=()=>draw(d.items.filter(u=>[u.user_id,u.username,u.first_name].some(v=>String(v||'').toLowerCase().includes($('#userSearch').value.toLowerCase()))));$$('[data-ban]').forEach(b=>b.onclick=async()=>{const uid=b.dataset.uid,act=b.dataset.ban,base=`/api/admin/users/${encodeURIComponent(uid)}`;try{if(act==='ban'){const reason=prompt('Motivo del baneo (opcional).\nEl usuario pierde el acceso ahora y, si no lo desbaneas en 48 horas, sus datos se borran.');if(reason===null)return;await api(base+'/ban',{method:'POST',body:JSON.stringify({reason})});alert('Usuario baneado')}else if(act==='unban'){if(!confirm(`¿Desbanear a ${uid}?`))return;await api(base+'/unban',{method:'POST'});alert('Usuario desbaneado')}else{if(!confirm(`¿Borrar a ${uid} y TODOS sus datos (perfil de Citas, fotos, historial, anuncio)? Esto no se puede deshacer.`))return;await api(base,{method:'DELETE'});alert('Usuario borrado')}await showTab('users')}catch(e){alert(e.message)}});$$('[data-prem]').forEach(b=>b.onclick=async()=>{if(!confirm(`¿Confirmas ${b.dataset.prem} Premium para ${b.dataset.uid}?`))return;try{await api('/api/admin/premium',{method:'POST',body:JSON.stringify({user_id:b.dataset.uid,action:b.dataset.prem,days:Number(b.dataset.days||7)})});alert('Premium actualizado');await showTab('users')}catch(e){alert(e.message)}})}
 else if(tab==='payments'){const d=await api('/api/admin/payments');c.innerHTML=`<h2>Pagos recientes</h2><div class="admin-table-wrap"><table class="admin-table"><thead><tr><th>Operación</th><th>Usuario</th><th>Método</th><th>Importe</th><th>Estado</th><th>Comprobante / archivo</th><th>Fecha</th><th>Acción</th></tr></thead><tbody>${d.items.map(p=>`<tr><td>${esc(p.operation_id)}</td><td>${esc(p.user_id)}</td><td>${esc(p.payment_method||'—')}</td><td>${esc(p.amount)}</td><td>${esc(p.status)}</td><td>${p.archive_status==='sent'?`Archivado · chat ${esc(p.archive_chat_id||'—')} · mensaje ${esc(p.archive_message_id||'—')}`:p.archive_status==='queued'||p.archive_status==='retrying'?`Pendiente de archivo · intentos ${esc(p.archive_attempts||0)}${p.archive_last_error?`<br>Error: ${esc(p.archive_last_error)}`:''}`:`${p.proof_text?'Texto disponible':''}${p.has_proof_image?' · Imagen disponible':''}${!p.proof_text&&!p.has_proof_image?'Sin copia local':''}`}${p.proof_text||p.has_proof_image?`<br><button class="admin-btn secondary" data-proof="${esc(p.operation_id)}">Ver comprobante</button>`:''}</td><td>${esc(fmtCubaDate(p.created_at))}</td><td>${can('payments')&&['pending','proof_submitted'].includes(p.status)?`<button class="admin-btn" data-verify="${esc(p.operation_id)}">Verificar</button><button class="admin-btn danger" data-reject="${esc(p.operation_id)}">Rechazar</button>`:'—'}</td></tr>`).join('')}</tbody></table></div><p class="admin-small">Verificar un pago concede el Premium del plan asociado. Confirma primero que el dinero fue recibido.</p>`;$$('[data-verify]').forEach(b=>b.onclick=async()=>{if(!confirm('¿Confirmaste el ingreso real del dinero y deseas activar Premium?'))return;try{await api('/api/admin/payments/verify',{method:'POST',body:JSON.stringify({operation_id:b.dataset.verify,user_id:''})});alert('Pago verificado');showTab('payments')}catch(e){alert(e.message)}});$$('[data-reject]').forEach(b=>b.onclick=async()=>{const reason=prompt('Motivo del rechazo (opcional):')??null;if(reason===null)return;try{await api('/api/admin/payments/reject',{method:'POST',body:JSON.stringify({operation_id:b.dataset.reject,action:'reject',reason})});showTab('payments')}catch(e){alert(e.message)}});$$('[data-proof]').forEach(b=>b.onclick=async()=>{try{const proof=await api('/api/admin/payments/'+encodeURIComponent(b.dataset.proof)+'/proof');const modal=document.createElement('div');modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px';const body=document.createElement('div');body.style.cssText='background:#fff;color:#222;border-radius:16px;padding:18px;max-width:700px;width:100%;max-height:90vh;overflow:auto';const close=document.createElement('button');close.className='admin-btn secondary';close.textContent='Cerrar';close.onclick=()=>modal.remove();body.appendChild(close);if(proof.proof_text){const text=document.createElement('pre');text.style.cssText='white-space:pre-wrap;overflow-wrap:anywhere;margin:14px 0';text.textContent=proof.proof_text;body.appendChild(text)}if(proof.proof_image){const img=document.createElement('img');img.src=proof.proof_image;img.alt='Comprobante de pago';img.style.cssText='max-width:100%;height:auto;border-radius:10px';body.appendChild(img)}modal.appendChild(body);modal.onclick=e=>{if(e.target===modal)modal.remove()};document.body.appendChild(modal)}catch(e){alert(e.message||'No se pudo cargar el comprobante')}})}
 else if(tab==='admins'){if(!can('admins')){c.innerHTML='<div class="admin-card">No tienes permiso para administrar cuentas.</div>';return}const d=await api('/api/admin/admins');c.innerHTML=`<h2>Administradores</h2><div class="admin-card"><h3>Crear administrador</h3><label>Usuario</label><input id="newUser" class="admin-input" placeholder="usuario"><label>Contraseña (mínimo 10 caracteres)</label><input id="newPass" class="admin-input" type="password"><p><label><input type="checkbox" value="users" class="perm" checked> Usuarios</label> <label><input type="checkbox" value="premium" class="perm" checked> Premium</label> <label><input type="checkbox" value="payments" class="perm"> Pagos</label> <label><input type="checkbox" value="stats" class="perm"> Estadísticas</label> <label><input type="checkbox" value="audit" class="perm"> Historial</label> <label><input type="checkbox" value="ai_analytics" class="perm"> Monitor de IA</label> <label><input type="checkbox" value="dating" class="perm"> Citas (moderación)</label> <label><input type="checkbox" value="ads" class="perm"> Anuncios</label></p><button id="createAdmin" class="admin-btn">Crear administrador</button></div><h3>Administradores existentes</h3>${d.items.map(a=>`<div class="admin-row"><b>${esc(a.username)}</b><div class="admin-small">Permisos: ${esc(a.permissions.join(', '))} · ${a.is_active?'Activo':'Desactivado'}</div>${a.is_active?`<button class="admin-btn danger" data-disable="${esc(a.username)}">Desactivar</button>`:''}</div>`).join('')}`;$('#createAdmin').onclick=async()=>{try{const permissions=$$('.perm:checked').map(x=>x.value);await api('/api/admin/admins',{method:'POST',body:JSON.stringify({username:$('#newUser').value,password:$('#newPass').value,permissions})});alert('Administrador creado');showTab('admins')}catch(e){alert(e.message)}};$$('[data-disable]').forEach(b=>b.onclick=async()=>{if(!confirm('¿Desactivar este administrador?'))return;try{await api('/api/admin/admins/status',{method:'POST',body:JSON.stringify({username:b.dataset.disable,is_active:false})});showTab('admins')}catch(e){alert(e.message)}})}
-else if(tab==='dating'){if(!can('dating')){c.innerHTML='<div class="admin-card">No tienes permiso para moderar Citas.</div>';return}const d=await api('/api/admin/dating/overview');const s=d.stats;c.innerHTML=`<h2>Citas · moderación</h2><div class="admin-grid">${[['Perfiles',s.profiles],['Activos',s.active_profiles],['Fotos por revisar',s.pending_photos],['Reportes abiertos',s.open_reports],['Matches',s.matches]].map(x=>`<div class="admin-stat"><b>${esc(x[1])}</b><span>${x[0]}</span></div>`).join('')}</div><h3>Fotos pendientes</h3>${d.photos.length?d.photos.map(p=>`<div class="admin-card"><img src="${esc(p.url)}" alt="" style="max-width:220px;max-height:280px;border-radius:12px;display:block;margin-bottom:8px"><div class="admin-small">${esc(p.display_name)} · usuario ${esc(p.user_id)} · ${fmtCubaDate(p.created_at)}</div><button class="admin-btn" data-photo="${esc(p.id)}" data-act="approve">Aprobar</button> <button class="admin-btn secondary" data-photo="${esc(p.id)}" data-act="reject">Rechazar</button></div>`).join(''):'<div class="admin-card">No hay fotos pendientes.</div>'}<h3>Reportes abiertos</h3>${d.reports.length?d.reports.map(r=>`<div class="admin-card"><b>${esc(r.display_name||'Perfil eliminado')}</b> <span class="admin-small">(${esc(r.profile_status||'—')})</span><div class="admin-small">Motivo: ${esc(r.reason)} · reportó ${esc(r.reporter_id)} · ${fmtCubaDate(r.created_at)}</div>${r.details?`<p>${esc(r.details)}</p>`:''}<button class="admin-btn" data-report="${esc(r.id)}" data-act="suspend">Suspender perfil</button> <button class="admin-btn secondary" data-report="${esc(r.id)}" data-act="dismiss">Descartar</button></div>`).join(''):'<div class="admin-card">No hay reportes abiertos.</div>'}`;$$('[data-photo]').forEach(b=>b.onclick=async()=>{let reason='';if(b.dataset.act==='reject'){reason=prompt('Motivo del rechazo (se muestra al usuario):','Foto no permitida')||'';if(!reason)return}try{await api('/api/admin/dating/photos/'+encodeURIComponent(b.dataset.photo)+'/review',{method:'POST',body:JSON.stringify({action:b.dataset.act,reason})});showTab('dating')}catch(e){alert(e.message)}});$$('[data-report]').forEach(b=>b.onclick=async()=>{if(b.dataset.act==='suspend'&&!confirm('¿Suspender este perfil de Citas?'))return;try{await api('/api/admin/dating/reports/'+encodeURIComponent(b.dataset.report)+'/resolve',{method:'POST',body:JSON.stringify({action:b.dataset.act})});showTab('dating')}catch(e){alert(e.message)}})}
+else if(tab==='dating'){
+if(!can('dating')){c.innerHTML='<div class="admin-card">No tienes permiso para moderar Citas.</div>';return}
+// ── Estado sub-sección ───────────────────────────────────────────────────────
+let _dtSubTab='moderation';
+const PROVINCES_LIST=['Pinar del Río','Artemisa','La Habana','Mayabeque','Matanzas','Cienfuegos','Villa Clara','Sancti Spíritus','Ciego de Ávila','Camagüey','Las Tunas','Holguín','Granma','Santiago de Cuba','Guantánamo','Isla de la Juventud','Fuera de Cuba'];
+const GENDERS_LIST=['hombre','mujer','otro'];
+const LOOKING_LIST=['hombres','mujeres','todos'];
+function _dtRenderShell(){
+  const d2=document.getElementById('dt-subnav-wrap');
+  if(d2)return;
+  c.innerHTML=`
+<style>
+.dt-subnav{display:flex;gap:8px;margin:10px 0 18px;flex-wrap:wrap}
+.dt-subnav button{background:#f0edff;color:#4d35ff;border:none;padding:9px 14px;border-radius:12px;font-weight:800;cursor:pointer;font-size:13px}
+.dt-subnav button.active{background:#4d35ff;color:white}
+.bot-card{background:#faf9ff;border:1px solid #e7e2f1;border-radius:16px;padding:14px;margin-bottom:10px}
+.bot-card-header{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+.bot-status-badge{font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px}
+.bot-status-badge.active{background:#edfdf4;color:#166534}
+.bot-status-badge.inactive{background:#fff8e6;color:#92570a}
+.bot-status-badge.suspended{background:#fff0f2;color:#b4233c}
+.bot-photos-row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 6px}
+.bot-photo-thumb{position:relative;width:72px;height:88px;border-radius:10px;overflow:hidden;border:1px solid #ddd;flex:none}
+.bot-photo-thumb img{width:100%;height:100%;object-fit:cover}
+.bot-photo-thumb .del-ph{position:absolute;top:3px;right:3px;background:rgba(180,35,60,.85);color:#fff;border:none;border-radius:50%;width:20px;height:20px;font-size:13px;cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1}
+.bot-form{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}
+@media(max-width:600px){.bot-form{grid-template-columns:1fr}}
+.bot-form label{font-size:12px;font-weight:700;color:#555;display:block;margin-bottom:3px}
+.bot-form input,.bot-form select,.bot-form textarea{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #d9d4f0;border-radius:10px;font-size:13px;background:#fff}
+.bot-form textarea{min-height:60px;resize:vertical}
+.bot-form .full{grid-column:1/-1}
+.interests-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px}
+.itag{background:#ede9fe;color:#4d35ff;font-size:12px;padding:3px 10px;border-radius:999px;cursor:pointer;user-select:none}
+.itag.sel{background:#4d35ff;color:#fff}
+</style>
+<h2>Citas</h2>
+<div class="dt-subnav" id="dt-subnav-wrap">
+  <button data-dtsub="moderation" class="active">📋 Moderación</button>
+  <button data-dtsub="bots">🤖 Gestión de Bots</button>
+</div>
+<div id="dt-content"></div>`;
+  document.querySelectorAll('[data-dtsub]').forEach(btn=>btn.onclick=()=>{
+    _dtSubTab=btn.dataset.dtsub;
+    document.querySelectorAll('[data-dtsub]').forEach(b=>b.classList.toggle('active',b.dataset.dtsub===_dtSubTab));
+    _dtLoadSub();
+  });
+}
+_dtRenderShell();
+async function _dtLoadSub(){
+  const dc=document.getElementById('dt-content');
+  if(!dc)return;
+  dc.innerHTML='<div class="admin-card">Cargando…</div>';
+  if(_dtSubTab==='moderation'){await _dtLoadModeration(dc)}
+  else{await _dtLoadBots(dc)}
+}
+
+// ── Sub-sección: Moderación (código original) ─────────────────────────────
+async function _dtLoadModeration(dc){
+  const d=await api('/api/admin/dating/overview');
+  const s=d.stats;
+  dc.innerHTML=`<div class="admin-grid">${[['Perfiles',s.profiles],['Activos',s.active_profiles],['Fotos por revisar',s.pending_photos],['Reportes abiertos',s.open_reports],['Matches',s.matches],['Bots',s.bots??'—'],['Bots activos',s.active_bots??'—']].map(x=>`<div class="admin-stat"><b>${esc(x[1])}</b><span>${x[0]}</span></div>`).join('')}</div><h3>Fotos pendientes</h3>${d.photos.length?d.photos.map(p=>`<div class="admin-card"><img src="${esc(p.url)}" alt="" style="max-width:220px;max-height:280px;border-radius:12px;display:block;margin-bottom:8px"><div class="admin-small">${esc(p.display_name)} · usuario ${esc(p.user_id)} · ${fmtCubaDate(p.created_at)}</div><button class="admin-btn" data-photo="${esc(p.id)}" data-act="approve">Aprobar</button> <button class="admin-btn secondary" data-photo="${esc(p.id)}" data-act="reject">Rechazar</button></div>`).join(''):'<div class="admin-card">No hay fotos pendientes.</div>'}<h3>Reportes abiertos</h3>${d.reports.length?d.reports.map(r=>`<div class="admin-card"><b>${esc(r.display_name||'Perfil eliminado')}</b> <span class="admin-small">(${esc(r.profile_status||'—')})</span><div class="admin-small">Motivo: ${esc(r.reason)} · reportó ${esc(r.reporter_id)} · ${fmtCubaDate(r.created_at)}</div>${r.details?`<p>${esc(r.details)}</p>`:''}<button class="admin-btn" data-report="${esc(r.id)}" data-act="suspend">Suspender perfil</button> <button class="admin-btn secondary" data-report="${esc(r.id)}" data-act="dismiss">Descartar</button></div>`).join(''):'<div class="admin-card">No hay reportes abiertos.</div>'}`;
+  dc.querySelectorAll('[data-photo]').forEach(b=>b.onclick=async()=>{let reason='';if(b.dataset.act==='reject'){reason=prompt('Motivo del rechazo (se muestra al usuario):','Foto no permitida')||'';if(!reason)return}try{await api('/api/admin/dating/photos/'+encodeURIComponent(b.dataset.photo)+'/review',{method:'POST',body:JSON.stringify({action:b.dataset.act,reason})});_dtLoadSub()}catch(e){alert(e.message)}});
+  dc.querySelectorAll('[data-report]').forEach(b=>b.onclick=async()=>{if(b.dataset.act==='suspend'&&!confirm('¿Suspender este perfil de Citas?'))return;try{await api('/api/admin/dating/reports/'+encodeURIComponent(b.dataset.report)+'/resolve',{method:'POST',body:JSON.stringify({action:b.dataset.act})});_dtLoadSub()}catch(e){alert(e.message)}});
+}
+
+// ── Sub-sección: Gestión de Bots ──────────────────────────────────────────
+let _dtEditingBot=null; // null=crear, string=user_id del bot a editar
+const INTEREST_OPTS=['música','deportes','viajes','cocina','cine','lectura','baile','fotografía','arte','gaming','tecnología','naturaleza','moda','fitness','animales'];
+
+function _dtBotFormHTML(bot){
+  const v=(f,def='')=>bot?esc(bot[f]??def):def;
+  const ints=bot?JSON.parse(bot.interests||'[]'):[];
+  const sel=(f,opts,def='')=>`<select name="${f}">${opts.map(o=>`<option value="${esc(o)}"${(bot?bot[f]:def)===o?' selected':''}>${esc(o)}</option>`).join('')}</select>`;
+  const intTags=INTEREST_OPTS.map(i=>`<span class="itag${ints.includes(i)?' sel':''}" data-int="${esc(i)}">${esc(i)}</span>`).join('');
+  return `<div class="bot-form" id="bot-form-fields">
+  <div><label>Nombre / display_name *</label><input name="display_name" value="${v('display_name')}" placeholder="Ej: Sofía García" required></div>
+  <div><label>Fecha nacimiento * (YYYY-MM-DD)</label><input name="birth_date" value="${v('birth_date')}" placeholder="1995-06-15" required></div>
+  <div><label>Género *</label>${sel('gender',GENDERS_LIST,'mujer')}</div>
+  <div><label>Busca *</label>${sel('looking_for',LOOKING_LIST,'hombres')}</div>
+  <div><label>Provincia *</label><select name="province">${PROVINCES_LIST.map(p=>`<option value="${esc(p)}"${v('province')===p?' selected':''}>${esc(p)}</option>`).join('')}</select></div>
+  <div><label>Municipio</label><input name="municipality" value="${v('municipality')}" placeholder="Opcional"></div>
+  <div class="full"><label>Biografía corta</label><textarea name="bio" placeholder="Descripción del perfil (máx. 500 caracteres)">${v('bio')}</textarea></div>
+  <div><label>Edad mínima buscada</label><input type="number" name="min_age" value="${v('min_age','18')}" min="18" max="99"></div>
+  <div><label>Edad máxima buscada</label><input type="number" name="max_age" value="${v('max_age','99')}" min="18" max="99"></div>
+  <div><label>WhatsApp</label><input name="whatsapp" value="${v('whatsapp')}" placeholder="+5355123456"></div>
+  <div><label>Estado</label><select name="status"><option value="active"${v('status','active')==='active'?' selected':''}>Activo</option><option value="inactive"${v('status')==='inactive'?' selected':''}>Inactivo</option><option value="suspended"${v('status')==='suspended'?' selected':''}>Suspendido</option></select></div>
+  <div class="full"><label>Notas internas (solo admin)</label><input name="bot_notes" value="${v('bot_notes')}" placeholder="Notas que solo ve el administrador"></div>
+  <div class="full"><label>Intereses (haz clic para seleccionar)</label><div class="interests-tags" id="interests-tags-wrap">${intTags}</div><input type="hidden" name="interests_json" id="interests-json-hidden" value="${esc(JSON.stringify(ints))}"></div>
+</div>`;
+}
+
+function _dtCollectForm(){
+  const form=document.getElementById('bot-form-fields');
+  if(!form)return null;
+  const g=n=>form.querySelector(`[name="${n}"]`)?.value?.trim()||'';
+  const interests=JSON.parse(document.getElementById('interests-json-hidden')?.value||'[]');
+  return{display_name:g('display_name'),birth_date:g('birth_date'),gender:g('gender'),looking_for:g('looking_for'),province:g('province'),municipality:g('municipality'),bio:g('bio'),min_age:parseInt(g('min_age')||'18'),max_age:parseInt(g('max_age')||'99'),whatsapp:g('whatsapp'),status:g('status'),bot_notes:g('bot_notes'),interests,visible:true};
+}
+
+async function _dtLoadBots(dc){
+  const data=await api('/api/admin/dating/bots?limit=200');
+  const bots=data.bots||[];
+  let html=`<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><h3 style="margin:0">🤖 Gestión de Bots de Citas</h3><button class="admin-btn" id="btn-new-bot">＋ Crear bot</button></div><div id="bot-form-wrap"></div><div id="bot-list-wrap">`;
+  if(!bots.length){html+='<div class="admin-card" style="color:#888">No hay bots de citas. Crea el primero con el botón de arriba.</div>'}
+  else{bots.forEach(bot=>{
+    const badge=`<span class="bot-status-badge ${esc(bot.status||'active')}">${esc(bot.status||'active')}</span>`;
+    const ints=JSON.parse(bot.interests||'[]').join(', ')||'—';
+    html+=`<div class="bot-card" id="bc-${esc(bot.user_id)}">
+      <div class="bot-card-header"><div><b>${esc(bot.display_name)}</b> ${badge}<div class="admin-small" style="margin-top:3px">${esc(bot.gender)} · ${esc(bot.province)} · ${esc(bot.birth_date)} · busca: ${esc(bot.looking_for)}</div>${bot.bio?`<div class="admin-small" style="margin-top:2px;color:#555">${esc(bot.bio)}</div>`:''}<div class="admin-small" style="margin-top:2px">Intereses: ${esc(ints)}</div>${bot.bot_notes?`<div class="admin-small" style="color:#a37c00;margin-top:2px">📌 ${esc(bot.bot_notes)}</div>`:''}</div><div class="admin-actions" style="flex-direction:column;align-items:flex-end"><button class="admin-btn secondary" data-bot-edit="${esc(bot.user_id)}">✏️ Editar</button><button class="admin-btn secondary" data-bot-toggle="${esc(bot.user_id)}" data-bot-status="${esc(bot.status||'active')}">${(bot.status==='active')?'⏸ Desactivar':'▶ Activar'}</button><button class="admin-btn danger" data-bot-del="${esc(bot.user_id)}" data-bot-name="${esc(bot.display_name)}">🗑 Eliminar</button></div></div>
+      <div class="bot-photos-row" id="bph-${esc(bot.user_id)}"><span class="admin-small" style="align-self:center;color:#aaa">Cargando fotos…</span></div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><label class="admin-btn secondary" style="cursor:pointer;font-size:11px">📷 Agregar foto<input type="file" accept="image/jpeg,image/png,image/webp" style="display:none" data-bot-upload="${esc(bot.user_id)}"></label><span class="admin-small" style="color:#888">JPG/PNG/WEBP · máx. 8 MB · se aprueba automáticamente</span></div>
+    </div>`;
+  })}
+  html+='</div>';
+  dc.innerHTML=html;
+  // Cargar fotos de cada bot
+  bots.forEach(bot=>{_dtLoadBotPhotos(bot.user_id)});
+  // Botón nuevo bot
+  document.getElementById('btn-new-bot').onclick=()=>{_dtShowBotForm(null)};
+  // Acciones de cada bot
+  dc.querySelectorAll('[data-bot-edit]').forEach(b=>b.onclick=async()=>{
+    const botData=bots.find(x=>x.user_id===b.dataset.botEdit);
+    _dtShowBotForm(botData);
+  });
+  dc.querySelectorAll('[data-bot-toggle]').forEach(b=>b.onclick=async()=>{
+    const uid=b.dataset.botToggle;
+    const cur=b.dataset.botStatus;
+    const next=cur==='active'?'inactive':'active';
+    if(!confirm(`¿${next==='active'?'Activar':'Desactivar'} el bot?`))return;
+    try{await api('/api/admin/dating/bots/'+encodeURIComponent(uid),{method:'PUT',body:JSON.stringify({status:next})});_dtLoadSub()}catch(e){alert(e.message)}
+  });
+  dc.querySelectorAll('[data-bot-del]').forEach(b=>b.onclick=async()=>{
+    if(!confirm(`¿Eliminar al bot "${b.dataset.botName}" y TODOS sus datos (matches, mensajes, fotos)? Esto no se puede deshacer.`))return;
+    try{await api('/api/admin/dating/bots/'+encodeURIComponent(b.dataset.botDel),{method:'DELETE'});_dtLoadSub()}catch(e){alert(e.message)}
+  });
+  dc.querySelectorAll('[data-bot-upload]').forEach(input=>input.onchange=async()=>{
+    const file=input.files?.[0];if(!file)return;
+    const uid=input.dataset.botUpload;
+    if(file.size>8*1024*1024){alert('La foto supera los 8 MB.');input.value='';return}
+    const reader=new FileReader();
+    reader.onload=async()=>{
+      try{
+        await api('/api/admin/dating/bots/'+encodeURIComponent(uid)+'/photos',{method:'POST',body:JSON.stringify({image:reader.result})});
+        _dtLoadBotPhotos(uid);
+      }catch(e){alert('Error subiendo foto: '+e.message)}
+      input.value='';
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function _dtLoadBotPhotos(uid){
+  const wrap=document.getElementById('bph-'+uid);
+  if(!wrap)return;
+  try{
+    const data=await api('/api/admin/dating/bots/'+encodeURIComponent(uid)+'/photos');
+    const photos=data.photos||[];
+    if(!photos.length){wrap.innerHTML='<span class="admin-small" style="align-self:center;color:#aaa">Sin fotos aún</span>';return}
+    wrap.innerHTML=photos.map(ph=>`<div class="bot-photo-thumb"><img src="${esc(ph.url)}" alt=""><button class="del-ph" title="Eliminar foto" data-del-ph="${esc(ph.id)}" data-del-uid="${esc(uid)}">×</button></div>`).join('');
+    wrap.querySelectorAll('[data-del-ph]').forEach(btn=>btn.onclick=async()=>{
+      if(!confirm('¿Eliminar esta foto del bot?'))return;
+      try{await api('/api/admin/dating/bots/'+encodeURIComponent(btn.dataset.delUid)+'/photos/'+encodeURIComponent(btn.dataset.delPh),{method:'DELETE'});_dtLoadBotPhotos(btn.dataset.delUid)}catch(e){alert(e.message)}
+    });
+  }catch(e){wrap.innerHTML='<span class="admin-small" style="color:#c00">Error cargando fotos</span>'}
+}
+
+function _dtShowBotForm(bot){
+  _dtEditingBot=bot?bot.user_id:null;
+  const wrap=document.getElementById('bot-form-wrap');
+  if(!wrap)return;
+  const title=bot?`✏️ Editar bot: ${esc(bot.display_name)}`:'＋ Crear nuevo bot de citas';
+  wrap.innerHTML=`<div class="admin-card" style="border:2px solid #4d35ff22;margin-bottom:14px"><h3 style="margin-top:0">${title}</h3>${_dtBotFormHTML(bot)}<div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap"><button class="admin-btn" id="btn-bot-save">${bot?'💾 Guardar cambios':'🚀 Crear bot'}</button><button class="admin-btn secondary" id="btn-bot-cancel">Cancelar</button></div><p id="bot-form-err" class="admin-error"></p></div>`;
+  // Intereses tags
+  wrap.querySelectorAll('.itag').forEach(tag=>tag.onclick=()=>{
+    tag.classList.toggle('sel');
+    const sel=[...wrap.querySelectorAll('.itag.sel')].map(t=>t.dataset.int);
+    document.getElementById('interests-json-hidden').value=JSON.stringify(sel);
+  });
+  document.getElementById('btn-bot-cancel').onclick=()=>{wrap.innerHTML='';_dtEditingBot=null};
+  document.getElementById('btn-bot-save').onclick=async()=>{
+    const data=_dtCollectForm();
+    if(!data){return}
+    if(!data.display_name||!data.birth_date||!data.gender||!data.looking_for||!data.province){
+      document.getElementById('bot-form-err').textContent='Completa los campos obligatorios (*).';return
+    }
+    try{
+      if(_dtEditingBot){
+        await api('/api/admin/dating/bots/'+encodeURIComponent(_dtEditingBot),{method:'PUT',body:JSON.stringify(data)});
+        alert('Bot actualizado correctamente.');
+      }else{
+        const res=await api('/api/admin/dating/bots',{method:'POST',body:JSON.stringify(data)});
+        alert('Bot creado: '+res.display_name+' ('+res.user_id+')');
+      }
+      wrap.innerHTML='';_dtEditingBot=null;_dtLoadSub();
+    }catch(e){document.getElementById('bot-form-err').textContent=e.message}
+  };
+  wrap.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+
+_dtLoadSub();
+}
 else if(tab==='bot-chats'){
 if(!can('dating')){c.innerHTML='<div class="admin-card">No tienes permiso para ver los chats de bots.</div>';return}
 // ── Estado ──────────────────────────────────────────────────────────
-let _bcConvs=[],_bcSelMatch=null,_bcLastId=0,_bcPoll=null,_bcSending=false;
+let _bcConvs=[],_bcSelMatch=null,_bcSelConv=null,_bcLastId=0,_bcPoll=null,_bcSending=false,_bcMobileView='list';
 function _bcEsc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-function _bcTime(iso){if(!iso)return'';const d=new Date(iso.endsWith('Z')?iso:iso+'Z');return d.toLocaleTimeString('es-CU',{hour:'2-digit',minute:'2-digit'})}
-function _bcDate(iso){if(!iso)return'';const d=new Date(iso.endsWith('Z')?iso:iso+'Z');return d.toLocaleDateString('es-CU',{day:'2-digit',month:'short'})}
+function _bcTime(iso){if(!iso)return'';const d=new Date(iso.endsWith('Z')?iso:iso+'Z');return d.toLocaleTimeString('es-CU',{hour:'2-digit',minute:'2-digit',timeZone:'America/Havana'})}
+function _bcDateTime(iso){if(!iso)return'';const d=new Date(iso.endsWith('Z')?iso:iso+'Z');return d.toLocaleString('es-CU',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',timeZone:'America/Havana'})}
+function _bcDateRel(iso){
+  if(!iso)return'';
+  const d=new Date(iso.endsWith('Z')?iso:iso+'Z'),now=new Date();
+  const diff=Math.floor((now-d)/1000);
+  if(diff<60)return'ahora';if(diff<3600)return Math.floor(diff/60)+'m';
+  if(diff<86400)return Math.floor(diff/3600)+'h';
+  if(diff<604800)return Math.floor(diff/86400)+'d';
+  return d.toLocaleDateString('es-CU',{day:'2-digit',month:'short',timeZone:'America/Havana'});
+}
 // ── HTML base ────────────────────────────────────────────────────────
 c.innerHTML=`
 <style>
-.bc-conv-card{padding:10px 12px;border-radius:6px;cursor:pointer;border:1px solid transparent;margin-bottom:4px;transition:background .15s;position:relative}
-.bc-conv-card:hover{background:#eef2ff}.bc-conv-card.active{background:#e0e7ff;border-color:#a5b4fc}
-.bc-conv-card .bc-names{font-size:13px;font-weight:600;color:#333}
-.bc-conv-card .bc-preview{font-size:12px;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
-.bc-conv-card .bc-badge{position:absolute;top:8px;right:10px;background:#ef4444;color:#fff;font-size:11px;font-weight:700;border-radius:999px;padding:2px 7px}
-.bc-msg{display:flex;margin-bottom:2px}.bc-msg.from-bot{justify-content:flex-end}.bc-msg.from-user{justify-content:flex-start}.bc-msg.from-system{justify-content:center}
-.bc-bubble{max-width:68%;padding:8px 12px;border-radius:14px;font-size:14px;line-height:1.45;word-break:break-word;white-space:pre-wrap}
-.from-bot .bc-bubble{background:#818cf8;color:#fff;border-bottom-right-radius:4px}
-.from-user .bc-bubble{background:#e5e7eb;color:#111;border-bottom-left-radius:4px}
-.from-system .bc-bubble{background:none;color:#9ca3af;font-size:12px;font-style:italic;text-align:center}
-.bc-meta{font-size:11px;color:rgba(255,255,255,.65);margin-top:3px;display:block;text-align:right}
-.from-user .bc-meta{color:#9ca3af;text-align:left}
+/* ── Layout principal ── */
+#bc-root{display:flex;flex-direction:column;gap:0;height:calc(100vh - 160px);min-height:420px}
+#bc-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding-bottom:12px;border-bottom:1px solid #eeeaf5;margin-bottom:0}
+#bc-main{display:flex;gap:0;flex:1;overflow:hidden;border:1px solid #e2ddf5;border-radius:14px;background:#fff;min-height:0}
+/* ── Lista de conversaciones ── */
+#bc-list-pane{width:300px;min-width:240px;display:flex;flex-direction:column;border-right:1px solid #e2ddf5;background:#faf9fd;flex-shrink:0}
+#bc-list-search{padding:10px 10px 6px;border-bottom:1px solid #eee}
+#bc-list-search input{width:100%;box-sizing:border-box;padding:7px 10px;border:1px solid #d9d4f0;border-radius:8px;font-size:13px;outline:none}
+#bc-list-search input:focus{border-color:#818cf8;box-shadow:0 0 0 2px #e0e7ff}
+#bc-list-scroll{flex:1;overflow-y:auto;padding:6px}
+/* ── Cards de conversación ── */
+.bc-conv-card{padding:10px 12px;border-radius:10px;cursor:pointer;border:1px solid transparent;margin-bottom:4px;transition:all .15s;position:relative}
+.bc-conv-card:hover{background:#eef2ff;border-color:#c7d2fe}
+.bc-conv-card.active{background:#e0e7ff;border-color:#818cf8;box-shadow:0 0 0 1px #818cf8}
+.bc-conv-card .bc-names{font-size:13px;font-weight:700;color:#1e1b4b;display:flex;align-items:center;gap:5px;margin-bottom:2px}
+.bc-conv-card .bc-preview{font-size:12px;color:#6b7280;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px;padding-right:36px}
+.bc-conv-card .bc-ts{font-size:11px;color:#9ca3af;position:absolute;top:10px;right:10px}
+.bc-conv-card .bc-badge{position:absolute;bottom:10px;right:10px;background:#ef4444;color:#fff;font-size:10px;font-weight:800;border-radius:999px;padding:1px 6px;min-width:18px;text-align:center}
+.bc-conv-card .bc-status-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;display:inline-block}
+.bc-conv-card .bc-status-dot.active{background:#22c55e}.bc-conv-card .bc-status-dot.closed{background:#9ca3af}
+/* ── Panel de chat ── */
+#bc-chat-pane{flex:1;display:flex;flex-direction:column;min-width:0;overflow:hidden}
+#bc-chat-header{padding:12px 16px;border-bottom:1px solid #eee;background:#faf9fd;display:flex;align-items:center;gap:10px;min-height:52px;flex-shrink:0}
+#bc-chat-header .bc-hdr-back{display:none;background:none;border:none;font-size:20px;cursor:pointer;padding:0 4px;color:#4d35ff}
+#bc-chat-info{flex:1;min-width:0}
+#bc-chat-info .bc-hdr-title{font-size:14px;font-weight:700;color:#1e1b4b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#bc-chat-info .bc-hdr-sub{font-size:11px;color:#9ca3af;margin-top:1px}
+#bc-chat-status{display:flex;gap:6px;align-items:center;flex-shrink:0}
+#bc-msgs{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:4px;background:#f9f8fd;scroll-behavior:smooth}
+/* ── Mensajes ── */
+.bc-msg{display:flex;margin-bottom:1px}
+.bc-msg.from-bot{justify-content:flex-end}
+.bc-msg.from-user{justify-content:flex-start}
+.bc-msg.from-system{justify-content:center;margin:6px 0}
+.bc-bubble{max-width:72%;padding:9px 13px;border-radius:16px;font-size:14px;line-height:1.5;word-break:break-word;white-space:pre-wrap;position:relative}
+.from-bot .bc-bubble{background:#4d35ff;color:#fff;border-bottom-right-radius:4px;box-shadow:0 2px 8px #4d35ff22}
+.from-user .bc-bubble{background:#fff;color:#111;border-bottom-left-radius:4px;border:1px solid #e5e7eb;box-shadow:0 1px 3px #0001}
+.from-system .bc-bubble{background:none;color:#9ca3af;font-size:11px;font-style:italic;text-align:center;padding:2px 8px;max-width:100%}
+.bc-meta{font-size:10px;color:rgba(255,255,255,.55);margin-top:4px;display:block;text-align:right}
+.from-user .bc-meta{color:#d1d5db}
+.from-system .bc-meta{display:none}
+/* ── Día separador ── */
+.bc-day-sep{text-align:center;font-size:11px;color:#9ca3af;margin:10px 0 6px;position:relative}
+.bc-day-sep span{background:#f9f8fd;padding:0 10px;position:relative;z-index:1}
+.bc-day-sep::before{content:'';position:absolute;top:50%;left:0;right:0;height:1px;background:#e5e7eb}
+/* ── Formulario ── */
+#bc-form{padding:10px 12px;border-top:1px solid #eee;background:#fff;display:flex;gap:8px;align-items:flex-end;flex-shrink:0}
+#bc-body{flex:1;resize:none;padding:9px 12px;border:1.5px solid #d9d4f0;border-radius:10px;font-size:14px;font-family:inherit;line-height:1.4;outline:none;transition:border-color .15s;min-height:40px;max-height:120px;overflow-y:auto}
+#bc-body:focus{border-color:#818cf8;box-shadow:0 0 0 3px #e0e7ff}
+#bc-body:disabled{background:#f3f4f6;color:#9ca3af}
+#bc-send{flex-shrink:0;padding:10px 16px;white-space:nowrap;border-radius:10px;font-size:13px}
+/* ── Estado vacío / carga ── */
+.bc-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:#9ca3af;text-align:center;padding:24px;gap:10px}
+.bc-empty-icon{font-size:40px;opacity:.35}
+.bc-empty h3{margin:0;font-size:15px;color:#6b7280;font-weight:600}
+.bc-empty p{margin:0;font-size:13px;line-height:1.5}
+/* ── Indicador de polling ── */
+#bc-live-dot{width:7px;height:7px;border-radius:50%;background:#22c55e;display:inline-block;animation:bc-pulse 2s infinite}
+@keyframes bc-pulse{0%,100%{opacity:1}50%{opacity:.3}}
+/* ── Píldora de estado ── */
+.bc-pill{font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;white-space:nowrap}
+.bc-pill.active{background:#dcfce7;color:#166534}
+.bc-pill.closed{background:#f3f4f6;color:#6b7280}
+/* ── Responsive móvil ── */
+@media(max-width:620px){
+  #bc-root{height:calc(100vh - 130px)}
+  #bc-list-pane{width:100%;border-right:none;display:none}
+  #bc-list-pane.bc-mobile-show{display:flex}
+  #bc-chat-pane{display:none}
+  #bc-chat-pane.bc-mobile-show{display:flex}
+  #bc-chat-header .bc-hdr-back{display:block}
+  #bc-toolbar{flex-wrap:wrap;gap:6px}
+}
 </style>
-<h2>💬 Chats de Bots</h2>
-<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px">
-  <label style="font-weight:600;white-space:nowrap">Filtrar por bot:</label>
-  <select id="bc-bot-filter" style="min-width:160px;padding:8px;border-radius:8px;border:1px solid #d9d4f0">
-    <option value="">— Todos —</option>
-  </select>
-  <button class="admin-btn secondary" id="bc-refresh">🔄 Actualizar</button>
-  <span id="bc-count" class="admin-small"></span>
-</div>
-<div style="display:flex;gap:14px;height:70vh;min-height:380px">
-  <div id="bc-list" style="width:270px;min-width:180px;overflow-y:auto;border:1px solid #ddd;border-radius:8px;background:#fafafa">
-    <div id="bc-list-inner" style="padding:8px"><p style="color:#aaa;padding:14px;text-align:center">Cargando…</p></div>
+<div id="bc-root">
+  <div id="bc-toolbar">
+    <h2 style="margin:0;font-size:18px;flex-shrink:0">💬 Chats de Bots</h2>
+    <select id="bc-bot-filter" style="padding:8px 10px;border-radius:8px;border:1.5px solid #d9d4f0;font-size:13px;background:#fff;cursor:pointer">
+      <option value="">🤖 Todos los bots</option>
+    </select>
+    <select id="bc-status-filter" style="padding:8px 10px;border-radius:8px;border:1.5px solid #d9d4f0;font-size:13px;background:#fff;cursor:pointer">
+      <option value="">📋 Todos los estados</option>
+      <option value="active">✅ Activos</option>
+      <option value="unmatched">⛔ Cerrados</option>
+    </select>
+    <button class="admin-btn secondary" id="bc-refresh" style="padding:8px 12px;font-size:13px">🔄 Actualizar</button>
+    <span id="bc-count" class="admin-small" style="margin-left:auto;white-space:nowrap"></span>
   </div>
-  <div style="flex:1;display:flex;flex-direction:column;border:1px solid #ddd;border-radius:8px;overflow:hidden;background:#fff">
-    <div id="bc-header" style="padding:12px 16px;border-bottom:1px solid #eee;background:#f5f5f5;min-height:50px;display:flex;align-items:center">
-      <span style="color:#aaa;font-style:italic">Selecciona una conversación</span>
+  <div id="bc-main">
+    <div id="bc-list-pane" class="bc-mobile-show">
+      <div id="bc-list-search">
+        <input id="bc-search" type="search" placeholder="🔍 Buscar por nombre…" autocomplete="off">
+      </div>
+      <div id="bc-list-scroll">
+        <div class="bc-empty"><div class="bc-empty-icon">⌛</div><p>Cargando conversaciones…</p></div>
+      </div>
     </div>
-    <div id="bc-msgs" style="flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:6px;background:#f9f9f9"></div>
-    <div id="bc-form" style="padding:10px;border-top:1px solid #eee;background:#fff;display:flex;gap:8px;align-items:flex-end">
-      <textarea id="bc-body" rows="2" placeholder="Escribe la respuesta del bot…"
-        style="flex:1;resize:vertical;padding:8px;border:1px solid #ccc;border-radius:6px;font-size:14px"
-        onkeydown="if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();document.getElementById('bc-send').click()}"></textarea>
-      <button id="bc-send" class="admin-btn" style="white-space:nowrap">Enviar como bot</button>
+    <div id="bc-chat-pane">
+      <div id="bc-chat-header">
+        <button class="bc-hdr-back" id="bc-back" title="Volver">←</button>
+        <div id="bc-chat-info">
+          <div class="bc-hdr-title" style="color:#9ca3af;font-weight:400;font-style:italic">Selecciona una conversación</div>
+          <div class="bc-hdr-sub"></div>
+        </div>
+        <div id="bc-chat-status"></div>
+      </div>
+      <div id="bc-msgs">
+        <div class="bc-empty">
+          <div class="bc-empty-icon">💬</div>
+          <h3>Chats de Bots</h3>
+          <p>Selecciona una conversación de la lista para ver el historial de mensajes e intervenir como el bot.</p>
+        </div>
+      </div>
+      <div id="bc-form">
+        <textarea id="bc-body" rows="1" placeholder="Escribe la respuesta del bot… (Ctrl+Enter para enviar)" disabled></textarea>
+        <button id="bc-send" class="admin-btn" disabled>Enviar como bot</button>
+      </div>
     </div>
   </div>
 </div>`;
 // ── Cargar filtro de bots ────────────────────────────────────────────
 api('/api/admin/dating/bots?limit=200').then(data=>{
   const sel=document.getElementById('bc-bot-filter');
+  if(!sel)return;
   (data.bots||[]).forEach(b=>{const o=document.createElement('option');o.value=b.user_id;o.textContent=_bcEsc(b.display_name)+' ('+_bcEsc(b.gender)+', '+_bcEsc(b.province)+')';sel.appendChild(o)});
 }).catch(()=>{});
+// ── Búsqueda con debounce ────────────────────────────────────────────
+let _bcSearchTimer=null;
+document.getElementById('bc-search').addEventListener('input',function(){
+  clearTimeout(_bcSearchTimer);
+  _bcSearchTimer=setTimeout(()=>_bcLoadConvs(),400);
+});
 // ── Cargar conversaciones ────────────────────────────────────────────
 async function _bcLoadConvs(){
   const bot=document.getElementById('bc-bot-filter')?.value||'';
-  let url='/api/admin/dating/bots/conversations?limit=50';
+  const statusF=document.getElementById('bc-status-filter')?.value||'';
+  const search=(document.getElementById('bc-search')?.value||'').trim();
+  let url='/api/admin/dating/bots/conversations?limit=60';
   if(bot)url+='&bot_user_id='+encodeURIComponent(bot);
-  document.getElementById('bc-list-inner').innerHTML='<p style="color:#aaa;padding:14px;text-align:center">Cargando…</p>';
+  if(statusF)url+='&status_filter='+encodeURIComponent(statusF);
+  if(search)url+='&search='+encodeURIComponent(search);
+  const scroll=document.getElementById('bc-list-scroll');
+  if(scroll)scroll.innerHTML='<div class="bc-empty"><div class="bc-empty-icon">⌛</div><p>Cargando…</p></div>';
   try{
     const data=await api(url);
     _bcConvs=data.conversations||[];
     const cnt=document.getElementById('bc-count');
     if(cnt)cnt.textContent=_bcConvs.length+' de '+(data.total||0)+' conversaciones';
     _bcRenderList();
-  }catch(e){document.getElementById('bc-list-inner').innerHTML='<p style="color:red;padding:10px">Error: '+_bcEsc(e.message)+'</p>'}
+  }catch(e){
+    const scroll=document.getElementById('bc-list-scroll');
+    if(scroll)scroll.innerHTML='<div class="bc-empty" style="color:#ef4444"><div class="bc-empty-icon">⚠️</div><h3>Error al cargar</h3><p>'+_bcEsc(e.message)+'</p><button class="admin-btn secondary" onclick="_bcLoadConvs()" style="margin-top:8px;font-size:12px">Reintentar</button></div>';
+  }
 }
 function _bcRenderList(){
-  const wrap=document.getElementById('bc-list-inner');
-  if(!_bcConvs.length){wrap.innerHTML='<p style="color:#aaa;padding:14px;text-align:center">No hay conversaciones con bots.</p>';return}
+  const wrap=document.getElementById('bc-list-scroll');
+  if(!wrap)return;
+  if(!_bcConvs.length){
+    const hasFilter=document.getElementById('bc-bot-filter')?.value||document.getElementById('bc-status-filter')?.value||document.getElementById('bc-search')?.value;
+    wrap.innerHTML='<div class="bc-empty"><div class="bc-empty-icon">'+(hasFilter?'🔍':'💬')+'</div>'
+      +'<h3>'+(hasFilter?'Sin resultados':'Sin conversaciones')+'</h3>'
+      +'<p>'+(hasFilter?'No hay chats que coincidan con los filtros.<br><a href="#" onclick="document.getElementById(\'bc-bot-filter\').value=\'\';document.getElementById(\'bc-status-filter\').value=\'\';document.getElementById(\'bc-search\').value=\'\';_bcLoadConvs();return false" style="color:#4d35ff">Limpiar filtros</a>':'Aún no hay matches entre usuarios reales y bots de citas.<br>Los chats aparecerán aquí cuando existan matches.')+'</p>'
+      +'</div>';
+    return;
+  }
   wrap.innerHTML='';
   _bcConvs.forEach(conv=>{
+    const isActive=conv.match_status==='active';
     const div=document.createElement('div');
     div.className='bc-conv-card'+(conv.match_id===_bcSelMatch?' active':'');
     div.dataset.matchId=conv.match_id;
-    const preview=conv.last_message?(conv.last_message.sender_id===conv.bot_id?'🤖 ':'👤 ')+conv.last_message.body.slice(0,45):'(sin mensajes)';
-    div.innerHTML='<div class="bc-names">🤖 '+_bcEsc(conv.bot_name)+' ↔ 👤 '+_bcEsc(conv.real_name)+'</div>'
-      +'<div class="bc-preview">'+_bcEsc(preview)+'</div>'
-      +'<div style="font-size:11px;color:#aaa;margin-top:2px">'+_bcDate(conv.matched_at)+'</div>'
+    const lm=conv.last_message;
+    const previewText=lm?(lm.sender_id===conv.bot_id?'🤖 ':'👤 ')+lm.body.slice(0,50):'— sin mensajes —';
+    const relTime=lm?_bcDateRel(lm.created_at):_bcDateRel(conv.matched_at);
+    div.innerHTML=
+      '<div class="bc-names">'
+      +'<span class="bc-status-dot '+(isActive?'active':'closed')+'"></span>'
+      +_bcEsc(conv.bot_name)
+      +' <span style="color:#9ca3af;font-weight:400">↔</span> '
+      +_bcEsc(conv.real_name)
+      +'</div>'
+      +'<div class="bc-preview">'+_bcEsc(previewText)+'</div>'
+      +'<div class="bc-ts">'+_bcEsc(relTime)+'</div>'
       +(conv.unread_from_user>0?'<span class="bc-badge">'+conv.unread_from_user+'</span>':'');
-    div.onclick=()=>_bcOpen(conv);
+    div.onclick=()=>_bcSelectConv(conv);
     wrap.appendChild(div);
   });
 }
+// ── Seleccionar conversación ─────────────────────────────────────────
+function _bcSelectConv(conv){
+  _bcMobileView='chat';
+  _bcMobileSwitch();
+  _bcOpen(conv);
+}
+function _bcMobileSwitch(){
+  const list=document.getElementById('bc-list-pane'),chat=document.getElementById('bc-chat-pane');
+  if(!list||!chat)return;
+  if(window.innerWidth<=620){
+    list.classList.toggle('bc-mobile-show',_bcMobileView==='list');
+    chat.classList.toggle('bc-mobile-show',_bcMobileView==='chat');
+  }else{
+    list.classList.add('bc-mobile-show');chat.classList.add('bc-mobile-show');
+  }
+}
+document.getElementById('bc-back').onclick=function(){_bcMobileView='list';_bcMobileSwitch()};
+window.addEventListener('resize',_bcMobileSwitch);
 // ── Abrir conversación ───────────────────────────────────────────────
 async function _bcOpen(conv){
   if(_bcPoll){clearInterval(_bcPoll);_bcPoll=null}
-  _bcSelMatch=conv.match_id;_bcLastId=0;
+  _bcSelMatch=conv.match_id;_bcSelConv=conv;_bcLastId=0;
   document.querySelectorAll('.bc-conv-card').forEach(el=>el.classList.toggle('active',parseInt(el.dataset.matchId)===conv.match_id));
-  const hdr=document.getElementById('bc-header');
-  if(hdr)hdr.innerHTML='<b>🤖 '+_bcEsc(conv.bot_name)+'</b> <span style="color:#9ca3af">responde a</span> <b>👤 '+_bcEsc(conv.real_name)+'</b> <span style="color:#9ca3af;font-size:12px">(match #'+conv.match_id+')</span>';
-  const msgs=document.getElementById('bc-msgs');if(msgs)msgs.innerHTML='';
-  const body=document.getElementById('bc-body');if(body){body.value='';body.disabled=false}
-  const send=document.getElementById('bc-send');if(send)send.disabled=false;
+  const isActive=conv.match_status==='active';
+  // Header
+  const hdrTitle=document.querySelector('#bc-chat-info .bc-hdr-title');
+  const hdrSub=document.querySelector('#bc-chat-info .bc-hdr-sub');
+  const hdrStatus=document.getElementById('bc-chat-status');
+  if(hdrTitle)hdrTitle.innerHTML='<span style="color:#818cf8">🤖 '+_bcEsc(conv.bot_name)+'</span> <span style="color:#d1d5db">↔</span> <span>👤 '+_bcEsc(conv.real_name)+'</span>';
+  if(hdrSub)hdrSub.innerHTML='Match #'+conv.match_id+' · '+_bcDateTime(conv.matched_at)+(conv.message_count!=null?' · '+conv.message_count+' mensajes':'');
+  if(hdrStatus)hdrStatus.innerHTML='<span class="bc-pill '+(isActive?'active':'closed')+'">'+(isActive?'✅ Activo':'⛔ Cerrado')+'</span>'+'<span id="bc-live-dot" style="margin-left:6px;'+(isActive?'':'display:none')+'"></span>';
+  // Limpiar mensajes
+  const msgs=document.getElementById('bc-msgs');
+  if(msgs){msgs.innerHTML='<div class="bc-empty" style="opacity:.5"><div class="bc-empty-icon" style="font-size:24px">⌛</div><p style="font-size:12px">Cargando mensajes…</p></div>'}
+  // Formulario
+  const bodyEl=document.getElementById('bc-body');
+  const sendEl=document.getElementById('bc-send');
+  if(bodyEl){bodyEl.disabled=!isActive;bodyEl.value='';if(isActive)bodyEl.placeholder='Escribe la respuesta del bot… (Ctrl+Enter para enviar)';else bodyEl.placeholder='Este match está cerrado — no se pueden enviar mensajes.'}
+  if(sendEl){sendEl.disabled=!isActive;sendEl.textContent=isActive?'Enviar como bot':'Cerrado'}
+  // Cargar mensajes
   await _bcPoll2(conv);
-  _bcPoll=setInterval(()=>_bcPoll2(conv),5000);
+  if(isActive)_bcPoll=setInterval(()=>_bcPoll2(conv),4000);
 }
-// ── Polling ──────────────────────────────────────────────────────────
+// ── Polling de mensajes ───────────────────────────────────────────────
 async function _bcPoll2(conv){
   if(!_bcSelMatch)return;
   try{
     const data=await api('/api/admin/dating/bots/conversations/'+_bcSelMatch+'/messages?after_id='+_bcLastId+'&limit=60');
+    const msgs=document.getElementById('bc-msgs');
+    if(msgs&&msgs.querySelector('.bc-empty'))msgs.innerHTML='';
     if(data.messages&&data.messages.length){_bcAppend(data.messages,conv);_bcLastId=data.last_id}
-    // Modo solo lectura si el match está cerrado
+    else if(!_bcLastId&&msgs&&!msgs.children.length){
+      msgs.innerHTML='<div class="bc-empty"><div class="bc-empty-icon">🤐</div><h3>Sin mensajes aún</h3><p>Aún no hay mensajes en esta conversación.</p></div>';
+    }
+    // Actualizar estado del formulario según status devuelto
     const isActive=!data.match_status||data.match_status==='active';
-    const body=document.getElementById('bc-body');const send=document.getElementById('bc-send');
-    if(body)body.disabled=!isActive;if(send){send.disabled=!isActive;send.textContent=isActive?'Enviar como bot':'Match cerrado'}
+    const bodyEl=document.getElementById('bc-body');const sendEl=document.getElementById('bc-send');
+    if(bodyEl)bodyEl.disabled=!isActive;
+    if(sendEl){sendEl.disabled=!isActive;sendEl.textContent=isActive?'Enviar como bot':'Cerrado'}
   }catch(_){}
 }
+// ── Render de mensajes ────────────────────────────────────────────────
 function _bcAppend(msgs,conv){
   const area=document.getElementById('bc-msgs');if(!area)return;
-  const atBottom=area.scrollHeight-area.scrollTop-area.clientHeight<60;
+  const atBottom=area.scrollHeight-area.scrollTop-area.clientHeight<80;
+  let lastDay='';
   msgs.forEach(m=>{
-    if(area.querySelector('[data-msg-id="'+m.id+'"]'))return; // deduplicar
+    if(area.querySelector('[data-msg-id="'+m.id+'"]'))return;
     const isBot=m.sender_id===conv.bot_id,isSystem=m.is_system;
     const cls=isSystem?'from-system':(isBot?'from-bot':'from-user');
+    // Separador de día
+    const msgDay=m.created_at?(new Date((m.created_at.endsWith('Z')?m.created_at:m.created_at+'Z'))).toLocaleDateString('es-CU',{weekday:'long',day:'numeric',month:'long',timeZone:'America/Havana'}):'';
+    if(msgDay&&msgDay!==lastDay){
+      const sep=document.createElement('div');sep.className='bc-day-sep';sep.innerHTML='<span>'+_bcEsc(msgDay)+'</span>';
+      area.appendChild(sep);lastDay=msgDay;
+    }
     const row=document.createElement('div');row.className='bc-msg '+cls;row.dataset.msgId=m.id;
-    const who=isSystem?'':(isBot?'<b>'+_bcEsc(conv.bot_name)+'</b> · ':'<b>'+_bcEsc(conv.real_name)+'</b> · ');
-    row.innerHTML='<div class="bc-bubble">'+_bcEsc(m.body)+'<span class="bc-meta">'+who+_bcTime(m.created_at)+'</span></div>';
+    const readIcon=(!isSystem&&isBot&&m.read_at)?'<span style="font-size:9px;opacity:.6" title="Leído '+_bcDateTime(m.read_at)+'"> ✓✓</span>':'';
+    row.innerHTML='<div class="bc-bubble">'+_bcEsc(m.body)
+      +'<span class="bc-meta">'+_bcTime(m.created_at)+readIcon+'</span>'
+      +'</div>';
     area.appendChild(row);
   });
   if(atBottom)area.scrollTop=area.scrollHeight;
 }
+// ── Auto-resize textarea ─────────────────────────────────────────────
+document.getElementById('bc-body').addEventListener('input',function(){
+  this.style.height='auto';this.style.height=Math.min(this.scrollHeight,120)+'px';
+});
 // ── Enviar respuesta ─────────────────────────────────────────────────
+document.getElementById('bc-body').addEventListener('keydown',function(e){
+  if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();document.getElementById('bc-send').click()}
+});
 document.getElementById('bc-send').onclick=async function(){
   if(!_bcSelMatch||_bcSending)return;
   const ta=document.getElementById('bc-body');const body=(ta?.value||'').trim();
@@ -177,16 +552,23 @@ document.getElementById('bc-send').onclick=async function(){
   _bcSending=true;this.disabled=true;this.textContent='Enviando…';
   try{
     await api('/api/admin/dating/bots/reply',{method:'POST',body:JSON.stringify({match_id:_bcSelMatch,body})});
-    if(ta)ta.value='';ta?.focus();
-    const conv=_bcConvs.find(x=>x.match_id===_bcSelMatch);
-    if(conv)await _bcPoll2(conv);
+    if(ta){ta.value='';ta.style.height='auto';ta.focus()}
+    if(_bcSelConv)await _bcPoll2(_bcSelConv);
+    // Actualizar preview en la lista
+    const card=document.querySelector('.bc-conv-card[data-match-id="'+_bcSelMatch+'"]');
+    if(card){const prev=card.querySelector('.bc-preview');if(prev)prev.textContent='🤖 '+body.slice(0,50);}
   }catch(e){alert('Error al enviar: '+_bcEsc(e.message))}
   finally{_bcSending=false;this.disabled=false;this.textContent='Enviar como bot'}
 };
 document.getElementById('bc-refresh').onclick=_bcLoadConvs;
 document.getElementById('bc-bot-filter').onchange=_bcLoadConvs;
+document.getElementById('bc-status-filter').onchange=_bcLoadConvs;
 // ── Limpiar al salir ─────────────────────────────────────────────────
-window._bcTeardown=function(){if(_bcPoll){clearInterval(_bcPoll);_bcPoll=null}};
+window._bcTeardown=function(){
+  if(_bcPoll){clearInterval(_bcPoll);_bcPoll=null}
+  window.removeEventListener('resize',_bcMobileSwitch);
+  if(_bcSearchTimer)clearTimeout(_bcSearchTimer);
+};
 _bcLoadConvs();
 }
 else if(tab==='ai-monitor'){
