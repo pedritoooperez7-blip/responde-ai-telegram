@@ -318,14 +318,14 @@ def reward_referrer(c: sqlite3.Connection, invitee_uid: str, payment_operation_i
             c.rollback()
             return False
         current = row["premium_until"]
-        base = datetime.utcnow()
+        base = datetime.now(timezone.utc)
         if current:
             try:
                 parsed = _parse_dt(current)
                 if parsed > base:
                     base = parsed
             except Exception:
-                base = datetime.utcnow()
+                base = datetime.now(timezone.utc)
         until = (base + timedelta(days=REWARD_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
         t = _now()
         idempotency_key = f"ref_{ref['id']}_pay_{payment_operation_id}"
@@ -755,7 +755,7 @@ def admin_adjust_reward(
         if current:
             try:
                 base = _parse_dt(current)
-                if base < datetime.utcnow():
+                if base < datetime.now(timezone.utc):
                     base = datetime.now(timezone.utc)
             except Exception:
                 base = datetime.now(timezone.utc)

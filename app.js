@@ -561,7 +561,7 @@ function _referStatusClass(status){
   const map={registered:'ref-status-pending',premium_active:'ref-status-premium',rewarded:'ref-status-rewarded',not_eligible:'ref-status-ineligible',admin_review:'ref-status-review'};
   return map[status]||'ref-status-pending';
 }
-function _fmtDate(iso){if(!iso)return'—';try{const d=new Date(iso+'Z');return d.toLocaleDateString(state.language==='es'?'es-CU':'en-US',{day:'2-digit',month:'short',year:'numeric'})}catch{return iso.slice(0,10)}}
+function _fmtDate(iso){if(!iso)return'—';try{const d=new Date(iso.endsWith('Z')?iso:iso+'Z');return d.toLocaleDateString(state.language==='es'?'es-CU':'en-US',{day:'2-digit',month:'short',year:'numeric',timeZone:'America/Havana'})}catch{return iso.slice(0,10)}}
 
 async function _loadReferralLink(){
   try{

@@ -369,9 +369,16 @@
   let W = null;
 
   const ageOf = (iso) => {
-    const b = new Date(iso + 'T00:00:00'); if (!iso || isNaN(b)) return null;
-    const t = new Date(); let n = t.getFullYear() - b.getFullYear();
-    if (t.getMonth() < b.getMonth() || (t.getMonth() === b.getMonth() && t.getDate() < b.getDate())) n--;
+    if (!iso) return null;
+    const b = new Date(iso + 'T00:00:00'); if (isNaN(b)) return null;
+    // Usar fecha actual en hora de Cuba para calcular la edad correctamente
+    const cubaFmt = new Intl.DateTimeFormat('es-CU', { timeZone: 'America/Havana', year: 'numeric', month: '2-digit', day: '2-digit' });
+    const parts = cubaFmt.formatToParts(new Date());
+    const y = +parts.find(p => p.type === 'year').value;
+    const m = +parts.find(p => p.type === 'month').value;
+    const d = +parts.find(p => p.type === 'day').value;
+    let n = y - b.getFullYear();
+    if (m < b.getMonth() + 1 || (m === b.getMonth() + 1 && d < b.getDate())) n--;
     return n;
   };
   const tgUser = () => D.me?.profile?.telegram_username || tg?.initDataUnsafe?.user?.username || '';
@@ -456,7 +463,8 @@
     }
     if (s.kind === 'birth') {
       if (W.lockedBirth) return el('div', { class: 'd-notice' }, el('b', { text: ageOf(a.birth_date) + ' ' + T('years') }), el('br'), X('birth_locked'));
-      const input = el('input', { type: 'date', value: a.birth_date || '', max: new Date().toISOString().slice(0, 10) });
+      const _cubaToday = () => { const p = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Havana' }).format(new Date()); return p; };
+      const input = el('input', { type: 'date', value: a.birth_date || '', max: _cubaToday() });
       input.onchange = input.oninput = () => { a.birth_date = input.value; refresh(); wzPersist(); };
       return el('label', { class: 'df-field wz-field' }, input);
     }

@@ -10,7 +10,14 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from datetime import datetime, timezone, timedelta
 from typing import Callable, Deque, Dict, Tuple
+
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _CUBA_TZ = _ZoneInfo("America/Havana")
+except Exception:
+    _CUBA_TZ = timezone(timedelta(hours=-5))
 
 
 class SlidingWindowLimiter:
@@ -50,7 +57,7 @@ class SlidingWindowLimiter:
 
 
 class DailyCounter:
-    """Per-key daily counter that resets on the UTC date boundary."""
+    """Per-key daily counter that resets on the Cuba (America/Havana) date boundary."""
 
     def __init__(self, limit: int, clock: Callable[[], float] = time.time):
         self.limit = max(1, int(limit))
@@ -60,7 +67,7 @@ class DailyCounter:
         self._counts: Dict[str, int] = {}
 
     def _today(self) -> str:
-        return time.strftime("%Y-%m-%d", time.gmtime(self._clock()))
+        return datetime.fromtimestamp(self._clock(), tz=timezone.utc).astimezone(_CUBA_TZ).strftime("%Y-%m-%d")
 
     def take(self, key: str) -> bool:
         """Consume one unit, returning False when the daily budget is exhausted."""
