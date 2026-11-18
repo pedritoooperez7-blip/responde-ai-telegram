@@ -63,8 +63,9 @@ MAX_MINOR_REPORTS_PER_DAY = 3
 FREE_MSG_LIMIT = int(os.getenv("DATING_FREE_MSG_LIMIT", "8"))
 MSG_RATE_PER_MINUTE = int(os.getenv("DATING_MSG_RATE_PER_MINUTE", "10"))
 
-# ── Bots — control de proporción en el feed ───────────────────────────────────
-# Máximo bots por página de feed. 0 = ocultar bots del feed.
+# ── Bots — siempre en el feed, sin reglas de proporción ───────────────────────
+# DATING_BOTS_PER_FEED ya no oculta ni limita bots. Se conserva la variable
+# solo para no romper entornos que todavía la definen.
 BOT_FEED_MAX = int(os.getenv("DATING_BOTS_PER_FEED", "3"))
 
 GENDERS = ("hombre", "mujer", "otro")
@@ -640,45 +641,15 @@ def overview(c: sqlite3.Connection, uid: str, secret: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _interleave_bots(candidates: List[Any], bot_max: int) -> List[Any]:
-    """Intercala bots en la lista de candidatos con proporción controlada.
+    """Pone todos los bots delante. Sin cupo, posición ni perfiles reales.
 
-    Reglas:
-    - El primer bot nunca aparece antes de la posición 2 (índice 2).
-    - Luego un bot cada 3 posiciones.
-    - Total de bots en la página ≤ bot_max.
-    - Si bot_max == 0 se devuelven solo los reales.
+    bot_max se ignora: un bot activo y visible sale aunque el feed de
+    personas esté vacío.
     """
-    if bot_max <= 0:
-        return [c for c in candidates if not c[2]["is_bot"]]
-
-    bots  = [c for c in candidates if     c[2]["is_bot"]]
+    del bot_max
+    bots = [c for c in candidates if c[2]["is_bot"]]
     reals = [c for c in candidates if not c[2]["is_bot"]]
-
-    bots_to_use = bots[:bot_max]
-    if not bots_to_use:
-        return reals
-
-    result: List[Any] = []
-    bot_idx = 0
-    real_idx = 0
-    pos = 0
-
-    while real_idx < len(reals) or bot_idx < len(bots_to_use):
-        # Insertar bot: a partir de pos 2 y luego cada 3, si quedan bots
-        if (pos >= 2 and (pos - 2) % 3 == 0
-                and bot_idx < len(bots_to_use)
-                and real_idx < len(reals)):  # solo intercalar si hay reales
-            result.append(bots_to_use[bot_idx])
-            bot_idx += 1
-        elif real_idx < len(reals):
-            result.append(reals[real_idx])
-            real_idx += 1
-        else:
-            # Si se agotaron los reales, no poner más bots
-            break
-        pos += 1
-
-    return result
+    return bots + reals
 
 
 def candidate_feed(c: sqlite3.Connection, uid: str, secret: str, limit: int = 10, today: Optional[date] = None) -> List[Dict[str, Any]]:
@@ -687,43 +658,52 @@ def candidate_feed(c: sqlite3.Connection, uid: str, secret: str, limit: int = 10
     if not c.execute("SELECT 1 FROM dating_photos WHERE user_id=?", (uid,)).fetchone():
         raise DatingError("Sube al menos una foto para ver perfiles.", 409, "no_photo")
     my_age = age_from(me["birth_date"], today)
-    # Bots aparecen sin foto aprobada (usan fotos opcionales o ninguna en MVP)
-    sql = (
-        "SELECT p.* FROM dating_profiles p WHERE p.user_id != ? AND p.status='active' AND p.visible=1 "
-        "AND (p.is_bot=1 OR EXISTS(SELECT 1 FROM dating_photos ph WHERE ph.user_id=p.user_id AND ph.status='approved')) "
+    # Los bots no pasan por género, edad, foto ni cupo. Las personas reales sí.
+    base_where = (
+        "FROM dating_profiles p WHERE p.user_id != ? AND p.status='active' AND p.visible=1 "
         "AND NOT EXISTS(SELECT 1 FROM dating_swipes s WHERE s.user_id=? AND s.target_id=p.user_id) "
         "AND NOT EXISTS(SELECT 1 FROM dating_blocks b WHERE (b.blocker_id=? AND b.blocked_id=p.user_id) "
         "OR (b.blocker_id=p.user_id AND b.blocked_id=?)) "
     )
-    params: List[Any] = [uid, uid, uid, uid]
+    base_params: List[Any] = [uid, uid, uid, uid]
+    gender_parts: List[str] = []
+    gender_params: List[Any] = []
     wanted = LOOKING_TO_GENDER.get(me["looking_for"])
     if wanted:
-        sql += "AND p.gender=? "
-        params.append(wanted)
+        gender_parts.append("p.gender=?")
+        gender_params.append(wanted)
     their_need = GENDER_TO_LOOKING.get(me["gender"])
     if their_need:
-        sql += "AND p.looking_for IN ('todos',?) "
-        params.append(their_need)
+        gender_parts.append("p.looking_for IN ('todos',?)")
+        gender_params.append(their_need)
     else:
-        sql += "AND p.looking_for='todos' "
-    sql += "ORDER BY (p.province=?) DESC, RANDOM() LIMIT 200"
-    params.append(me["province"])
+        gender_parts.append("p.looking_for='todos'")
+    real_sql = (
+        "SELECT p.* " + base_where
+        + "AND p.is_bot=0 AND EXISTS(SELECT 1 FROM dating_photos ph WHERE ph.user_id=p.user_id AND ph.status='approved') "
+        + "AND " + " AND ".join(gender_parts) + " "
+        + "ORDER BY (p.province=?) DESC, RANDOM() LIMIT 200"
+    )
+    bot_sql = "SELECT p.* " + base_where + "AND p.is_bot=1"
     my_prefs = load_prefs(me["prefs"])
     wants_near = my_prefs.get("distance") in ("neighborhood", "city")
     candidates = []
-    for row in c.execute(sql, params).fetchall():
-        their_age = age_from(row["birth_date"], today)
-        if not (me["min_age"] <= their_age <= me["max_age"]):
-            continue
-        if not (row["min_age"] <= my_age <= row["max_age"]):
-            continue
+    rows = list(c.execute(bot_sql, base_params)) + list(
+        c.execute(real_sql, base_params + gender_params + [me["province"]])
+    )
+    for row in rows:
+        if not row["is_bot"]:
+            their_age = age_from(row["birth_date"], today)
+            if not (me["min_age"] <= their_age <= me["max_age"]):
+                continue
+            if not (row["min_age"] <= my_age <= row["max_age"]):
+                continue
         score = compat_score(my_prefs, load_prefs(row["prefs"]))
         if wants_near and row["province"] == me["province"] and me["municipality"] and row["municipality"].lower() == me["municipality"].lower():
             score += 2
         candidates.append((row["province"] == me["province"], score, row))
-    # sort estable: la misma provincia primero, luego más afinidad; el azar de SQL desempata
+    # Personas: misma provincia primero, luego afinidad. Los bots van todos delante.
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    # Intercalar bots con proporción controlada
     mixed = _interleave_bots(candidates, BOT_FEED_MAX)
     return [card(c, row, secret, me["province"], my_prefs) for _same, _score, row in mixed[:limit]]
 
