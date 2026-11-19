@@ -1,1 +1,3697 @@
-see file
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
+from pydantic import BaseModel
+from PIL import Image
+import base64, hashlib, hmac, io, json, logging, os, re, sqlite3, threading, time, uuid
+import pytesseract
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Union
+from urllib.parse import parse_qs
+from starlette.concurrency import run_in_threadpool
+try:
+    from . import db as _db, limits as _limits, payments as _payments, dating as _dating, telegram_backup as _tgbackup, ads as _ads, cleanup as _cleanup
+    from . import referrals as _referrals
+    from .ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
+    from .telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo, send_document
+except ImportError:  # Support running uvicorn with backend/ as the working directory.
+    import db as _db, limits as _limits, payments as _payments, dating as _dating, telegram_backup as _tgbackup, ads as _ads, cleanup as _cleanup
+    import referrals as _referrals
+    from ai_providers import generate_reply as _provider_generate_reply, ProviderError, validate_provider_configuration, get_provider_health, remaining_provider_budget, encrypt_provider_key, decrypt_provider_key, normalize_compatible_endpoint, test_custom_provider, encrypt_cache_payload, decrypt_cache_payload
+    from telegram_bot import TelegramBotError, handle_update, verify_webhook_secret, set_webhook, delete_webhook, send_message, send_photo, send_document
+logger = logging.getLogger(__name__)
+
+# [Bots de citas] Controlador del grupo de control. No sustituye handle_update.
+try:
+    from .telegram_bot import (
+        TelegramBot as _DatingTelegramBot,
+        claim_update as _tg_claim_update,
+        release_update as _tg_release_update,
+        init_processed_updates as _tg_init_processed,
+    )
+except ImportError:
+    from telegram_bot import (
+        TelegramBot as _DatingTelegramBot,
+        claim_update as _tg_claim_update,
+        release_update as _tg_release_update,
+        init_processed_updates as _tg_init_processed,
+    )
+
+_dating_bot = _DatingTelegramBot()
+
+ai_generate_reply = _provider_generate_reply
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+app = FastAPI(title="LiggaCuba API", version="2.1")
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+
+
+def _default_cors_origins() -> list:
+    """Derive allowed origins from this deployment's public URLs when CORS_ORIGINS is unset.
+
+    Returns an empty list when no valid HTTPS origin can be derived. An empty
+    list means cross-origin requests are denied (no wildcard fallback).
+    """
+    from urllib.parse import urlsplit
+    found = []
+    for name in ("PUBLIC_BASE_URL", "TELEGRAM_MINI_APP_URL"):
+        parts = urlsplit((os.getenv(name) or "").strip())
+        if parts.scheme == "https" and parts.netloc:
+            origin = f"{parts.scheme}://{parts.netloc}"
+            if origin not in found:
+                found.append(origin)
+    return found
+
+
+from starlette.middleware.gzip import GZipMiddleware
+
+
+class _SelectiveGZip(GZipMiddleware):
+    """Comprime JS/CSS/JSON; las fotos JPEG ya vienen comprimidas y se sirven tal cual."""
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and str(scope.get("path", "")).startswith("/api/dating/photo/"):
+            return await self.app(scope, receive, send)
+        await super().__call__(scope, receive, send)
+
+
+app.add_middleware(_SelectiveGZip, minimum_size=1024)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins or _default_cors_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Authorization", "Content-Type", "X-Admin-Key", "X-Atajo-Key"],
+)
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    headers = response.headers
+    headers.setdefault("X-Content-Type-Options", "nosniff")
+    headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    if request.url.path.startswith("/api/"):
+        headers.setdefault("Cache-Control", "no-store")
+    else:
+        headers.setdefault("Content-Security-Policy",
+                           "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org https://telegram.org")
+    return response
+
+
+FREE_DAILY_LIMIT = 3
+FREE_CHAT_MODES = {"gracioso", "coquetear", "enamorar"}
+PREMIUM_CHAT_MODES = {"provocativo", "salvar", "reactivar"}
+FREE_STORY_MODES = {"gracioso", "coquetear"}
+PREMIUM_STORY_MODES = {"provocativo", "enamorar", "reactivar"}
+DB_PATH = os.getenv("DB_PATH", os.path.join(ROOT, "liggacuba.db"))
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "")
+ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+ATAJO_KEY = os.getenv("ATAJO_KEY", "")
+BANDEC_ACCOUNT = os.getenv("BANDEC_ACCOUNT", "")
+BPA_ACCOUNT = os.getenv("BPA_ACCOUNT", "")
+PAYMENT_PHONE = os.getenv("PAYMENT_PHONE", "")
+SESSION_TTL = 86400
+MAX_OCR_BYTES = 8 * 1024 * 1024
+MAX_OCR_PIXELS = 24_000_000
+OWNER_SESSION_TTL = 90 * 86400
+ADMIN_SESSION_TTL = 7 * 86400
+SESSION_SECRET = os.getenv("SESSION_SECRET", "")
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int((os.getenv(name) or "").strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+# In-process abuse controls. Limits are per process; see docs/OPERACIONES_V1.md.
+OCR_RATE_LIMITER = _limits.SlidingWindowLimiter(_env_int("OCR_RATE_LIMIT_PER_MINUTE", 10), 60)
+OCR_DAILY_COUNTER = _limits.DailyCounter(_env_int("OCR_DAILY_LIMIT", 50))
+OCR_GATE = _limits.ConcurrencyGate(_env_int("OCR_MAX_CONCURRENT", 2))
+ANALYZE_RATE_LIMITER = _limits.SlidingWindowLimiter(_env_int("ANALYZE_RATE_LIMIT_PER_MINUTE", 20), 60)
+GENERATION_RATE_LIMITER = _limits.SlidingWindowLimiter(_env_int("GENERATION_RATE_LIMIT_PER_HOUR", 40), 3600)
+ADMIN_LOGIN_IP_LIMITER = _limits.SlidingWindowLimiter(
+    _env_int("ADMIN_LOGIN_MAX_ATTEMPTS", 10), _env_int("ADMIN_LOGIN_WINDOW_SECONDS", 900)
+)
+ADMIN_LOGIN_USER_LIMITER = _limits.SlidingWindowLimiter(
+    _env_int("ADMIN_LOGIN_MAX_ATTEMPTS_PER_USER", 30), _env_int("ADMIN_LOGIN_WINDOW_SECONDS", 900)
+)
+
+
+def _retry_after_header(retry_after: float) -> dict:
+    return {"Retry-After": str(max(1, int(retry_after + 0.999)))}
+
+
+def _enforce_rate_limit(limiter, key: str, message: str) -> None:
+    allowed, retry_after = limiter.check(key)
+    if not allowed:
+        raise HTTPException(429, message, headers=_retry_after_header(retry_after))
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP for throttling. Behind a proxy the header is used.
+
+    X-Forwarded-For can be spoofed, so it is only a throttling hint; the
+    per-username limiter below does not depend on it.
+    """
+    # The proxy (Railway) appends the real peer address at the END of the list;
+    # the first entries are client-supplied and can be forged to dodge limits.
+    parts = [x.strip() for x in (request.headers.get("x-forwarded-for") or "").split(",") if x.strip()]
+    forwarded = parts[-1] if parts else ""
+    if forwarded and len(forwarded) <= 45:
+        return forwarded
+    return request.client.host if request.client else "unknown"
+
+
+def _b64e(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def _b64d(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def session_token(uid: str) -> str:
+    if not SESSION_SECRET or len(SESSION_SECRET) < 32:
+        raise HTTPException(503, "SESSION_SECRET debe configurarse con al menos 32 caracteres")
+    payload = _b64e(json.dumps({"uid": str(uid), "exp": int(time.time()) + SESSION_TTL}, separators=(",", ":")).encode())
+    sig = _b64e(hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).digest())
+    return payload + "." + sig
+
+
+def verify_session(token: str) -> str:
+    if not token or "." not in token:
+        raise HTTPException(401, "Sesión requerida")
+    payload, sig = token.rsplit(".", 1)
+    if not SESSION_SECRET or len(SESSION_SECRET) < 32:
+        raise HTTPException(503, "SESSION_SECRET debe configurarse con al menos 32 caracteres")
+    expected = _b64e(hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).digest())
+    if not hmac.compare_digest(sig, expected):
+        raise HTTPException(401, "Sesión inválida")
+    try:
+        data = json.loads(_b64d(payload).decode())
+        if int(data.get("exp", 0)) < int(time.time()):
+            raise HTTPException(401, "Sesión expirada")
+        uid = str(data.get("uid", ""))
+        if not uid:
+            raise HTTPException(401, "Usuario inválido")
+        return uid
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(401, "Sesión inválida")
+
+
+def current_user(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(401, "Sesión requerida")
+    uid = verify_session(auth[7:].strip())
+    _reject_if_banned(uid)
+    return uid
+
+
+BANNED_MESSAGE = "Tu cuenta fue suspendida por administración."
+
+
+def _reject_if_banned(uid: str) -> None:
+    """403 si el usuario está baneado. Si la consulta falla, no bloquea (nunca tumbar el servicio por esto)."""
+    try:
+        c = db()
+        try:
+            banned = _cleanup.is_banned(c, uid)
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return
+    if banned:
+        raise HTTPException(403, BANNED_MESSAGE)
+
+
+def db():
+    return _db.connect(DB_PATH)
+
+
+try:  # grupo único de revisión (comprobantes, fotos, reportes, anuncios, referidos)
+    from . import review_group as _review
+except ImportError:  # pragma: no cover
+    import review_group as _review
+
+
+def notify_user(user_id: str, text: str, app_button: bool = False) -> None:
+    """Send a Telegram message to a user. Fails silently — never breaks the caller.
+
+    ``app_button`` añade el botón que abre la Mini App (avisos de vencimiento y match).
+    """
+    import threading
+    markup = _review.app_keyboard() if app_button else None
+    def _send():
+        try:
+            send_message(str(user_id), text, markup)
+        except Exception as exc:
+            logger.debug("notify_user to %s failed: %s", user_id, exc)
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def now(): return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+try:  # los reinicios diarios y las estadísticas del día usan la fecha de Cuba (los registros siguen en UTC)
+    from zoneinfo import ZoneInfo
+    CUBA_TZ = ZoneInfo("America/Havana")
+except Exception:  # sin base de zonas horarias en el sistema: Cuba = UTC-5 como respaldo
+    CUBA_TZ = timezone(timedelta(hours=-5))
+def cuba_today(): return datetime.now(timezone.utc).astimezone(CUBA_TZ).date().isoformat()
+def cuba_day_start_utc() -> str:
+    """Medianoche de Cuba de hoy en UTC (formato de now(): ISO sin zona), para comparar con used_at/created_at."""
+    d = datetime.now(timezone.utc).astimezone(CUBA_TZ).date()
+    return datetime(d.year, d.month, d.day, tzinfo=CUBA_TZ).astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+def today(): return cuba_today()
+def cuba_n_days_ago_date(n: int) -> str:
+    """Fecha de hace N días completos en hora de Cuba (YYYY-MM-DD), para usar como corte en agrupaciones por día."""
+    return (datetime.now(timezone.utc).astimezone(CUBA_TZ) - timedelta(days=n)).date().isoformat()
+
+
+def cuba_sqlite_day_modifier() -> str:
+    """Modificador SQLite para date(col, …) que convierte timestamps UTC naive a fecha local de Cuba.
+
+    Calcula el offset actual de America/Havana vía ZoneInfo (p. ej. '-5 hours').
+    Cuba no aplica DST desde hace décadas, pero si el offset cambiara en el futuro
+    este helper se adapta solo. No es perfecto para datos históricos que crucen
+    un cambio de offset, pero es preferible a hardcodear '-5 hours'.
+    """
+    now_cuba = datetime.now(timezone.utc).astimezone(CUBA_TZ)
+    offset = now_cuba.utcoffset() or timedelta(0)
+    total_seconds = int(offset.total_seconds())
+    hours = total_seconds // 3600
+    if hours == 0:
+        return "+0 hours"
+    # SQLite acepta p.ej. '-5 hours' o '+2 hours'
+    return f"{hours:+d} hours"
+
+
+def _quota_charge_is_from_today(connection, log_id, uid: str) -> bool:
+    """Only refund a charge made today; yesterday's charge must not undo today's."""
+    if not log_id:
+        return True  # legacy attempt without a usage log id: keep the old behaviour
+    row = connection.execute("SELECT used_at FROM usage_logs WHERE id=? AND user_id=?", (log_id, uid)).fetchone()
+    if not row:
+        return False
+    return str(row["used_at"] or "") >= cuba_day_start_utc()   # used_at se guarda en UTC
+
+def _utc_datetime(value=None):
+    """Parse a timestamp as an aware UTC datetime; naive legacy values are treated as UTC."""
+    if value is None:
+        return datetime.now(timezone.utc)
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+def _validate_image_data_url(data_url: str) -> bytes:
+    """Validate a supported base64 image URL and return its raw bytes without retaining it."""
+    if not isinstance(data_url, str) or len(data_url) > 15_000_000:
+        raise HTTPException(400, "La imagen supera el tamaño permitido o no es válida")
+    match = re.fullmatch(r"data:image/(png|jpeg|jpg|webp|bmp|tiff);base64,([A-Za-z0-9+/]+={0,2})", data_url.strip(), re.I)
+    if not match:
+        raise HTTPException(400, "Formato de imagen inválido")
+    try:
+        raw = base64.b64decode(match.group(2), validate=True)
+        if not raw:
+            raise HTTPException(400, "Imagen vacía")
+        if len(raw) > MAX_OCR_BYTES:
+            raise HTTPException(400, "La imagen supera el límite de 8 MB")
+        with Image.open(io.BytesIO(raw)) as probe:
+            if probe.format not in {"PNG", "JPEG", "WEBP", "BMP", "TIFF"}:
+                raise HTTPException(415, "Formato de imagen no admitido")
+            width, height = probe.size
+            if width < 1 or height < 1 or width * height > MAX_OCR_PIXELS:
+                raise HTTPException(413, "La imagen tiene demasiados píxeles")
+            probe.verify()
+        return raw
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(400, "Imagen inválida o dañada") from None
+
+
+AI_PROMPT_CACHE_VERSION = "reply-context-v1"
+AI_CACHE_TTL_HOURS = 6
+
+def _ai_cache_key(text: str, image_data_url: str, mode: str, module: str) -> str | None:
+    # Global reuse only for an exact input/configuration match. The original input is never stored.
+    if len((os.getenv("AI_PROVIDER_ENCRYPTION_KEY") or "").strip()) < 32:
+        return None
+    image_digest = hashlib.sha256(image_data_url.encode("utf-8")).hexdigest() if image_data_url else ""
+    config = {k: os.getenv(k, "") for k in ("GEMINI_MODEL", "GROQ_MODEL", "OPENROUTER_MODEL", "COHERE_MODEL", "AI_PRIORITY_GEMINI", "AI_PRIORITY_GROQ", "AI_PRIORITY_OPENROUTER", "AI_PRIORITY_COHERE")}
+    config["credential_fingerprints"] = {k: hashlib.sha256(os.getenv(k, "").encode("utf-8")).hexdigest() for k in ("GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "COHERE_API_KEY") if os.getenv(k)}
+    c = db()
+    try:
+        rows = c.execute("SELECT provider_id,base_url,model,supports_text,supports_image,enabled,priority,updated_at FROM custom_ai_providers ORDER BY provider_id").fetchall()
+        config["custom"] = [dict(r) for r in rows]
+    except sqlite3.Error:
+        config["custom"] = []
+    finally:
+        c.close()
+    material = {"version": AI_PROMPT_CACHE_VERSION, "text": text, "image_sha256": image_digest, "mode": mode, "module": module, "provider_config": config}
+    return hashlib.sha256(json.dumps(material, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+def _ai_cache_get(cache_key: str | None):
+    if not cache_key:
+        return None
+    c = db()
+    try:
+        row = c.execute("SELECT encrypted_payload,expires_at FROM ai_response_cache WHERE cache_key=?", (cache_key,)).fetchone()
+        if not row:
+            return None
+        if _utc_datetime(row["expires_at"]) <= _utc_datetime():
+            c.execute("DELETE FROM ai_response_cache WHERE cache_key=?", (cache_key,)); c.commit()
+            return None
+        payload = json.loads(decrypt_cache_payload(row["encrypted_payload"]))
+        if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
+            c.execute("DELETE FROM ai_response_cache WHERE cache_key=?", (cache_key,)); c.commit()
+            return None
+        return payload
+    except Exception:
+        # A cache read or key rotation must never block live generation.
+        try: c.execute("DELETE FROM ai_response_cache WHERE cache_key=?", (cache_key,)); c.commit()
+        except Exception: pass
+        return None
+    finally:
+        c.close()
+
+def _ai_cache_put(cache_key: str | None, result: dict, recognized: str):
+    if not cache_key or not isinstance(result, dict):
+        return
+    try:
+        encrypted = encrypt_cache_payload(json.dumps({"result": result, "recognized": recognized}, ensure_ascii=False, separators=(",", ":")))
+        created = datetime.now(timezone.utc)
+        c = db()
+        try:
+            c.execute("INSERT INTO ai_response_cache(cache_key,encrypted_payload,prompt_version,created_at,expires_at) VALUES(?,?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET encrypted_payload=excluded.encrypted_payload,prompt_version=excluded.prompt_version,created_at=excluded.created_at,expires_at=excluded.expires_at",
+                      (cache_key, encrypted, AI_PROMPT_CACHE_VERSION, created.isoformat(), (created + timedelta(hours=AI_CACHE_TTL_HOURS)).isoformat()))
+            c.execute("DELETE FROM ai_response_cache WHERE expires_at < ?", (created.isoformat(),))
+            c.commit()
+        finally:
+            c.close()
+    except Exception:
+        # Cache is an optimization, never a dependency for serving the answer.
+        return
+
+
+def init_db():
+    c = db()
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS users(
+      user_id TEXT PRIMARY KEY, username TEXT, first_name TEXT, last_name TEXT,
+      premium_until TEXT, payment_phone TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      usage_today INTEGER NOT NULL DEFAULT 0, last_reset_date TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS usage_logs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, used_at TEXT, module TEXT, mode TEXT, premium_used INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS payment_operations(
+      operation_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, plan TEXT NOT NULL, language TEXT NOT NULL,
+      status TEXT NOT NULL, amount TEXT NOT NULL, proof_text TEXT, proof_image TEXT,
+      payment_method TEXT, payer_phone TEXT, destination_account TEXT,
+      transaction_id TEXT, transfer_date TEXT, source_sms TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, verified_at TEXT, cancelled_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS saved_situations(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, ocr_text TEXT, reply TEXT, created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS admin_users(
+      username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, permissions TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS admin_audit(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT NOT NULL, action TEXT NOT NULL,
+      target TEXT, details TEXT, created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS admin_sessions(
+      session_id TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL, revoked_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS analysis_attempts(
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, module TEXT NOT NULL, mode TEXT NOT NULL,
+      retry_used INTEGER NOT NULL DEFAULT 0, generation_count INTEGER NOT NULL DEFAULT 0,
+      generation_in_progress INTEGER NOT NULL DEFAULT 0, generation_started_at TEXT,
+      quota_charged INTEGER NOT NULL DEFAULT 1, quota_log_id INTEGER, retry_call_started INTEGER NOT NULL DEFAULT 0,
+      generation_calls INTEGER NOT NULL DEFAULT 0, analysis_date TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS ai_idempotency(
+      user_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_hash TEXT NOT NULL,
+      status TEXT NOT NULL, result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY(user_id,idempotency_key)
+    );
+    CREATE TABLE IF NOT EXISTS ai_generation_events(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, analysis_id TEXT, provider TEXT, model TEXT,
+      status TEXT NOT NULL, latency_ms INTEGER, error_category TEXT, error_code TEXT,
+      quality_score REAL, retry_number INTEGER NOT NULL DEFAULT 0, module TEXT, mode TEXT, created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS custom_ai_providers(
+      provider_id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL,
+      api_key_encrypted TEXT NOT NULL, supports_text INTEGER NOT NULL DEFAULT 1,
+      supports_image INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+      priority INTEGER NOT NULL DEFAULT 50, last_test_status TEXT, last_test_at TEXT,
+      last_error_category TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS ai_response_cache(
+      cache_key TEXT PRIMARY KEY, encrypted_payload TEXT NOT NULL, prompt_version TEXT NOT NULL,
+      created_at TEXT NOT NULL, expires_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS payment_proof_archive_queue(
+      operation_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, proof_text TEXT, proof_image TEXT,
+      status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL, last_error TEXT, created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL, processing_started_at TEXT, archive_message_id TEXT,
+      FOREIGN KEY(operation_id) REFERENCES payment_operations(operation_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_proof_archive_due ON payment_proof_archive_queue(status,next_attempt_at);
+    """)
+    for sql in (
+        "ALTER TABLE users ADD COLUMN payment_phone TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN payment_method TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN payer_phone TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN destination_account TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN transaction_id TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN transfer_date TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN source_sms TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN amount_value REAL",
+        "ALTER TABLE payment_operations ADD COLUMN amount_currency TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN archive_chat_id TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN archive_message_id TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN archive_status TEXT NOT NULL DEFAULT 'not_configured'",
+        "ALTER TABLE payment_operations ADD COLUMN archive_attempts INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE payment_operations ADD COLUMN archive_next_attempt_at TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN archive_last_error TEXT",
+        "ALTER TABLE payment_operations ADD COLUMN archived_at TEXT",
+    ):
+        try:
+            c.execute(sql)
+        except sqlite3.OperationalError:
+            pass
+    _ads.ensure_schema(c)
+    _cleanup.ensure_schema(c)
+    # Safe additive migrations: SQLite ignores duplicate-column errors.
+    for sql in (
+        "ALTER TABLE analysis_attempts ADD COLUMN quota_log_id INTEGER",
+        "ALTER TABLE analysis_attempts ADD COLUMN retry_call_started INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE analysis_attempts ADD COLUMN generation_calls INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE analysis_attempts ADD COLUMN updated_at TEXT",
+        "ALTER TABLE analysis_attempts ADD COLUMN analysis_date TEXT",
+        "ALTER TABLE analysis_attempts ADD COLUMN replies_json TEXT",
+        "ALTER TABLE ai_generation_events ADD COLUMN error_code TEXT",
+        "ALTER TABLE ai_generation_events ADD COLUMN quality_score REAL",
+        "ALTER TABLE ai_generation_events ADD COLUMN retry_number INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_generation_events ADD COLUMN module TEXT",
+        "ALTER TABLE ai_generation_events ADD COLUMN mode TEXT",
+    ):
+        try:
+            c.execute(sql)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+    # Historical databases may already contain duplicate identifiers from older
+    # builds. Do not crash startup while adding defense-in-depth indexes; the
+    # payment endpoint also serializes and checks duplicates transactionally.
+    for index_sql, index_name in (
+        ("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_transaction ON payment_operations(transaction_id) WHERE transaction_id IS NOT NULL AND transaction_id != ''", "idx_payment_transaction"),
+        ("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_source_sms ON payment_operations(source_sms) WHERE source_sms IS NOT NULL AND source_sms != ''", "idx_payment_source_sms"),
+    ):
+        try:
+            c.execute(index_sql)
+        except sqlite3.IntegrityError:
+            logger.error("Could not create %s because legacy payment duplicates exist; runtime duplicate checks remain enabled", index_name)
+    _dating.init_schema(c)
+    try:
+        _review.ensure_schema(c)
+    except Exception:
+        logger.warning("Could not create the review group tables", exc_info=True)
+    # New tables for price overrides and referral system
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS price_overrides(
+      plan TEXT PRIMARY KEY,
+      price REAL NOT NULL,
+      updated_at TEXT NOT NULL,
+      updated_by TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS referrals(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      referrer_id TEXT NOT NULL,
+      referred_id TEXT NOT NULL UNIQUE,
+      rewarded INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    """)
+    for sql in (
+        "ALTER TABLE users ADD COLUMN refer_code TEXT",
+        "ALTER TABLE users ADD COLUMN referred_by TEXT",
+    ):
+        try:
+            c.execute(sql)
+        except sqlite3.OperationalError:
+            pass
+    # Migraciones del motor de referidos (nuevas columnas, índices, tabla de auditoría)
+    _referrals.run_migrations(c)
+    c.close()
+
+
+def _ensure_refer_code(uid: str) -> str:
+    """Return (creating if needed) a unique 8-char referral code for uid."""
+    c = db()
+    code = _referrals.ensure_refer_code(c, uid)
+    c.close()
+    return code
+
+
+def _db_get_price_override(plan: str) -> Optional[float]:
+    try:
+        c = db()
+        row = c.execute("SELECT price FROM price_overrides WHERE plan=?", (plan,)).fetchone()
+        c.close()
+        return float(row["price"]) if row else None
+    except Exception:
+        return None
+
+
+# Register price override getter with payments module
+_payments.set_db_price_getter(_db_get_price_override)
+
+init_db()
+
+
+def user(user_id: str, extra: Optional[Dict[str, Any]] = None):
+    uid = str(user_id or "guest-user")
+    c = db(); row = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not row:
+        t=now(); c.execute("INSERT INTO users(user_id,created_at,updated_at,last_reset_date) VALUES(?,?,?,?)", (uid,t,t,today()))
+        c.commit(); row=c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    if extra:
+        allowed={"username","first_name","last_name","premium_until","payment_phone"}; fields=[]; vals=[]
+        for k,v in extra.items():
+            if k in allowed and v is not None: fields.append(f"{k}=?"); vals.append(v)
+        if fields:
+            fields.append("updated_at=?"); vals.extend([now(),uid]); c.execute(f"UPDATE users SET {','.join(fields)} WHERE user_id=?", vals); c.commit()
+            row=c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    c.close(); return dict(row)
+
+
+def reset(uid):
+    u=user(uid)
+    if u["last_reset_date"] != today():
+        c=db(); c.execute("UPDATE users SET usage_today=0,last_reset_date=?,updated_at=? WHERE user_id=?",(today(),now(),uid)); c.commit(); c.close()
+
+
+def premium(uid):
+    p=user(uid).get("premium_until")
+    if not p: return False
+    try:
+        return _utc_datetime() < _utc_datetime(p)
+    except (ValueError, TypeError): return False
+
+
+def usage(uid):
+    reset(uid); u=user(uid); used=int(u.get("usage_today") or 0); prem=premium(uid)
+    return {"allowed": prem or used < FREE_DAILY_LIMIT, "remaining": 999 if prem else max(0,FREE_DAILY_LIMIT-used), "used_today":used, "premium":prem}
+
+
+def consume(uid, module, mode):
+    reset(uid)
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT usage_today, premium_until FROM users WHERE user_id=?", (str(uid),)).fetchone()
+        if not row:
+            c.execute("INSERT INTO users(user_id,created_at,updated_at,last_reset_date) VALUES(?,?,?,?)", (str(uid), now(), now(), today()))
+            used, until = 0, None
+        else:
+            used, until = int(row["usage_today"] or 0), row["premium_until"]
+        is_premium = False
+        if until:
+            try:
+                is_premium = _utc_datetime() < _utc_datetime(until)
+            except (ValueError, TypeError):
+                is_premium = False
+        if not is_premium and used >= FREE_DAILY_LIMIT:
+            c.rollback()
+            return {"allowed": False, "remaining": 0, "premium": False}
+        if not is_premium:
+            c.execute("UPDATE users SET usage_today=usage_today+1,updated_at=? WHERE user_id=? AND usage_today<?", (now(), str(uid), FREE_DAILY_LIMIT))
+            if c.total_changes < 1:
+                c.rollback()
+                return {"allowed": False, "remaining": 0, "premium": False}
+            remaining = max(0, FREE_DAILY_LIMIT - used - 1)
+        else:
+            remaining = 999
+        log_cursor = c.execute("INSERT INTO usage_logs(user_id,used_at,module,mode,premium_used) VALUES(?,?,?,?,?)", (str(uid), now(), module, mode, 1 if is_premium else 0))
+        log_id = log_cursor.lastrowid
+        c.commit()
+        return {"allowed": True, "remaining": remaining, "premium": is_premium, "usage_log_id": log_id}
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+
+
+class TelegramAuth(BaseModel): initData:str=""; user_id:Optional[str]=None; start_param:Optional[str]=None
+class TelegramWidgetAuth(BaseModel):
+    id: Union[int, str]
+    first_name: str = ""
+    last_name: str = ""
+    username: str = ""
+    photo_url: str = ""
+    auth_date: Union[int, str] = ""
+    hash: str = ""
+class Usage(BaseModel): user_id:str
+class Analyze(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"; image:str=""
+class Generate(BaseModel): user_id:str; mode:str="coquetear"; module:str="chat"; text:str=""; analysis_id:Optional[str]=None; image:str=""; idempotency_key:Optional[str]=None
+class Pending(BaseModel): user_id:str; plan:str="weekly"; language:str="es"; payment_method:str="BANDEC"
+class PaymentPhone(BaseModel): phone:str
+class AtajoPayment(BaseModel):
+    metodo_pago:str
+    telefono_origen:str=""
+    cuenta_destino:str=""
+    monto_recibido:float
+    transaccion:str=""
+    fecha:str=""
+    fecha_ejecucion:str=""
+    sms:str=""
+class PaymentId(BaseModel): operation_id:str; user_id:str
+class AdminLogin(BaseModel): username:str=""; password:str=""; master_key:str=""
+class AIProviderUpsert(BaseModel):
+    provider_id: str
+    name: str
+    base_url: str
+    model: str
+    api_key: str = ""
+    supports_text: bool = True
+    supports_image: bool = False
+    enabled: bool = True
+    priority: int = 50
+class AdminCreate(BaseModel): username:str; password:str; permissions:list[str]=[]
+class AdminStatus(BaseModel): username:str; is_active:bool=True
+class PremiumChange(BaseModel): user_id:str; action:str; days:int=7
+class PaymentReview(BaseModel): operation_id:str; action:str; reason:str=""
+class Proof(BaseModel): operation_id:str; user_id:str=""; proof_text:str=""; proof_image:str=""
+class SaveSituation(BaseModel): user_id:str; ocr_text:str=""; reply:str=""
+class OCR(BaseModel): image:str
+class ReferralApply(BaseModel):
+    refer_code: str
+    source: Optional[str] = "manual"  # "manual" | "startapp"
+class PriceUpdate(BaseModel): plan:str; price:float
+
+
+def parse_init(s):
+    pairs = parse_qs(s, keep_blank_values=True, strict_parsing=True)
+    if any(len(values) != 1 for values in pairs.values()):
+        raise ValueError("Parámetros de Telegram duplicados")
+    return {key: values[0] for key, values in pairs.items()}
+
+def verify_init(s):
+    if not s: raise ValueError("initData vacío")
+    try:
+        p = parse_init(s)
+    except ValueError:
+        raise ValueError("Parámetros de Telegram duplicados o inválidos") from None
+    received = p.pop("hash", "")
+    if not BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN no configurado")
+    if not received: raise ValueError("Hash de Telegram ausente")
+    try: auth_date = int(p.get("auth_date", "0"))
+    except (ValueError, TypeError): raise ValueError("auth_date inválido")
+    if auth_date > time.time() + 60: raise ValueError("auth_date en el futuro")
+    if time.time() - auth_date > 86400: raise ValueError("Sesión de Telegram expirada")
+    check = "\n".join(f"{k}={p[k]}" for k in sorted(p))
+    secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc, received): raise ValueError("Hash de Telegram inválido")
+    try: u = json.loads(p.get("user", "{}"))
+    except (json.JSONDecodeError, TypeError): raise ValueError("Datos de usuario Telegram inválidos") from None
+    if not isinstance(u, dict): raise ValueError("Los datos de usuario deben ser un objeto")
+    uid = u.get("id")
+    if isinstance(uid, bool) or not isinstance(uid, (int, str)) or not str(uid).isdigit() or int(uid) <= 0:
+        raise ValueError("Identificador de usuario Telegram inválido")
+    return u
+
+
+def admin_identity(request: Request):
+    if not ADMIN_KEY:
+        raise HTTPException(503, "ADMIN_KEY no configurado en Railway")
+    key = request.headers.get("x-admin-key", "")
+    if key and hmac.compare_digest(key, ADMIN_KEY):
+        return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics", "dating", "ads"]}
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not token or "." not in token:
+        raise HTTPException(401, "No autorizado")
+    payload, sig = token.rsplit(".", 1)
+    expected = _b64e(hmac.new(ADMIN_KEY.encode(), payload.encode(), hashlib.sha256).digest())
+    if not hmac.compare_digest(sig, expected):
+        raise HTTPException(401, "Sesión administrativa inválida")
+    try:
+        data = json.loads(_b64d(payload).decode())
+        if int(data.get("exp", 0)) < int(time.time()):
+            raise HTTPException(401, "Sesión administrativa expirada")
+        username = str(data.get("username", ""))
+        jti = str(data.get("jti", ""))
+        if not username or not jti:
+            raise HTTPException(401, "Sesión administrativa inválida")
+        c = db()
+        try:
+            session = c.execute("SELECT * FROM admin_sessions WHERE session_id=? AND username=?", (jti, username)).fetchone()
+            if not session or session["revoked_at"]:
+                raise HTTPException(401, "Sesión administrativa revocada o inexistente")
+            if int(session["expires_at"] or 0) < int(time.time()):
+                raise HTTPException(401, "Sesión administrativa expirada")
+            if data.get("role") == "owner" and username == "owner":
+                return {"username": "owner", "permissions": ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics", "dating", "ads"]}
+            row = c.execute("SELECT * FROM admin_users WHERE username=? AND is_active=1", (username,)).fetchone()
+            if not row:
+                raise HTTPException(401, "Administrador desactivado")
+            return {"username": row["username"], "permissions": json.loads(row["permissions"])}
+        finally:
+            c.close()
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(401, "Sesión administrativa inválida")
+
+def admin(request:Request, permission: str = None):
+    identity = admin_identity(request)
+    if permission and permission not in identity["permissions"]:
+        raise HTTPException(403, "No tienes permiso para esta acción")
+    return identity
+
+def audit(actor, action, target=None, details=None):
+    c=db(); c.execute("INSERT INTO admin_audit(actor,action,target,details,created_at) VALUES(?,?,?,?,?)", (actor,action,str(target or ""),json.dumps(details or {},ensure_ascii=False),now())); c.commit(); c.close()
+
+
+def amount(plan,lang):
+    """Localized display amount; currency comes from payments configuration."""
+    return _payments.amount(plan, lang)
+
+
+def _telegram_start_message(chat_id):
+    """Compatibility wrapper: delegates to the real Telegram bot module."""
+    from . import telegram_bot as _tb
+    try:
+        app_url = _tb.mini_app_url()
+    except _tb.TelegramBotError:
+        app_url = ""
+    if not app_url:
+        return {"chat_id": chat_id, "text": "¡Bienvenido a LiggaCuba! La Mini App estará disponible próximamente.", "reply_markup": {"inline_keyboard": [[{"text": "📢 Canal oficial", "url": _tb.official_channel()}]]}}
+    payload = _tb.build_start_payload(chat_id, app_url, _tb.official_channel(), _tb.community_chat())
+    return payload
+
+def purge_expired_records():
+    """Apply conservative retention: idempotency results 24h, AI events 30d, admin audit 90d."""
+    current = datetime.now(timezone.utc)
+    idem_cutoff = (current - timedelta(hours=24)).isoformat()
+    event_cutoff = (current - timedelta(days=30)).isoformat()
+    audit_cutoff = (current - timedelta(days=90)).isoformat()
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("DELETE FROM ai_idempotency WHERE updated_at < ?", (idem_cutoff,))
+        c.execute("DELETE FROM ai_generation_events WHERE created_at < ?", (event_cutoff,))
+        c.execute("DELETE FROM admin_audit WHERE created_at < ?", (audit_cutoff,))
+        c.execute("DELETE FROM ai_response_cache WHERE expires_at < ?", (current.isoformat(),))
+        c.execute("DELETE FROM dating_reports WHERE status != 'open' AND resolved_at < ?", ((current - timedelta(days=180)).isoformat(),))
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+    _run_user_cleanup()
+
+
+def _admin_telegram_ids() -> set:
+    return {x.strip() for x in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if x.strip()}
+
+
+def _run_user_cleanup() -> None:
+    """Limpieza de usuarios inactivos/baneados/bots. Falla en silencio: la purga clásica no debe verse afectada."""
+    c = None
+    try:
+        c = db()
+        result = _cleanup.run_cleanup(
+            c, _dating_photos_dir(), protected=_admin_telegram_ids(),
+            on_delete=lambda uid, reason, counts: audit("sistema", "auto_delete_user", uid, {"reason": reason, **counts}),
+        )
+        if any(result.get(k) for k in ("inactive", "ghost", "banned", "payments_cancelled", "usage_logs")):
+            logger.warning("User cleanup result: %s", result)  # warning para que se vea en los logs de Railway
+    except Exception:
+        logger.warning("User cleanup failed; it will be retried on the next cycle", exc_info=True)
+    finally:
+        if c is not None:
+            c.close()
+
+def check_operational_configuration() -> list[str]:
+    """Log-only warnings about operational settings; never aborts startup."""
+    warnings = []
+    if not _cors_origins and not _default_cors_origins():
+        warnings.append("CORS_ORIGINS is empty and no PUBLIC_BASE_URL/TELEGRAM_MINI_APP_URL origin could be derived: cross-origin requests are denied. Set CORS_ORIGINS (or PUBLIC_BASE_URL) to the Mini App origin.")
+    elif not _cors_origins:
+        warnings.append("CORS_ORIGINS is empty: using origin(s) derived from PUBLIC_BASE_URL/TELEGRAM_MINI_APP_URL. Prefer setting CORS_ORIGINS explicitly.")
+    if not ADMIN_KEY:
+        warnings.append("ADMIN_KEY is not configured: the admin panel and admin sessions are unavailable.")
+    elif len(ADMIN_KEY) < 32:
+        warnings.append("ADMIN_KEY is shorter than 32 characters; admin tokens are signed with a weak key.")
+    if not SESSION_SECRET or len(SESSION_SECRET) < 32:
+        warnings.append("SESSION_SECRET is missing or shorter than 32 characters: user sessions cannot be issued.")
+    if not os.getenv("DB_PATH", "").strip():
+        warnings.append("DB_PATH is not set: the SQLite file lives inside the container and is lost on redeploy unless a persistent volume is mounted.")
+    if not re.sub(r"\D", "", BANDEC_ACCOUNT or "") and not re.sub(r"\D", "", BPA_ACCOUNT or ""):
+        warnings.append("No BANDEC/BPA destination account is configured: payment operations cannot be created.")
+    if not (os.getenv("PAYMENT_ARCHIVE_CHAT_ID") or "").strip():
+        warnings.append("PAYMENT_ARCHIVE_CHAT_ID is missing: proof archiving is disabled; proofs remain in SQLite.")
+    if not _tgbackup.backup_chat_id():
+        warnings.append("BACKUP_CHAT_ID/PAYMENT_ARCHIVE_CHAT_ID is missing: automatic database backups to Telegram are disabled.")
+    elif not (os.getenv("BACKUP_ENCRYPTION_KEY") or "").strip():
+        warnings.append("BACKUP_ENCRYPTION_KEY is not set: Telegram database backups will be sent unencrypted.")
+    return warnings
+
+
+@app.on_event("startup")
+def _log_operational_configuration():
+    for message in check_operational_configuration():
+        logger.warning("Configuration check: %s", message)
+    start_background_purge()
+    start_payment_archive_worker()
+    try:
+        _tgbackup.start_backup_worker(DB_PATH, send_document)
+    except Exception:
+        logger.warning("Could not start the Telegram backup worker", exc_info=True)
+    # Expose photos_dir on app.state so ads router can use it for disk fallback
+    app.state.photos_dir = _dating_photos_dir()
+    try:
+        granted = _grant_pending_referral_rewards()
+        if granted:
+            logger.info("Accredited %s pending referral reward(s) on startup", len(granted))
+    except Exception:
+        logger.warning("Could not grant pending referral rewards", exc_info=True)
+
+
+PURGE_INTERVAL_SECONDS = 6 * 60 * 60
+PURGE_START_DELAY_SECONDS = 300
+_background_purge_started = False
+_background_purge_lock = threading.Lock()
+
+
+def _run_premium_expiry_reminders() -> None:
+    """Envía notificación a usuarios cuyo Premium vence en las próximas 24 h.
+
+    Se ejecuta en el mismo ciclo que la purga (cada 6 h). Usa una tabla de
+    control para no mandar más de un recordatorio por periodo de vencimiento.
+    """
+    try:
+        c = db()
+        try:
+            c.execute("""CREATE TABLE IF NOT EXISTS premium_expiry_reminders(
+                user_id TEXT PRIMARY KEY,
+                reminded_at TEXT NOT NULL,
+                premium_until TEXT NOT NULL
+            )""")
+            c.commit()
+            window_start = datetime.now(timezone.utc).isoformat()
+            window_end   = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+            rows = c.execute(
+                """SELECT user_id, premium_until FROM users
+                   WHERE premium_until > ? AND premium_until <= ?""",
+                (window_start, window_end)
+            ).fetchall()
+            for row in rows:
+                uid, until = row["user_id"], row["premium_until"]
+                already = c.execute(
+                    "SELECT 1 FROM premium_expiry_reminders WHERE user_id=? AND premium_until=?",
+                    (uid, until)
+                ).fetchone()
+                if already:
+                    continue
+                notify_user(uid,
+                    "⏰ <b>Tu Premium vence pronto.</b>\n\n"
+                    "Tienes menos de 24 horas de acceso Premium. Renuévalo desde la app para no perder el acceso. 💜",
+                    app_button=True)
+                c.execute(
+                    "INSERT OR REPLACE INTO premium_expiry_reminders(user_id, reminded_at, premium_until) VALUES(?,?,?)",
+                    (uid, datetime.now(timezone.utc).isoformat(), until)
+                )
+                c.commit()
+            # Limpiar recordatorios de periodos ya expirados (>7 días)
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            c.execute("DELETE FROM premium_expiry_reminders WHERE reminded_at < ?", (cutoff,))
+            c.commit()
+        finally:
+            c.close()
+    except Exception:
+        logger.warning("Premium expiry reminder failed; will retry next cycle", exc_info=True)
+
+
+def _run_lifecycle_notices() -> None:
+    """Avisos puntuales y no repetidos: Premium vencido y pago a punto de cancelarse.
+
+    Usa ``lifecycle_notices`` como control de idempotencia, igual que el
+    recordatorio de 24 h usa ``premium_expiry_reminders``.
+    """
+    try:
+        c = db()
+        try:
+            c.execute("""CREATE TABLE IF NOT EXISTS lifecycle_notices(
+                notice_key TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at TEXT NOT NULL)""")
+            c.commit()
+            current = datetime.now(timezone.utc)
+            # Premium recién vencido (últimas 48 h): un aviso por periodo.
+            expired = c.execute(
+                """SELECT user_id, premium_until FROM users
+                   WHERE premium_until IS NOT NULL AND premium_until <= ? AND premium_until >= ?""",
+                (current.isoformat(), (current - timedelta(hours=48)).isoformat()),
+            ).fetchall()
+            for row in expired:
+                key = f"premium_expired:{row['user_id']}:{row['premium_until']}"
+                if c.execute("SELECT 1 FROM lifecycle_notices WHERE notice_key=?", (key,)).fetchone():
+                    continue
+                notify_user(
+                    row["user_id"],
+                    "⚠️ <b>Tu Premium venció.</b>\n\n"
+                    "Tu cuenta volvió al plan gratuito: 3 análisis diarios y modos básicos. "
+                    "Puedes reactivarlo cuando quieras desde Premium. 💜",
+                    app_button=True,
+                )
+                c.execute(
+                    "INSERT OR REPLACE INTO lifecycle_notices(notice_key,user_id,created_at) VALUES(?,?,?)",
+                    (key, row["user_id"], current.isoformat()),
+                )
+                c.commit()
+            # Pago sin comprobante en el penúltimo día antes de cancelarse.
+            days = max(1, _env_int("PENDING_PAYMENT_DAYS", 3))
+            if days >= 2:
+                from_cutoff = (current - timedelta(days=days - 1)).isoformat()
+                to_cutoff = (current - timedelta(days=days)).isoformat()
+                stale = c.execute(
+                    """SELECT operation_id, user_id, amount, created_at FROM payment_operations
+                       WHERE status='pending' AND created_at <= ? AND created_at >= ?""",
+                    (from_cutoff, to_cutoff),
+                ).fetchall()
+                for row in stale:
+                    key = f"payment_cancel_warning:{row['operation_id']}"
+                    if c.execute("SELECT 1 FROM lifecycle_notices WHERE notice_key=?", (key,)).fetchone():
+                        continue
+                    notify_user(
+                        row["user_id"],
+                        "⏳ <b>Tu operación se cancela mañana.</b>\n\n"
+                        f"Operación <code>{row['operation_id']}</code> · {row['amount']}.\n"
+                        "Si ya pagaste, envía el comprobante hoy desde la app para que podamos verificarlo.",
+                        app_button=True,
+                    )
+                    c.execute(
+                        "INSERT OR REPLACE INTO lifecycle_notices(notice_key,user_id,created_at) VALUES(?,?,?)",
+                        (key, row["user_id"], current.isoformat()),
+                    )
+                    c.commit()
+        finally:
+            c.close()
+    except Exception:
+        logger.warning("Lifecycle notices failed; will retry next cycle", exc_info=True)
+
+
+def _run_retention_purge() -> None:
+    """Run the existing retention policy; failures are logged, never raised."""
+    try:
+        from .telegram_bot import purge_processed_updates as _tg_purge
+    except ImportError:
+        from telegram_bot import purge_processed_updates as _tg_purge
+    try:
+        purge_expired_records()
+    except Exception:
+        logger.warning("Retention purge failed; it will be retried on the next cycle", exc_info=True)
+    try:
+        _tg_purge()
+    except Exception:
+        logger.warning("Telegram update retention purge failed; it will be retried on the next cycle", exc_info=True)
+    _run_premium_expiry_reminders()
+    _run_lifecycle_notices()
+
+
+def start_background_purge() -> bool:
+    """Start one daemon purge loop per process. Never blocks startup.
+
+    With several uvicorn workers each process runs its own loop; the deletes are
+    idempotent, so overlapping runs only duplicate work, never corrupt data.
+    """
+    global _background_purge_started
+    with _background_purge_lock:
+        if _background_purge_started:
+            return False
+        if os.getenv("DISABLE_BACKGROUND_PURGE", "").strip().lower() in {"1", "true", "yes"}:
+            return False
+        if DB_PATH in {"", ":memory:"}:
+            # Every connection would get its own empty in-memory database, so a
+            # background thread could not see (or purge) the app's data.
+            return False
+
+        def loop():
+            time.sleep(PURGE_START_DELAY_SECONDS)
+            while True:
+                _run_retention_purge()
+                time.sleep(PURGE_INTERVAL_SECONDS)
+
+        threading.Thread(target=loop, name="retention-purge", daemon=True).start()
+        _background_purge_started = True
+        return True
+
+
+ARCHIVE_WORKER_INTERVAL_SECONDS = 20
+ARCHIVE_RETRY_BASE_SECONDS = 30
+ARCHIVE_RETRY_MAX_SECONDS = 6 * 60 * 60
+_archive_worker_started = False
+_archive_worker_lock = threading.Lock()
+
+
+def process_one_payment_archive() -> bool:
+    """Process one due archive job; keep original proof until Telegram confirms success."""
+    c = db()
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute(
+            """SELECT * FROM payment_proof_archive_queue
+               WHERE (status='pending' AND next_attempt_at<=?)
+                  OR (status='processing' AND processing_started_at<=?)
+               ORDER BY created_at LIMIT 1""",
+            (now_iso, (now_dt - timedelta(minutes=5)).isoformat()),
+        ).fetchone()
+        if not row:
+            c.commit()
+            return False
+        operation_id = row['operation_id']
+        c.execute("UPDATE payment_proof_archive_queue SET status='processing',processing_started_at=?,updated_at=? WHERE operation_id=?",
+                  (now_iso, now_iso, operation_id))
+        c.commit()
+        job = dict(row)
+    except Exception:
+        c.rollback()
+        logger.warning("Could not claim payment proof archive job", exc_info=True)
+        return False
+    finally:
+        c.close()
+
+    try:
+        # Datos completos de la transferencia + botones de decisión.
+        # Telegram no admite teclado en un mensaje con foto: los botones van aparte.
+        caption = _review.payment_details(operation_id, connect=db)
+        image = job.get('proof_image') or ''
+        if image:
+            raw = _validate_image_data_url(image)
+            short_caption = caption.split("\n")[0] + "\n" + caption.split("\n")[1]
+            result = send_photo(job['chat_id'], raw, "comprobante.jpg", short_caption[:900])
+            message_id = str(result.get('message_id') or '').strip()
+            if not message_id:
+                raise TelegramBotError("Telegram no devolvió message_id; se conserva el comprobante")
+            try:
+                _review.send_payment_buttons(operation_id, connect=db, chat_id=str(job['chat_id']))
+            except Exception:
+                logger.warning("No se pudieron enviar los botones del comprobante operation_id=%s", operation_id)
+        else:
+            result = _review.send_payment_review(operation_id, connect=db, chat_id=str(job['chat_id']))
+            message_id = str(result.get('message_id') or '').strip()
+        if not message_id:
+            raise TelegramBotError("Telegram no devolvió message_id; se conserva el comprobante")
+        c = db()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("""UPDATE payment_operations SET proof_text='',proof_image='',archive_chat_id=?,
+                       archive_message_id=?,archive_status='sent',archive_attempts=?,archive_next_attempt_at=NULL,
+                       archive_last_error=NULL,archived_at=?,updated_at=? WHERE operation_id=?""",
+                      (str(job['chat_id']), message_id, int(job['attempts']) + 1, now(), now(), operation_id))
+            c.execute("""UPDATE payment_proof_archive_queue SET status='sent',proof_text=NULL,proof_image=NULL,
+                       attempts=attempts+1,last_error=NULL,archive_message_id=?,processing_started_at=NULL,updated_at=?
+                       WHERE operation_id=?""", (message_id, now(), operation_id))
+            c.commit()
+        except Exception:
+            c.rollback()
+            # Telegram may have accepted the message; retain the queued proof and retry safely.
+            raise
+        finally:
+            c.close()
+        logger.info("Payment proof archived operation_id=%s message_id=%s", operation_id, message_id)
+        return True
+    except Exception as exc:
+        attempts = int(job.get('attempts') or 0) + 1
+        delay = min(ARCHIVE_RETRY_MAX_SECONDS, ARCHIVE_RETRY_BASE_SECONDS * (2 ** min(attempts - 1, 10)))
+        next_time = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+        error = (str(exc) or type(exc).__name__)[:240]
+        c = db()
+        try:
+            c.execute("""UPDATE payment_proof_archive_queue SET status='pending',attempts=?,next_attempt_at=?,
+                       last_error=?,processing_started_at=NULL,updated_at=? WHERE operation_id=?""",
+                      (attempts, next_time, error, now(), job['operation_id']))
+            c.execute("""UPDATE payment_operations SET archive_status='retrying',archive_attempts=?,
+                       archive_next_attempt_at=?,archive_last_error=?,updated_at=? WHERE operation_id=?""",
+                      (attempts, next_time, error, now(), job['operation_id']))
+            c.commit()
+        except Exception:
+            c.rollback()
+            logger.error("Failed to persist payment archive retry operation_id=%s", job['operation_id'], exc_info=True)
+        finally:
+            c.close()
+        logger.warning("Payment proof archive failed; retry scheduled operation_id=%s attempt=%s delay_seconds=%s error=%s",
+                       job['operation_id'], attempts, delay, error)
+        return False
+
+
+def _archive_user_for_operation(operation_id: str) -> str:
+    c = db()
+    try:
+        row = c.execute("SELECT user_id FROM payment_operations WHERE operation_id=?", (operation_id,)).fetchone()
+        return str(row['user_id']) if row else 'desconocido'
+    finally:
+        c.close()
+
+
+def start_payment_archive_worker() -> bool:
+    """Start a single per-process polling worker; DB claims coordinate multiple workers."""
+    global _archive_worker_started
+    with _archive_worker_lock:
+        if _archive_worker_started or os.getenv('DISABLE_PAYMENT_ARCHIVE_WORKER','').strip().lower() in {'1','true','yes'}:
+            return False
+        if DB_PATH in {'', ':memory:'}:
+            return False
+        def loop():
+            while True:
+                try:
+                    process_one_payment_archive()
+                except Exception:
+                    logger.error("Unexpected payment archive worker failure", exc_info=True)
+                time.sleep(ARCHIVE_WORKER_INTERVAL_SECONDS)
+        threading.Thread(target=loop, name='payment-proof-archive', daemon=True).start()
+        _archive_worker_started = True
+        return True
+
+
+def _public_base_url() -> str:
+    """Absolute origin for canonical, Open Graph and sitemap links."""
+    configured = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if configured.startswith("https://"):
+        return configured
+    return "https://responde-ai-telegram-production-6cdc.up.railway.app"
+
+@app.get("/")
+def root():
+    with open(os.path.join(ROOT, "index.html"), encoding="utf-8") as handle:
+        html = handle.read().replace("__PUBLIC_BASE_URL__", _public_base_url())
+    return HTMLResponse(html)
+
+@app.get("/admin.html")
+def admin_page(): return FileResponse(os.path.join(ROOT,"admin.html"), media_type="text/html")
+
+@app.post("/api/admin/telegram-access")
+def admin_telegram_access(p: Usage, request: Request):
+    uid = current_user(request)
+    allowed = {x.strip() for x in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if x.strip()}
+    return {"allowed": bool(uid in allowed), "url": "/admin.html" if uid in allowed else None}
+@app.get("/app.js")
+def js(): return FileResponse(os.path.join(ROOT,"app.js"),media_type="application/javascript")
+@app.get("/ads.js")
+def ads_js(): return FileResponse(os.path.join(ROOT,"ads.js"),media_type="application/javascript")
+@app.get("/dating.js")
+def dating_js(): return FileResponse(os.path.join(ROOT,"dating.js"),media_type="application/javascript")
+@app.get("/chat.js")
+def chat_js(): return FileResponse(os.path.join(ROOT,"chat.js"),media_type="application/javascript")
+@app.get("/style.css")
+def css(): return FileResponse(os.path.join(ROOT,"style.css"),media_type="text/css")
+@app.get("/liggacuba-logo.jpg")
+def logo(): return FileResponse(os.path.join(ROOT,"liggacuba-logo.jpg"),media_type="image/jpeg")
+@app.get("/privacy.html")
+def privacy(): return FileResponse(os.path.join(ROOT,"privacy.html"),media_type="text/html")
+@app.get("/image-guide.html")
+def image_guide(): return FileResponse(os.path.join(ROOT,"image-guide.html"),media_type="text/html")
+@app.get("/rules.html")
+def content_rules(): return FileResponse(os.path.join(ROOT,"rules.html"),media_type="text/html")
+@app.get("/terms.html")
+def terms(): return FileResponse(os.path.join(ROOT,"terms.html"),media_type="text/html")
+@app.get("/robots.txt")
+def robots_txt():
+    base = _public_base_url()
+    body = (
+        "User-agent: *\n"
+        "Allow: /\n"
+        "Disallow: /admin.html\n"
+        "Disallow: /api/\n"
+        f"Sitemap: {base}/sitemap.xml\n"
+    )
+    return PlainTextResponse(body)
+
+@app.get("/sitemap.xml")
+def sitemap_xml():
+    base = _public_base_url()
+    pages = ("/", "/privacy.html", "/terms.html", "/rules.html", "/image-guide.html")
+    urls = "".join(f"<url><loc>{base}{path}</loc></url>" for path in pages)
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        + urls +
+        "</urlset>"
+    )
+    return Response(content=xml, media_type="application/xml")
+
+@app.get("/health")
+def health():
+    """Liveness/readiness probe: reports database availability without internals."""
+    try:
+        _db.check_connection(DB_PATH)
+    except Exception:
+        logger.warning("Health check failed: database unavailable")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "degraded", "service": "LiggaCuba", "version": "2.1", "database": "unavailable"},
+        )
+    return {"status": "ok", "service": "LiggaCuba", "version": "2.1", "database": "ok"}
+
+
+@app.exception_handler(sqlite3.OperationalError)
+async def _sqlite_operational_error_handler(request: Request, exc: sqlite3.OperationalError):
+    """Turn lock contention into a retryable 503 instead of an opaque 500."""
+    if _db.is_locked_error(exc):
+        logger.warning("SQLite contention while handling a request; returning 503")
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Servicio temporalmente no disponible. Inténtalo de nuevo."},
+            headers={"Retry-After": "2"},
+        )
+    # Never log the raw SQL or its parameters: they can contain user data.
+    logger.error("SQLite operational error: error_type=%s", type(exc).__name__)
+    return JSONResponse(status_code=500, content={"detail": "Error interno del servidor"})
+
+
+@app.post("/webhook/telegram")
+async def telegram_webhook(request: Request):
+    """Receive Telegram updates. Authenticated via X-Telegram-Bot-Api-Secret-Token."""
+    try:
+        secret_valid = verify_webhook_secret(request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""))
+    except TelegramBotError:
+        logger.error("Telegram webhook unavailable: secret configuration invalid")
+        raise HTTPException(503, "Webhook de Telegram no configurado en el servidor")
+    if not secret_valid:
+        raise HTTPException(401, "Webhook no autorizado")
+    body = await request.body()
+    if len(body) > 256 * 1024:
+        raise HTTPException(413, "Update demasiado grande")
+    try:
+        update = json.loads(body.decode("utf-8"))
+        if not isinstance(update, dict):
+            raise ValueError("update no es un objeto")
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(400, "Update inválido")
+    if isinstance(update.get("callback_query"), dict):
+        try:
+            return {"ok": True, **_handle_review_callback(update)}
+        except Exception:
+            logger.warning("Review callback failed update_id=%s", update.get("update_id"), exc_info=True)
+            raise HTTPException(502, "No se pudo procesar la acción del grupo de revisión")
+    if isinstance(update.get("message"), dict):
+        try:
+            if _handle_review_reason_message(update):
+                return {"ok": True, "handled": True, "action": "review_reason"}
+        except Exception:
+            logger.warning("Review reason handling failed update_id=%s", update.get("update_id"), exc_info=True)
+    # El grupo de control de bots no es un chat de usuario: no debe pasar por handle_update
+    # (ese camino manda el aviso de "próximamente"). El claim evita duplicar el reply si Telegram reintenta.
+    _ctrl_group = getattr(_dating_bot, "bots_control_group_id", None)
+    _ctrl_kind = ""
+    if _ctrl_group:
+        for _kind in ("message", "edited_message"):
+            _msg = update.get(_kind)
+            if isinstance(_msg, dict) and str((_msg.get("chat") or {}).get("id", "")) == str(_ctrl_group):
+                _ctrl_kind = _kind
+                break
+    if _ctrl_kind:
+        if _ctrl_kind != "message":
+            return {"ok": True, "handled": True, "action": "bots_control_ignored"}
+        update_id = update.get("update_id")
+        if not isinstance(update_id, int):
+            return {"ok": True, "handled": False, "reason": "missing_update_id"}
+        _tg_init_processed()
+        if not _tg_claim_update(update_id):
+            return {"ok": True, "handled": False, "reason": "duplicate_update"}
+        delivered = False
+        try:
+            delivered = bool(_dating_bot.process_update_from_main(update))
+        except Exception:
+            logger.warning("Bots control reply failed update_id=%s", update_id, exc_info=True)
+            delivered = False
+        if not delivered:
+            _tg_release_update(update_id)
+            raise HTTPException(502, "No se pudo entregar la respuesta del bot")
+        return {"ok": True, "handled": True, "action": "bots_control"}
+    try:
+        outcome = handle_update(update)
+        return {"ok": True, **outcome}
+    except TelegramBotError as exc:
+        # handle_update releases its claim on failure, so Telegram's retry can
+        # attempt processing again. Never log tokens or request payloads.
+        logger.warning(
+            "Telegram webhook processing failed update_id=%s error_type=%s reason=%s",
+            update.get("update_id"), type(exc).__name__, str(exc)[:240],
+        )
+        raise HTTPException(502, str(exc))
+
+
+@app.post("/api/admin/telegram-webhook/setup")
+def admin_setup_webhook(request: Request):
+    """Register the production webhook URL. Requires the owner admin key."""
+    admin(request, "settings")
+    public_url = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if not public_url.startswith("https://"):
+        raise HTTPException(503, "PUBLIC_BASE_URL debe ser la URL HTTPS pública de este despliegue")
+    try:
+        result = set_webhook(
+            public_url + "/webhook/telegram",
+            os.getenv("TELEGRAM_WEBHOOK_SECRET", ""),
+            ["message", "callback_query"],
+        )
+    except TelegramBotError as exc:
+        raise HTTPException(502, str(exc))
+    audit("owner", "telegram_webhook_setup", public_url, {})
+    return {"success": True, "webhook_url": public_url + "/webhook/telegram", "telegram_result": result}
+
+
+@app.post("/api/auth/telegram")
+def auth_telegram(p:TelegramAuth):
+    try:
+        if p.initData:
+            u=verify_init(p.initData)
+        elif not BOT_TOKEN:
+            raise ValueError("TELEGRAM_BOT_TOKEN no configurado")
+        else:
+            u=None
+    except ValueError as e:
+        raise HTTPException(401,str(e))
+    if not u or not u.get("id"): raise HTTPException(401,"Autenticación requerida")
+    if p.user_id and str(p.user_id) != str(u.get("id")):
+        raise HTTPException(401,"El usuario no coincide con Telegram")
+    uid=str(u["id"]); _reject_if_banned(uid)
+    user(uid,{"username":u.get("username"),"first_name":u.get("first_name"),"last_name":u.get("last_name")}); x=usage(uid)
+    # Atribución automática vía startapp: start_param = "ref_XXXXXXXX"
+    referral_applied = False
+    if p.start_param:
+        raw = str(p.start_param).strip()
+        if raw.startswith("ref_"):
+            code = raw[4:].upper()
+            c = db()
+            try:
+                ref_result = _referrals.apply_referral(c, uid, code, source="startapp")
+                referral_applied = ref_result.get("success", False)
+                if referral_applied and not ref_result.get("already_registered"):
+                    referrer_id = ref_result.get("referrer_id")
+                    if referrer_id:
+                        c2 = db()
+                        u_row = c2.execute("SELECT first_name, username FROM users WHERE user_id=?", (uid,)).fetchone()
+                        c2.close()
+                        invitee_name = "Un amigo"
+                        if u_row:
+                            invitee_name = u_row["first_name"] or (f"@{u_row['username']}" if u_row["username"] else "Un amigo")
+                        notify_user(
+                            referrer_id,
+                            f"👥 <b>¡Nuevo amigo invitado!</b>\n"
+                            f"{invitee_name} se unió a LiggaCuba usando tu enlace. "
+                            f"Cuando active Premium, recibirás <b>3 días de Premium</b> extra. 🎉",
+                        )
+            except Exception as exc:
+                logger.warning("startapp referral apply failed uid=%s code=%s: %s", uid, code, exc)
+            finally:
+                c.close()
+    return {"success":True,"user_id":uid,"token":session_token(uid),"referral_applied":referral_applied,**x}
+
+@app.post("/api/auth/telegram-widget")
+def auth_telegram_widget(p: TelegramWidgetAuth):
+    """Endpoint para el Telegram Login Widget (web y Android WebView).
+    Verifica la firma HMAC usando SHA-256 del BOT_TOKEN (distinto al initData).
+    """
+    if not BOT_TOKEN:
+        raise HTTPException(503, "TELEGRAM_BOT_TOKEN no configurado")
+    if not p.id or not p.hash:
+        raise HTTPException(401, "Datos de autenticación incompletos")
+    try:
+        auth_date_int = int(p.auth_date or "0")
+    except (ValueError, TypeError):
+        raise HTTPException(401, "auth_date inválido")
+    if auth_date_int > time.time() + 60:
+        raise HTTPException(401, "auth_date en el futuro")
+    if time.time() - auth_date_int > 86400:
+        raise HTTPException(401, "Sesión de Telegram expirada (>24h)")
+    # Construir la cadena de verificación (todos los campos excepto hash, ordenados)
+    fields = {k: v for k, v in {
+        "auth_date": p.auth_date,
+        "first_name": p.first_name,
+        "id": p.id,
+        "last_name": p.last_name,
+        "photo_url": p.photo_url,
+        "username": p.username,
+    }.items() if v}
+    check_string = "\n".join(f"{k}={fields[k]}" for k in sorted(fields))
+    # El widget usa SHA-256 del BOT_TOKEN como clave secreta (no "WebAppData")
+    secret = hashlib.sha256(BOT_TOKEN.encode()).digest()
+    calc = hmac.new(secret, check_string.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc, p.hash):
+        raise HTTPException(401, "Firma de Telegram inválida")
+    uid = str(p.id)
+    _reject_if_banned(uid)
+    user(uid, {"username": p.username, "first_name": p.first_name, "last_name": p.last_name})
+    x = usage(uid)
+    return {"success": True, "user_id": uid, "token": session_token(uid), **x}
+
+
+@app.get("/api/auth/bot-username")
+def get_bot_username():
+    """Devuelve el username del bot para que el frontend pueda inicializar el widget."""
+    if not BOT_USERNAME:
+        raise HTTPException(503, "TELEGRAM_BOT_USERNAME no configurado")
+    return {"username": BOT_USERNAME}
+
+
+@app.post("/api/usage")
+def api_usage(p:Usage, request:Request):
+    uid=current_user(request)
+    return usage(uid)
+
+@app.post("/api/analyze")
+def analyze(p: Analyze, request: Request):
+    uid = current_user(request)
+    _enforce_rate_limit(ANALYZE_RATE_LIMITER, f"analyze:{uid}", "Demasiadas solicitudes. Espera un minuto.")
+    module = p.module if p.module in {"chat", "story"} else "chat"
+    mode = (p.mode or "coquetear").lower().strip()
+    free = FREE_CHAT_MODES if module == "chat" else FREE_STORY_MODES
+    premset = PREMIUM_CHAT_MODES if module == "chat" else PREMIUM_STORY_MODES
+    if mode not in free | premset:
+        raise HTTPException(400, "Modo no válido")
+    if mode in premset and not premium(uid):
+        raise HTTPException(402, "Este modo requiere Premium")
+    if str(p.user_id) != uid:
+        raise HTTPException(403, "El usuario no coincide con la sesión")
+    if p.image:
+        _validate_image_data_url(p.image)
+    reservation = consume(uid, module, mode)
+    if not reservation["allowed"]:
+        raise HTTPException(403, "Has alcanzado tus 3 análisis gratuitos de hoy")
+    analysis_id = uuid.uuid4().hex
+    c = db()
+    try:
+        c.execute("INSERT INTO analysis_attempts(id,user_id,module,mode,quota_charged,quota_log_id,analysis_date,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                  (analysis_id, uid, module, mode, 0 if reservation.get("premium") else 1, reservation.get("usage_log_id"), today(), now(), now()))
+        c.commit()
+    except Exception:
+        c.rollback()
+        # Undo the quota reservation if attempt persistence failed.
+        if not reservation.get("premium"):
+            c.execute("UPDATE users SET usage_today=MAX(0,usage_today-1) WHERE user_id=?", (uid,))
+            if reservation.get("usage_log_id"):
+                c.execute("DELETE FROM usage_logs WHERE id=? AND user_id=?", (reservation["usage_log_id"], uid))
+            c.commit()
+        raise
+    finally:
+        c.close()
+    public_reservation = {k: v for k, v in reservation.items() if k != "usage_log_id"}
+    return {**public_reservation, "analysis_id": analysis_id, "module": module, "mode": mode}
+
+
+def _generate_with_ocr_fallback(text: str, mode: str, module: str, image_data_url: str | None, timings: dict | None = None):
+    timings = timings if timings is not None else {}
+    recognized = ""
+    if image_data_url:
+        start = time.monotonic()
+        try:
+            result = ai_generate_reply(text, mode, module, image_data_url)
+            timings["visual_generation_ms"] = int((time.monotonic()-start)*1000)
+            timings.setdefault("ocr_ms", 0); timings.setdefault("alternative_generation_ms", 0)
+            return result, recognized
+        except ProviderError:
+            timings["visual_generation_ms"] = int((time.monotonic()-start)*1000)
+            raw = base64.b64decode(image_data_url.split(",",1)[1], validate=True)
+            image = _decode_ocr_image(raw)
+            ocr_start = time.monotonic()
+            recognized = _ocr_text(image)
+            timings["ocr_ms"] = int((time.monotonic()-ocr_start)*1000)
+            if not recognized.strip() and not text.strip():
+                raise HTTPException(422, "No se pudo reconocer texto en la imagen")
+            combined = (text.strip() + "\n" + recognized.strip()).strip()
+            alt_start = time.monotonic()
+            result = ai_generate_reply(combined, mode, module, None)
+            timings["alternative_generation_ms"] = int((time.monotonic()-alt_start)*1000)
+            return result, recognized
+    start = time.monotonic()
+    result = ai_generate_reply(text, mode, module, None)
+    timings["visual_generation_ms"] = int((time.monotonic()-start)*1000)
+    timings.setdefault("ocr_ms", 0); timings.setdefault("alternative_generation_ms", 0)
+    return result, recognized
+
+
+@app.post("/api/generate-reply")
+def generate(p: Generate, request: Request):
+    uid = current_user(request)
+    _enforce_rate_limit(GENERATION_RATE_LIMITER, f"generate:{uid}", "Demasiadas generaciones. Espera unos minutos.")
+    if str(p.user_id) != uid:
+        raise HTTPException(403, "El usuario no coincide con la sesión")
+    module = p.module if p.module in {"chat", "story"} else "chat"
+    mode = (p.mode or "coquetear").lower().strip()
+    free = FREE_CHAT_MODES if module == "chat" else FREE_STORY_MODES
+    premium_modes = PREMIUM_CHAT_MODES if module == "chat" else PREMIUM_STORY_MODES
+    if mode not in free | premium_modes:
+        raise HTTPException(400, "Modo no válido")
+    if mode in premium_modes and not premium(uid):
+        raise HTTPException(402, "Este modo requiere Premium")
+    text = re.sub(r"\s+", " ", (p.text or "")).strip()
+    image = (p.image or "").strip()
+    if image:
+        _validate_image_data_url(image)
+    if not text and not image: raise HTTPException(400, "Debes enviar texto o una imagen")
+    aid = (p.analysis_id or "").strip()
+    if not aid: raise HTTPException(400, "analysis_id es obligatorio; crea primero un análisis")
+    payload_hash = hashlib.sha256(json.dumps({"text":text,"image_hash":hashlib.sha256(image.encode()).hexdigest() if image else "","mode":mode,"module":module,"analysis_id":aid}, sort_keys=True).encode()).hexdigest()
+    key = (p.idempotency_key or uuid.uuid4().hex).strip()
+    if len(key) > 128 or len(key) < 8: raise HTTPException(400, "idempotency_key debe tener entre 8 y 128 caracteres")
+    c=db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        attempt=c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?",(aid,uid)).fetchone()
+        if not attempt: raise HTTPException(404,"Análisis no encontrado")
+        if attempt["module"] != module or attempt["mode"] != mode: raise HTTPException(409,"El análisis no coincide con el módulo o modo")
+        if int(attempt["generation_in_progress"] or 0) and attempt["generation_started_at"]:
+            try:
+                stale = (_utc_datetime() - _utc_datetime(attempt["generation_started_at"])).total_seconds() > 120
+            except (ValueError, TypeError, OverflowError):
+                stale = True
+            if stale:
+                c.execute("UPDATE analysis_attempts SET generation_in_progress=0,generation_started_at=NULL,updated_at=? WHERE id=?", (now(), aid))
+                attempt = c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?", (aid, uid)).fetchone()
+        idem=c.execute("SELECT * FROM ai_idempotency WHERE user_id=? AND idempotency_key=?",(uid,key)).fetchone()
+        if idem:
+            if idem["payload_hash"] != payload_hash: raise HTTPException(409,"La clave de idempotencia ya se usó con otros datos")
+            if idem["status"] == "completed" and idem["result_json"]: return json.loads(idem["result_json"])
+            raise HTTPException(409,"Esta generación ya está en curso o falló; usa el flujo de reintento autorizado")
+        if attempt["generation_in_progress"]: raise HTTPException(409,"Ya hay una generación en curso")
+        generation_calls = int(attempt["generation_calls"] or 0)
+        generation_count = int(attempt["generation_count"] or 0)
+        retry_used = int(attempt["retry_used"] or 0)
+        if generation_count > 0 and (retry_used != 1 or int(attempt["retry_call_started"] or 0) == 1): raise HTTPException(409,"Debes reservar un reintento disponible antes de generar otra respuesta")
+        if generation_count == 0 and generation_calls >= 2:
+            raise HTTPException(409, "El intento inicial y su reintento ya se utilizaron; crea un análisis nuevo")
+        if retry_used == 1:
+            c.execute("UPDATE analysis_attempts SET retry_call_started=1 WHERE id=?", (aid,))
+        c.execute("UPDATE analysis_attempts SET generation_calls=generation_calls+1 WHERE id=?", (aid,))
+        c.execute("INSERT INTO ai_idempotency(user_id,idempotency_key,payload_hash,status,created_at,updated_at) VALUES(?,?,?,'running',?,?)",(uid,key,payload_hash,now(),now()))
+        c.execute("UPDATE analysis_attempts SET generation_in_progress=1,generation_started_at=?,updated_at=? WHERE id=?",(now(),now(),aid))
+        c.commit()
+    except HTTPException:
+        c.rollback(); raise
+    finally: c.close()
+    timings={}; started=time.monotonic()
+    cache_key = _ai_cache_key(text, image, mode, module)
+    cache_hit = _ai_cache_get(cache_key)
+    try:
+        if cache_hit:
+            result = cache_hit["result"]
+            recognized = str(cache_hit.get("recognized") or "")
+            timings["cache_hit"] = True
+        else:
+            result, recognized = _generate_with_ocr_fallback(text,mode,module,image or None,timings)
+        if not isinstance(result,dict) or not result.get("reply") or not result.get("alternative"):
+            raise HTTPException(502,"La IA no devolvió dos respuestas válidas")
+        if not cache_hit:
+            _ai_cache_put(cache_key, result, recognized)
+        reply_text = str(result.get("reply", ""))
+        alternative_text = str(result.get("alternative", ""))
+        quality_score = max(1, min(5, round((min(len(reply_text), 160) + min(len(alternative_text), 160)) / 64)))
+        all_replies=[str(x) for x in (result.get("replies") or [reply_text, alternative_text]) if str(x).strip()]
+        result={k:v for k,v in result.items() if k!="replies"}
+        result={"success":True,**result,"model":result.get("model") or validate_provider_configuration().get(result.get("provider", ""), {}).get("model", "unknown"),"ocr_text":recognized,"ocr_fallback":bool(recognized),"quality_score":quality_score,"cache_hit":bool(cache_hit),"timings_ms":{**timings,"total_backend_ms":int((time.monotonic()-started)*1000)}}
+        c=db(); c.execute("BEGIN IMMEDIATE")
+        attempt=c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?",(aid,uid)).fetchone()
+        # Charge quota only after successful generation; retry is never allowed to charge twice.
+        if attempt and not int(attempt["quota_charged"] or 0) and not premium(uid):
+            quota_user = c.execute("SELECT usage_today,last_reset_date FROM users WHERE user_id=?", (uid,)).fetchone()
+            if not quota_user:
+                raise HTTPException(404, "Usuario no encontrado")
+            used = int(quota_user["usage_today"] or 0)
+            if quota_user["last_reset_date"] != today():
+                used = 0
+                c.execute("UPDATE users SET usage_today=0,last_reset_date=?,updated_at=? WHERE user_id=?", (today(), now(), uid))
+            if used >= FREE_DAILY_LIMIT:
+                raise HTTPException(403, "Has alcanzado tus 3 análisis gratuitos de hoy")
+            c.execute("UPDATE users SET usage_today=?,last_reset_date=?,updated_at=? WHERE user_id=?", (used + 1, today(), now(), uid))
+            quota_cursor = c.execute("INSERT INTO usage_logs(user_id,used_at,module,mode,premium_used) VALUES(?,?,?,?,0)", (uid, now(), module, mode))
+            c.execute("UPDATE analysis_attempts SET quota_charged=1,quota_log_id=? WHERE id=? AND user_id=?", (quota_cursor.lastrowid, aid, uid))
+        if attempt and int(attempt["generation_count"] or 0)==0 and len(all_replies)>2:
+            c.execute("UPDATE analysis_attempts SET replies_json=? WHERE id=?",(json.dumps(all_replies,ensure_ascii=False),aid))
+        c.execute("UPDATE analysis_attempts SET generation_count=generation_count+1,generation_in_progress=0,generation_started_at=NULL,updated_at=? WHERE id=?",(now(),aid))
+        c.execute("UPDATE ai_idempotency SET status='completed',result_json=?,updated_at=? WHERE user_id=? AND idempotency_key=?",(json.dumps(result,ensure_ascii=False),now(),uid,key))
+        c.commit(); c.close()
+        # Monitoring is best-effort: metrics storage must not turn a successful AI reply into an error.
+        try:
+            telemetry = db()
+            telemetry.execute("INSERT INTO ai_generation_events(user_id,analysis_id,provider,model,status,latency_ms,quality_score,retry_number,module,mode,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (uid, aid, result.get("provider"), result.get("model"), "success", result["timings_ms"]["total_backend_ms"], quality_score, int(attempt["retry_used"] or 0) if attempt else 0, module, mode, now()))
+            telemetry.commit()
+        except Exception:
+            pass
+        finally:
+            try: telemetry.close()
+            except Exception: pass
+        return result
+    except Exception as exc:
+        c = db()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            failed_attempt = c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?", (aid, uid)).fetchone()
+            # Refund exactly once only when the very first generation failed before any success.
+            if failed_attempt and int(failed_attempt["generation_count"] or 0) == 0 and int(failed_attempt["quota_charged"] or 0) == 1 and not premium(uid):
+                log_id = failed_attempt["quota_log_id"] if "quota_log_id" in failed_attempt.keys() else None
+                if _quota_charge_is_from_today(c, log_id, uid):
+                    c.execute("UPDATE users SET usage_today=MAX(0,usage_today-1),updated_at=? WHERE user_id=?", (now(), uid))
+                    if log_id:
+                        c.execute("DELETE FROM usage_logs WHERE id=? AND user_id=?", (log_id, uid))
+                    c.execute("UPDATE analysis_attempts SET quota_charged=0,quota_log_id=NULL WHERE id=? AND user_id=?", (aid, uid))
+            c.execute("UPDATE analysis_attempts SET generation_in_progress=0,generation_started_at=NULL,updated_at=? WHERE id=? AND user_id=?", (now(), aid, uid))
+            c.execute("UPDATE ai_idempotency SET status='failed',updated_at=? WHERE user_id=? AND idempotency_key=?", (now(), uid, key))
+            failed_attempt = c.execute("SELECT retry_used,module,mode FROM analysis_attempts WHERE id=? AND user_id=?", (aid, uid)).fetchone()
+            c.execute("INSERT INTO ai_generation_events(user_id,analysis_id,status,error_category,error_code,retry_number,module,mode,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (uid, aid, "error", "provider_or_generation_failure", type(exc).__name__, int(failed_attempt["retry_used"] or 0) if failed_attempt else 0, module, mode, now()))
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+        finally:
+            c.close()
+        if isinstance(exc,HTTPException): raise
+        if isinstance(exc,ProviderError): raise HTTPException(503,"No se pudo generar la respuesta con IA. Inténtalo de nuevo.") from None
+        raise HTTPException(503,"No se pudo generar la respuesta con IA. Inténtalo de nuevo.") from None
+
+
+@app.post("/api/retry")
+def reserve_retry(p: dict, request: Request):
+    uid=current_user(request); aid=str(p.get("analysis_id") or "")
+    c=db()
+    try:
+        c.execute("BEGIN IMMEDIATE"); row=c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?",(aid,uid)).fetchone()
+        if not row: raise HTTPException(404,"Análisis no encontrado")
+        if int(row["retry_used"] or 0) or int(row["generation_in_progress"] or 0): raise HTTPException(409,"El reintento ya fue utilizado o hay una generación en curso")
+        extra=[]
+        try: stored=json.loads(row["replies_json"] or "[]")
+        except (TypeError, ValueError): stored=[]
+        if isinstance(stored,list): extra=[str(x) for x in stored[2:4] if str(x).strip()]
+        if len(extra)>=2:
+            # Las respuestas 3 y 4 ya llegaron en la llamada principal: no se vuelve a llamar a la IA.
+            c.execute("UPDATE analysis_attempts SET retry_used=1,retry_call_started=1,updated_at=? WHERE id=?",(now(),aid)); c.commit()
+            return {"reserved":True,"analysis_id":aid,"replies":extra,"needs_generation":False}
+        c.execute("UPDATE analysis_attempts SET retry_used=1,updated_at=? WHERE id=?",(now(),aid)); c.commit(); return {"reserved":True,"analysis_id":aid,"needs_generation":True}
+    except HTTPException: c.rollback(); raise
+    finally: c.close()
+
+
+@app.post("/api/retry/release")
+def release_retry(p: dict, request: Request):
+    current_user(request)
+    return {"released":False,"reason":"Los reintentos reservados no se reabren para evitar duplicados"}
+
+
+@app.post("/api/analyze/release")
+def release_analysis(p: dict, request: Request):
+    uid=current_user(request); aid=str(p.get("analysis_id") or ""); c=db()
+    try:
+        c.execute("BEGIN IMMEDIATE"); row=c.execute("SELECT * FROM analysis_attempts WHERE id=? AND user_id=?",(aid,uid)).fetchone()
+        if not row: raise HTTPException(404,"Análisis no encontrado")
+        released=False
+        if not int(row["generation_count"] or 0) and not int(row["generation_in_progress"] or 0) and int(row["quota_charged"] or 0) and not premium(uid):
+            quota_log_id = row["quota_log_id"] if "quota_log_id" in row.keys() else None
+            if _quota_charge_is_from_today(c, quota_log_id, uid):
+                c.execute("UPDATE users SET usage_today=MAX(0,usage_today-1) WHERE user_id=?",(uid,))
+                if quota_log_id:
+                    c.execute("DELETE FROM usage_logs WHERE id=? AND user_id=?", (quota_log_id, uid))
+                c.execute("UPDATE analysis_attempts SET quota_charged=0,quota_log_id=NULL,updated_at=? WHERE id=?",(now(),aid)); released=True
+        c.commit(); return {"released":released}
+    except HTTPException: c.rollback(); raise
+    finally: c.close()
+
+
+@app.get("/api/ai/providers")
+def ai_provider_status(request: Request):
+    current_user(request)
+    return {"providers": validate_provider_configuration(), "health": get_provider_health()}
+
+
+def _local_alternative(reply: str, mode: str, text: str) -> str:
+    """Produce a clearly identified local fallback alternative without claiming an AI provider."""
+    clean = re.sub(r"^Puedes responder(?: de forma segura| con humor| con cercanía)?[: ]*", "", reply, flags=re.I).strip().strip("“”\"")
+    if mode == "gracioso":
+        return "Otra opción más ligera: “Jajaja, y eso que la conversación todavía no se ha puesto buena 😂.”"
+    if mode == "coquetear":
+        return "Otra opción más coqueta: “Jajaja, me gusta hablar contigo; siempre sale algo que comentar 😏.”"
+    if mode == "enamorar":
+        return "Otra opción más cálida: “Me gusta que podamos hablar así, sin forzar nada 😊.”"
+    if mode == "provocativo":
+        return "Otra opción con picardía: “Jajaja, ahora me dejaste con curiosidad 😏.”"
+    if mode == "salvar":
+        return "Otra opción tranquila: “Quizá no me expliqué bien; prefiero que lo hablemos con calma.”"
+    return ("Otra forma de decirlo: " + clean[:900]) if clean else "¿Y tú qué piensas?"
+
+
+def _ocr_variants(img: Image.Image):
+    from PIL import ImageOps, ImageEnhance, ImageFilter
+
+    img = img.convert("RGB")
+    w, h = img.size
+    max_side = max(w, h)
+
+    # Mantener suficiente resolución para texto pequeño, pero evitar imágenes
+    # gigantes que hacen lento el OCR.
+    if max_side > 2600:
+        scale = 2600 / max_side
+        img = img.resize(
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            Image.Resampling.LANCZOS
+        )
+
+    gray = img.convert("L")
+
+    # El OCR funciona mejor cuando el texto ocupa una cantidad razonable
+    # de píxeles. Ampliamos capturas pequeñas.
+    if max(gray.size) < 1800:
+        factor = min(2.5, 1800 / max(gray.size))
+        gray = gray.resize(
+            (max(1, int(gray.width * factor)),
+             max(1, int(gray.height * factor))),
+            Image.Resampling.LANCZOS
+        )
+
+    gray = ImageOps.autocontrast(gray, cutoff=1)
+    gray = ImageEnhance.Contrast(gray).enhance(1.45)
+    gray = gray.filter(ImageFilter.SHARPEN)
+
+    variants = [gray]
+
+    # Umbral claro para capturas con fondo claro.
+    variants.append(
+        gray.point(lambda px: 255 if px > 165 else 0)
+    )
+
+    # Umbral más bajo para texto tenue/gris.
+    variants.append(
+        gray.point(lambda px: 255 if px > 125 else 0)
+    )
+
+    # Variante invertida para modo oscuro.
+    inv = ImageOps.invert(gray)
+    inv = ImageEnhance.Contrast(inv).enhance(1.25)
+    variants.append(inv)
+
+    # Umbral de la variante invertida.
+    variants.append(
+        inv.point(lambda px: 255 if px > 145 else 0)
+    )
+
+    return variants
+
+
+def _ocr_text(img: Image.Image):
+    candidates = []
+
+    for variant_index, variant in enumerate(_ocr_variants(img)):
+        for psm in (6, 11, 12):
+            remaining = remaining_provider_budget()
+            if remaining is not None and remaining <= 0.1:
+                break
+            try:
+                ocr_timeout = min(3.0, remaining) if remaining is not None else 3.0
+                txt = pytesseract.image_to_string(
+                    variant,
+                    lang="spa+eng",
+                    config=f"--oem 3 --psm {psm}",
+                    timeout=max(0.1, ocr_timeout),
+                )
+            except Exception:
+                continue
+
+            txt = re.sub(r"[ \t]+", " ", txt)
+            txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+
+            if not txt:
+                continue
+
+            lines = [x.strip() for x in txt.splitlines() if x.strip()]
+            alnum = len(re.findall(
+                r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]", txt
+            ))
+            words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]{2,}", txt)
+
+            # Penalizar resultados que parecen ruido de OCR.
+            junk = len(re.findall(r"[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9\s.,!?¿¡:;()'\"@#$%&+\-_/]", txt))
+
+            score = (
+                alnum
+                + min(len(lines), 25) * 8
+                + min(len(words), 80) * 2
+                - junk * 3
+            )
+
+            # Preferir texto suficientemente largo y con palabras reales.
+            if len(words) >= 2:
+                score += 12
+            if len(txt) >= 20:
+                score += 8
+
+            candidates.append((score, txt, variant_index, psm))
+
+    if not candidates:
+        return ""
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+def _decode_ocr_image(raw: bytes) -> Image.Image:
+    if not raw:
+        raise HTTPException(400, "Imagen vacía")
+    if len(raw) > MAX_OCR_BYTES:
+        raise HTTPException(413, "La imagen supera el límite de 8 MB")
+    try:
+        with Image.open(io.BytesIO(raw)) as source:
+            if source.format not in {"PNG", "JPEG", "WEBP", "BMP", "TIFF"}:
+                raise HTTPException(415, "Formato de imagen no admitido")
+            width, height = source.size
+            if width < 1 or height < 1 or width * height > MAX_OCR_PIXELS:
+                raise HTTPException(413, "La imagen tiene demasiados píxeles")
+            source.load()
+            return source.convert("RGB")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(400, "Imagen inválida o dañada")
+
+
+def _enforce_ocr_limits(uid: str) -> None:
+    """Per-user burst/daily limits plus a process-wide concurrency cap."""
+    _enforce_rate_limit(OCR_RATE_LIMITER, f"ocr:{uid}", "Demasiadas solicitudes de OCR. Espera un minuto.")
+    if not OCR_GATE.acquire(timeout=2.0):
+        raise HTTPException(429, "El servicio OCR está ocupado. Inténtalo de nuevo.", headers={"Retry-After": "2"})
+    if not OCR_DAILY_COUNTER.take(uid):
+        OCR_GATE.release()
+        raise HTTPException(429, "Has alcanzado el límite diario de OCR. Inténtalo de nuevo mañana.")
+
+
+def _run_ocr_with_limits(img: Image.Image, uid: str) -> str:
+    _enforce_ocr_limits(uid)
+    try:
+        return _ocr_text(img)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(503, "El servicio OCR no está disponible temporalmente")
+    finally:
+        OCR_GATE.release()
+
+
+@app.post("/ocr")
+async def ocr_upload(request: Request):
+    # OCR is expensive; only authenticated Telegram WebApp sessions may invoke it.
+    uid = current_user(request)
+    chunks = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_OCR_BYTES:
+            raise HTTPException(413, "La imagen supera el límite de 8 MB")
+        chunks.append(chunk)
+    img = _decode_ocr_image(b"".join(chunks))
+    # Tesseract is blocking and CPU-bound: run it outside the event loop.
+    text = await run_in_threadpool(_run_ocr_with_limits, img, uid)
+    return {"ok": True, "text": text}
+
+@app.post("/ocr-base64")
+def ocr_base64(p: OCR, request: Request):
+    uid = current_user(request)
+    encoded = p.image.split(",", 1)[-1]
+    if len(encoded) > ((MAX_OCR_BYTES + 2) // 3) * 4 + 8:
+        raise HTTPException(413, "La imagen supera el límite de 8 MB")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception:
+        raise HTTPException(400, "Imagen Base64 inválida")
+    img = _decode_ocr_image(raw)
+    return {"success": True, "text": _run_ocr_with_limits(img, uid)}
+
+@app.post("/ocr-base64-simple")
+def ocr_simple(p:OCR, request: Request): return ocr_base64(p, request)
+
+
+@app.post("/api/profile")
+def profile(p:Usage, request:Request):
+    uid=current_user(request)
+    u=user(uid); c=db(); rows=c.execute("SELECT module,COUNT(*) n FROM usage_logs WHERE user_id=? GROUP BY module",(uid,)).fetchall(); c.close(); counts={r["module"]:r["n"] for r in rows}
+    return {"user_id":uid,"username":u.get("username"),"first_name":u.get("first_name"),"payment_phone":u.get("payment_phone") or "","premium":premium(uid),"premium_until":u.get("premium_until"),"chats":counts.get("chat",0),"stories":counts.get("story",0),"analyses":sum(counts.values())}
+
+@app.get("/api/stats")
+def user_stats(request: Request):
+    """Estadísticas personales del usuario: análisis por modo, racha y referidos."""
+    uid = current_user(request)
+    c = db()
+    # Usage by mode (last 30 days and all time)
+    rows_all = c.execute(
+        "SELECT mode, COUNT(*) n FROM usage_logs WHERE user_id=? GROUP BY mode", (uid,)
+    ).fetchall()
+    rows_week = c.execute(
+        "SELECT mode, COUNT(*) n FROM usage_logs WHERE user_id=? AND used_at>=? GROUP BY mode",
+        (uid, (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S"))
+    ).fetchall()
+    rows_days = c.execute(
+        """SELECT date(used_at) d, COUNT(*) n FROM usage_logs
+           WHERE user_id=? AND used_at>=?
+           GROUP BY date(used_at) ORDER BY d""",
+        (uid, (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S"))
+    ).fetchall()
+    # Best mode
+    all_modes = {r["mode"]: r["n"] for r in rows_all if r["mode"]}
+    best_mode = max(all_modes, key=all_modes.get) if all_modes else None
+    total = sum(all_modes.values())
+    # Referrals — datos completos del motor de referidos
+    ref_history = _referrals.get_referral_history(c, uid)
+    c.close()
+    return {
+        "total_analyses": total,
+        "by_mode": all_modes,
+        "best_mode": best_mode,
+        "this_week": sum(r["n"] for r in rows_week),
+        "daily_activity": [{"day": r["d"], "count": r["n"]} for r in rows_days],
+        # Campos legacy (compatibilidad con código anterior)
+        "refer_code": ref_history["refer_code"],
+        "referrals_total": ref_history["stats"]["total_invited"],
+        "referrals_rewarded": ref_history["stats"]["rewarded"],
+        # Nuevos campos
+        "referral_stats": ref_history["stats"],
+        "referral_invitations": ref_history["invitations"],
+        "referral_rewards_history": ref_history["rewards_history"],
+        "referral_next_rewards_pending": ref_history["next_rewards_pending"],
+    }
+
+
+@app.post("/api/referral/apply")
+def apply_referral(p: ReferralApply, request: Request):
+    """Registra que el usuario actual fue invitado por refer_code (manual o vía startapp)."""
+    uid = current_user(request)
+    code = str(p.refer_code or "").strip().upper()
+    source = str(getattr(p, "source", "manual") or "manual")
+
+    c = db()
+    result = _referrals.apply_referral(c, uid, code, source=source)
+    c.close()
+
+    if not result["success"]:
+        error = result.get("error", "")
+        if error == "code_required":
+            raise HTTPException(400, result["message"])
+        elif error == "code_not_found":
+            raise HTTPException(404, result["message"])
+        elif error == "self_referral":
+            raise HTTPException(400, result["message"])
+        elif error == "already_referred":
+            raise HTTPException(409, result["message"])
+        else:
+            raise HTTPException(400, result["message"])
+
+    # Si es un referido nuevo (no idempotente), notificar al invitador
+    if not result.get("already_registered"):
+        referrer_id = result.get("referrer_id")
+        if referrer_id:
+            # Obtener nombre del invitado para la notificación
+            c2 = db()
+            u_row = c2.execute("SELECT first_name, username FROM users WHERE user_id=?", (uid,)).fetchone()
+            c2.close()
+            invitee_name = "Un amigo"
+            if u_row:
+                invitee_name = u_row["first_name"] or (f"@{u_row['username']}" if u_row["username"] else "Un amigo")
+            notify_user(
+                referrer_id,
+                f"👥 <b>¡Nuevo amigo invitado!</b>\n"
+                f"{invitee_name} se unió a LiggaCuba usando tu código. "
+                f"Cuando active Premium, recibirás <b>3 días de Premium</b> extra. 🎉",
+            )
+
+    return {
+        "success": True,
+        "message": result["message"],
+        "already_registered": result.get("already_registered", False),
+    }
+
+
+def _notify_referral_reward(referrer_id: str, invitee_id: str) -> None:
+    """Avisa por Telegram al invitador y al invitado cuando se acreditan los 3 días."""
+    if referrer_id:
+        notify_user(
+            referrer_id,
+            "🎁 <b>¡Recompensa de referido!</b>\n"
+            "Uno de tus amigos activó Premium gracias a tu código. "
+            "Te regalamos <b>3 días de Premium</b> extra. ¡Gracias por recomendar LiggaCuba! 💜",
+        )
+    if invitee_id:
+        notify_user(
+            invitee_id,
+            "✅ <b>Tu código de referido está activo.</b>\n"
+            "Tu amigo que te invitó ya recibió sus <b>3 días de Premium</b>. ¡Gracias por unirte a LiggaCuba! 🎉",
+        )
+
+
+def _grant_pending_referral_rewards() -> list:
+    """Acredita recompensas que se quedaron a medias (premium activo, sin los 3 días)."""
+    c = db()
+    granted = []
+    try:
+        for item in _referrals.pending_reward_candidates(c):
+            _referrals.mark_referral_premium_active(c, item["referred_id"], item["operation_id"])
+            if _referrals.reward_referrer(c, item["referred_id"], item["operation_id"]):
+                granted.append(item)
+    except Exception as exc:
+        logger.warning("pending referral rewards failed: %s", exc)
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+    for item in granted:
+        _notify_referral_reward(item.get("referrer_id") or "", item.get("referred_id") or "")
+    return granted
+
+
+def _reward_referrer(user_id: str, payment_operation_id: str = "") -> None:
+    """Give 3 days Premium to the referrer when referred user pays for the first time."""
+    c = db()
+    rewarded = False
+    try:
+        op_id = payment_operation_id or ""
+        _referrals.mark_referral_premium_active(c, user_id, op_id)
+        if op_id:
+            rewarded = _referrals.reward_referrer(c, user_id, op_id)
+        if rewarded:
+            ref_row = c.execute(
+                "SELECT referrer_id FROM referrals WHERE referred_id=? AND rewarded=1", (user_id,)
+            ).fetchone()
+        else:
+            ref_row = None
+    except Exception as exc:
+        logger.warning("_reward_referrer failed for %s: %s", user_id, exc)
+        ref_row = None
+        rewarded = False
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+    if rewarded and ref_row:
+        _notify_referral_reward(ref_row["referrer_id"], user_id)
+    # Si este pago no acreditó (o quedaron otros a medias), reintenta los pendientes.
+    try:
+        _grant_pending_referral_rewards()
+    except Exception as exc:
+        logger.warning("pending referral sweep failed for %s: %s", user_id, exc)
+
+
+@app.post("/api/situations/save")
+def save_situation(p:SaveSituation, request:Request):
+    uid=current_user(request)
+    c=db(); c.execute("INSERT INTO saved_situations(user_id,ocr_text,reply,created_at) VALUES(?,?,?,?)",(uid,p.ocr_text[:20000],p.reply[:20000],now())); c.commit(); c.close(); return {"success":True}
+
+@app.post("/api/situations/list")
+def list_situations(p:Usage, request:Request):
+    uid=current_user(request)
+    c=db(); rows=c.execute("SELECT id,ocr_text,reply,created_at FROM saved_situations WHERE user_id=? ORDER BY id DESC LIMIT 30",(uid,)).fetchall(); c.close(); return {"items":[dict(r) for r in rows]}
+
+
+@app.post("/api/premium/check")
+def premium_check(p: Usage, request:Request):
+    uid=current_user(request)
+    u=user(uid)
+    return {
+        "ok": True,
+        "premium": premium(uid),
+        "premium_until": u.get("premium_until")
+    }
+
+def normalize_payment_phone(value: str) -> str:
+    """Normalize Cuban mobile numbers with or without the +53 country prefix."""
+    digits = re.sub(r"\D", "", value or "")
+    if len(digits) == 10 and digits.startswith("53"):
+        return digits[2:]
+    return digits
+
+
+def _active_payment_operation(uid: str):
+    c = db()
+    try:
+        return c.execute(
+            "SELECT operation_id FROM payment_operations WHERE user_id=? AND status IN ('pending','proof_submitted') LIMIT 1",
+            (uid,),
+        ).fetchone()
+    finally:
+        c.close()
+
+
+_PHONE_LOCKED_MSG = "Tienes una operación de pago activa. Cancélala antes de cambiar o borrar tu número."
+
+
+@app.post("/api/payment-phone")
+def payment_phone(p: PaymentPhone, request: Request):
+    uid = current_user(request)
+    phone = normalize_payment_phone(p.phone or "")
+    if len(phone) < 8 or len(phone) > 15:
+        raise HTTPException(400, "Número de teléfono inválido")
+    current = str(user(uid).get("payment_phone") or "")
+    if phone != current and _active_payment_operation(uid):
+        raise HTTPException(409, _PHONE_LOCKED_MSG)
+    user(uid, {"payment_phone": phone})
+    return {"success": True, "payment_phone": phone}
+
+
+@app.post("/api/payment-phone/delete")
+def payment_phone_delete(request: Request):
+    uid = current_user(request)
+    if _active_payment_operation(uid):
+        raise HTTPException(409, _PHONE_LOCKED_MSG)
+    user(uid, {"payment_phone": ""})
+    return {"success": True, "payment_phone": ""}
+
+
+@app.post("/api/atajo-pago")
+def atajo_pago(p: AtajoPayment, request: Request):
+    """Recibe los datos existentes de los atajos Apple y procesa pagos idempotentemente."""
+    key = request.headers.get("x-atajo-key", "")
+    if not ATAJO_KEY or not hmac.compare_digest(key, ATAJO_KEY):
+        raise HTTPException(401, "Atajo no autorizado")
+
+    method = (p.metodo_pago or "").strip().upper()
+    # El atajo bancario no distingue BANDEC de BPA: se conserva su identificador.
+    if method in {"BANDEC", "BPA"}:
+        method = "BANDEC_BPA"
+    if method not in {"BANDEC_BPA", "SALDO_MOVIL"}:
+        raise HTTPException(400, "Método de pago inválido")
+
+    phone = re.sub(r"\D", "", p.telefono_origen or "")
+    try:
+        amount_value = round(float(p.monto_recibido or 0), 2)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Importe inválido")
+    transaction = (p.transaccion or "").strip().upper()
+    sms = (p.sms or "").strip()
+    destination = re.sub(r"\D", "", p.cuenta_destino or "")
+    transfer_date = (p.fecha or p.fecha_ejecucion or "").strip()
+
+    if amount_value <= 0 or not phone:
+        raise HTTPException(400, "Faltan teléfono de origen o importe válido")
+    if method == "BANDEC_BPA":
+        if not destination or not transaction:
+            raise HTTPException(400, "Faltan cuenta de destino o número de transacción")
+        # Acepta la cuenta bancaria configurada. Si BPA_ACCOUNT está configurada,
+        # también la admite; no intenta inferir qué banco originó el SMS.
+        configured_accounts = {
+            re.sub(r"\D", "", value)
+            for value in (BANDEC_ACCOUNT, BPA_ACCOUNT)
+            if value and re.sub(r"\D", "", value)
+        }
+        if not configured_accounts:
+            raise HTTPException(503, "No hay cuentas bancarias configuradas")
+        if destination not in configured_accounts:
+            raise HTTPException(409, "Cuenta destino no configurada")
+        # El atajo bancario no manda el SMS completo: construimos una huella estable
+        # a partir de los campos extraídos que sí envía.
+        fingerprint_source = "|".join(
+            ["BANDEC_BPA", phone, destination, f"{amount_value:.2f}", transaction, transfer_date]
+        )
+    else:
+        if not sms:
+            raise HTTPException(400, "Falta el SMS original de Saldo Móvil")
+        # Validar que el SMS tenga estructura compatible con el aviso de ETECSA.
+        sms_norm = " ".join(sms.lower().split())
+        if "ha recibido" not in sms_norm or "numero" not in sms_norm:
+            raise HTTPException(400, "El SMS no tiene el formato esperado de Saldo Móvil")
+        # Verifica que teléfono e importe coincidan con el aviso original.
+        sms_phone_match = re.search(r"numero\s+(\+?\d{8,12})", sms_norm, re.IGNORECASE)
+        if not sms_phone_match or normalize_payment_phone(sms_phone_match.group(1)) != normalize_payment_phone(phone):
+            raise HTTPException(400, "El teléfono no coincide con el SMS")
+        amount_match = re.search(r"ha recibido\s+([0-9.,]+)\s*CUP", sms_norm, re.IGNORECASE)
+        if not amount_match:
+            raise HTTPException(400, "No se pudo leer el importe del SMS")
+        try:
+            sms_amount = round(float(amount_match.group(1).replace(",", "")), 2)
+        except ValueError:
+            raise HTTPException(400, "El importe del SMS no es válido")
+        if sms_amount != amount_value:
+            raise HTTPException(400, "El importe no coincide con el SMS")
+        fingerprint_source = "SALDO_MOVIL|" + sms
+    fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
+
+    c = db()
+    try:
+        # Serializa recepción concurrente: evita procesar dos veces la misma operación.
+        c.execute("BEGIN IMMEDIATE")
+        if transaction:
+            duplicate = c.execute(
+                "SELECT operation_id,status FROM payment_operations WHERE transaction_id=? LIMIT 1",
+                (transaction,),
+            ).fetchone()
+        else:
+            duplicate = None
+        if not duplicate:
+            duplicate = c.execute(
+                "SELECT operation_id,status FROM payment_operations WHERE source_sms=? LIMIT 1",
+                (fingerprint,),
+            ).fetchone()
+        if duplicate:
+            c.rollback()
+            return {
+                "success": False,
+                "status": "duplicate",
+                "operation_id": duplicate["operation_id"],
+            }
+
+        # Una sola operación activa por usuario: el pago debe coincidir con
+        # teléfono registrado, método, importe y destino cuando aplica.
+        rows = c.execute(
+            """SELECT po.*, u.payment_phone, u.first_name, u.username
+               FROM payment_operations po
+               JOIN users u ON u.user_id=po.user_id
+               WHERE po.status='pending'
+               ORDER BY po.created_at ASC"""
+        ).fetchall()
+        candidates = []
+        for row in rows:
+            row_method = (row["payment_method"] or "").strip().upper()
+            if method == "BANDEC_BPA":
+                if row_method not in {"BANDEC_BPA", "BANDEC", "BPA"}:
+                    continue
+                row_destination = re.sub(r"\D", "", row["destination_account"] or "")
+                if not row_destination or row_destination != destination:
+                    continue
+            else:
+                if row_method != "SALDO_MOVIL":
+                    continue
+            expected_amount, expected_currency = _payments.expected_values(row)
+            if expected_currency != _payments.payment_currency():
+                # Never compare an amount expressed in another currency.
+                continue
+            if round(expected_amount, 2) != amount_value:
+                continue
+            registered = row["payment_phone"] or row["payer_phone"] or ""
+            if not registered or normalize_payment_phone(registered) != normalize_payment_phone(phone):
+                continue
+            candidates.append(row)
+
+        if len(candidates) != 1:
+            c.rollback()
+            status = "unmatched" if not candidates else "ambiguous"
+            _review_async("atajo_unmatched", {
+                "status": status, "matches": len(candidates), "phone": phone,
+                "amount": f"{amount_value:.2f}", "method": method, "destination": destination,
+                "origin_account": "",
+                "transaction": transaction, "date": transfer_date,
+                "fingerprint": fingerprint[:16],
+                "raw_sms": sms or "",
+            })
+            return {
+                "success": False,
+                "status": status,
+                "matches": len(candidates),
+            }
+
+        matched = candidates[0]
+        if matched["plan"] not in _payments.VALID_PLANS:
+            c.rollback()
+            logger.error("Payment operation has invalid plan operation_id=%s", matched["operation_id"])
+            return {"success": False, "status": "invalid_operation"}
+        t = now()
+        updated = c.execute(
+            """UPDATE payment_operations
+               SET status='verified', payer_phone=?, destination_account=?,
+                   transaction_id=?, transfer_date=?, source_sms=?,
+                   verified_at=?, updated_at=?
+               WHERE operation_id=? AND status='pending'""",
+            (
+                phone, destination, transaction, transfer_date, fingerprint,
+                t, t, matched["operation_id"],
+            ),
+        )
+        if updated.rowcount != 1:
+            c.rollback()
+            return {"success": False, "status": "already_processed"}
+
+        # Actualización de pago y Premium/anuncio en la misma transacción.
+        until = _apply_paid_plan(c, matched["user_id"], matched["plan"], t)
+        c.commit()
+        result = {
+            "success": True,
+            "status": "verified",
+            "operation_id": matched["operation_id"],
+            "user_id": matched["user_id"],
+            "premium_until": until,
+        }
+        if _payments.is_ad_plan(matched["plan"]):
+            result.pop("premium_until")
+            result["ad_paid_until"] = until
+            result["plan"] = matched["plan"]
+            notify_user(matched["user_id"], "✅ <b>¡Tu anuncio fue activado!</b>\nYa puedes editar tu anuncio desde <b>Más → Anunciar mi negocio</b>.")
+        else:
+            days = _payments.plan_days(matched["plan"])
+            notify_user(matched["user_id"], f"🎉 <b>¡Premium activado!</b>\nTienes <b>{days} días</b> de acceso Premium en LiggaCuba. ¡Disfrútalo!")
+            _reward_referrer(matched["user_id"], str(matched["operation_id"]))
+            _review_async("atajo_granted", {
+                "operation_id": matched["operation_id"],
+                "user_id": matched["user_id"],
+                "first_name": matched["first_name"] or "",
+                "username": matched["username"] or "",
+                "phone": phone,
+                "amount": f"{amount_value:.2f}",
+                "method": method,
+                "destination": destination,
+                "origin_account": "",
+                "transaction": transaction,
+                "date": transfer_date,
+                "raw_sms": sms or "",
+            })
+        return result
+    except sqlite3.IntegrityError:
+        c.rollback()
+        return {"success": False, "status": "duplicate"}
+    finally:
+        c.close()
+
+def _apply_paid_plan(c, user_id, plan, t):
+    """Aplica un pago verificado dentro de la transacción ``c`` y devuelve la fecha de fin.
+
+    Premium suma días a ``users.premium_until``; un plan de anuncio suma días al
+    anuncio del negocio. En ambos casos se conservan los días ya pagados.
+    """
+    days = _payments.plan_days(plan)
+    if _payments.is_ad_plan(plan):
+        u = c.execute("SELECT first_name,username FROM users WHERE user_id=?", (str(user_id),)).fetchone()
+        name = ((u["first_name"] or u["username"] or "") if u else "")
+        return _ads.extend_business_subscription(c, str(user_id), days, name)
+    row = c.execute("SELECT premium_until FROM users WHERE user_id=?", (user_id,)).fetchone()
+    base = datetime.now(timezone.utc)
+    current = row["premium_until"] if row else None
+    if current:
+        try: base = max(base, _utc_datetime(current))
+        except (ValueError, TypeError): pass
+    until = (base + timedelta(days=days)).isoformat()
+    c.execute("UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?", (until, t, user_id))
+    return until
+
+
+@app.get("/api/payments/pricing")
+def payment_pricing():
+    """Public price list sourced from the same configuration used to charge."""
+    currency = _payments.payment_currency()
+    return {
+        "currency": currency,
+        "plans": {
+            "weekly":  {"amount_value": _payments.verification_amount("weekly"),  "amount": amount("weekly",  "es"), "days": 7},
+            "monthly": {"amount_value": _payments.verification_amount("monthly"), "amount": amount("monthly", "es"), "days": 30},
+            "annual":  {"amount_value": _payments.verification_amount("annual"),  "amount": amount("annual",  "es"), "days": 365},
+        },
+        "ad_plans": _payments.ad_pricing(),
+    }
+
+
+@app.get("/api/admin/pricing")
+def admin_get_pricing(request: Request):
+    """Devuelve todos los precios actuales (con origen: db/env/default)."""
+    admin(request, "settings")
+    c = db()
+    overrides = {r["plan"]: r["price"] for r in c.execute("SELECT plan, price FROM price_overrides").fetchall()}
+    c.close()
+    result = {}
+    for plan in _payments.VALID_PLANS:
+        db_val = overrides.get(plan)
+        env_key = _payments._PRICE_ENV.get(plan, "")
+        env_val = (os.getenv(env_key) or "").strip()
+        default_val = _payments.DEFAULT_PRICES_ALL[plan]
+        if db_val is not None:
+            source = "db"
+            current = float(db_val)
+        elif env_val:
+            source = "env"
+            current = float(env_val.replace(",", "."))
+        else:
+            source = "default"
+            current = default_val
+        result[plan] = {
+            "current": current,
+            "source": source,
+            "default": default_val,
+            "days": _payments.plan_days(plan),
+            "is_ad": _payments.is_ad_plan(plan),
+        }
+    return {"currency": _payments.payment_currency(), "plans": result}
+
+
+@app.post("/api/admin/pricing")
+def admin_set_pricing(p: PriceUpdate, request: Request):
+    """Guarda un precio override en la DB."""
+    ident = admin(request, "settings")
+    plan = (p.plan or "").strip().lower()
+    if plan not in _payments.VALID_PLANS:
+        raise HTTPException(400, "Plan inválido")
+    if p.price <= 0:
+        raise HTTPException(400, "El precio debe ser mayor que cero")
+    c = db()
+    c.execute(
+        "INSERT INTO price_overrides(plan,price,updated_at,updated_by) VALUES(?,?,?,?) "
+        "ON CONFLICT(plan) DO UPDATE SET price=excluded.price,updated_at=excluded.updated_at,updated_by=excluded.updated_by",
+        (plan, round(p.price, 2), now(), ident["username"])
+    )
+    c.commit(); c.close()
+    audit(ident["username"], "price_update", plan, {"price": p.price})
+    return {"success": True, "plan": plan, "price": round(p.price, 2)}
+
+
+@app.delete("/api/admin/pricing/{plan}")
+def admin_reset_pricing(plan: str, request: Request):
+    """Elimina el override de DB y vuelve al valor de env/default."""
+    ident = admin(request, "settings")
+    plan = plan.strip().lower()
+    if plan not in _payments.VALID_PLANS:
+        raise HTTPException(400, "Plan inválido")
+    c = db()
+    c.execute("DELETE FROM price_overrides WHERE plan=?", (plan,))
+    c.commit(); c.close()
+    audit(ident["username"], "price_reset", plan, {})
+    return {"success": True, "plan": plan}
+
+
+@app.post("/api/payments/pending")
+def pending(p: Pending, request: Request):
+    uid = current_user(request)
+    if p.plan not in _payments.VALID_PLANS:
+        raise HTTPException(400, "Plan inválido")
+    method = (p.payment_method or "BANDEC").strip().upper()
+    if method not in {"BANDEC", "BPA", "SALDO_MOVIL"}:
+        raise HTTPException(400, "Método de pago inválido")
+
+    registered_user = user(uid)
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        existing = c.execute(
+            """SELECT * FROM payment_operations
+               WHERE user_id=? AND status IN ('pending','proof_submitted')
+               ORDER BY created_at DESC LIMIT 1""",
+            (uid,),
+        ).fetchone()
+        if existing:
+            # No permitir cambiar método/plan en mitad de una operación.
+            c.commit()
+            existing_amount, existing_currency = _payments.expected_values(existing)
+            return {
+                "success": True,
+                "operation_id": existing["operation_id"],
+                "status": existing["status"],
+                "amount": existing["amount"],
+                "amount_value": existing_amount,
+                "amount_currency": existing_currency,
+                "payment_method": existing["payment_method"],
+                "destination_account": existing["destination_account"] or "",
+                "payment_phone": existing["payer_phone"] or registered_user.get("payment_phone") or "",
+                "existing_operation": True,
+                "requires_cancel_to_change": (
+                    existing["payment_method"] != method or existing["plan"] != p.plan
+                ),
+            }
+
+        # Exigir un teléfono guardado antes de crear una operación nueva.
+        phone = str(registered_user.get("payment_phone") or "").strip()
+        if not phone:
+            c.rollback()
+            raise HTTPException(
+                400,
+                "Configura tu número de teléfono en Perfil antes de iniciar el pago."
+            )
+
+        oid = uuid.uuid4().hex[:12].upper()
+        t = now()
+        a = amount(p.plan, p.language)
+        verification_value = _payments.verification_amount(p.plan)
+        currency = _payments.payment_currency()
+        if method == "BANDEC":
+            destination = BANDEC_ACCOUNT
+            if not re.sub(r"\D", "", destination or ""):
+                raise HTTPException(503, "Cuenta BANDEC no configurada")
+        elif method == "BPA":
+            destination = BPA_ACCOUNT
+            if not re.sub(r"\D", "", destination or ""):
+                raise HTTPException(503, "Cuenta BPA no configurada")
+        else:
+            destination = ""
+        phone = registered_user.get("payment_phone") or ""
+        c.execute(
+            """INSERT INTO payment_operations(
+               operation_id,user_id,plan,language,status,amount,payment_method,
+               payer_phone,destination_account,amount_value,amount_currency,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (oid, uid, p.plan, p.language, "pending", a, method, phone, destination, verification_value, currency, t, t),
+        )
+        c.commit()
+        return {
+            "success": True,
+            "operation_id": oid,
+            "status": "pending",
+            "amount": a,
+            "amount_value": verification_value,
+            "amount_currency": currency,
+            "payment_method": method,
+            "destination_account": destination,
+            "payment_phone": phone,
+            "existing_operation": False,
+        }
+    except sqlite3.IntegrityError:
+        c.rollback()
+        raise HTTPException(409, "Ya existe una operación de pago activa")
+    finally:
+        c.close()
+
+@app.post("/api/payments/proof")
+def proof(p:Proof, request:Request):
+    uid=current_user(request)
+    c=db()
+    try:
+        # Lock before reading the state: cancellation/review must not race with
+        # proof submission and resurrect a closed operation.
+        c.execute("BEGIN IMMEDIATE")
+        row=c.execute("SELECT * FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,uid)).fetchone()
+        if not row: raise HTTPException(404,"Operación no encontrada")
+        if row["status"] not in {"pending","proof_submitted"}: raise HTTPException(409,"La operación ya no admite comprobantes")
+        if len(p.proof_text)>4000: raise HTTPException(400,"Comprobante demasiado largo")
+        image=p.proof_image or ""
+        if len(image)>3_000_000: raise HTTPException(400,"El comprobante de imagen supera 3 MB")
+        if image:
+            try:
+                _validate_image_data_url(image)
+            except HTTPException as exc:
+                raise HTTPException(400, str(exc.detail)) from None
+        t=now()
+        archive_chat=(os.getenv("PAYMENT_ARCHIVE_CHAT_ID") or "").strip()
+        if archive_chat:
+            # Keep the original proof until Telegram confirms durable delivery.
+            c.execute("""INSERT INTO payment_proof_archive_queue(operation_id,chat_id,proof_text,proof_image,status,attempts,next_attempt_at,created_at,updated_at)
+                       VALUES(?,?,?,?,'pending',0,?,?,?)
+                       ON CONFLICT(operation_id) DO UPDATE SET chat_id=excluded.chat_id,proof_text=excluded.proof_text,
+                       proof_image=excluded.proof_image,status='pending',next_attempt_at=excluded.next_attempt_at,
+                       last_error=NULL,processing_started_at=NULL,attempts=0,archive_message_id=NULL,updated_at=excluded.updated_at""",
+                      (p.operation_id,archive_chat,p.proof_text,image,t,t,t))
+            cur=c.execute("""UPDATE payment_operations SET status='proof_submitted',proof_text=?,proof_image=?,
+                       archive_status='queued',archive_chat_id=NULL,archive_message_id=NULL,archive_last_error=NULL,archive_next_attempt_at=?,updated_at=?
+                       WHERE operation_id=? AND user_id=? AND status IN ('pending','proof_submitted')""",
+                      (p.proof_text,image,t,t,p.operation_id,uid))
+            archive_status='queued'
+        else:
+            cur=c.execute("""UPDATE payment_operations SET status='proof_submitted',proof_text=?,proof_image=?,
+                       archive_status='not_configured',archive_chat_id=NULL,archive_message_id=NULL,updated_at=?
+                       WHERE operation_id=? AND user_id=? AND status IN ('pending','proof_submitted')""",(p.proof_text,image,t,p.operation_id,uid))
+            archive_status='not_configured'
+        if cur.rowcount != 1:
+            raise HTTPException(409,"La operación ya no admite comprobantes")
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+    notify_user(uid, "📋 <b>Comprobante recibido.</b>\n\nLo estamos revisando. Te avisaremos cuando tu Premium esté activo. Puede tardar unos minutos.")
+    return {"success":True,"status":"proof_submitted","archive_status":archive_status,
+            "message":"Comprobante recibido; el archivo se procesa en segundo plano." if archive_status=='queued' else "Comprobante guardado. El archivo de Telegram no está configurado."}
+
+@app.post("/api/payments/cancel")
+def cancel(p:PaymentId, request:Request):
+    uid=current_user(request)
+    if not uid: raise HTTPException(400,"user_id requerido")
+    c=db()
+    try:
+        row=c.execute("SELECT status FROM payment_operations WHERE operation_id=? AND user_id=?",(p.operation_id,uid)).fetchone()
+        if not row: raise HTTPException(404,"Operación no encontrada")
+        if row["status"] not in {"pending","proof_submitted"}:
+            raise HTTPException(409,"La operación ya está cerrada o siendo procesada")
+        t=now()
+        # Conditional update is the final authority if state changes after SELECT.
+        cur=c.execute("UPDATE payment_operations SET status='cancelled',cancelled_at=?,updated_at=? WHERE operation_id=? AND user_id=? AND status IN ('pending','proof_submitted')",(t,t,p.operation_id,uid))
+        if cur.rowcount != 1: raise HTTPException(409,"La operación ya está cerrada")
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+    return {"success":True,"status":"cancelled"}
+
+@app.post("/api/payments/status")
+def status(p:PaymentId, request:Request):
+    uid=current_user(request)
+    c=db()
+    try:
+        row=c.execute("""SELECT po.operation_id,po.user_id,po.plan,po.language,po.status,po.amount,
+                       po.created_at,po.updated_at,po.verified_at,po.cancelled_at,u.premium_until
+                       FROM payment_operations po LEFT JOIN users u ON u.user_id=po.user_id
+                       WHERE po.operation_id=? AND po.user_id=?""",(p.operation_id,uid)).fetchone()
+    finally:
+        c.close()
+    if not row: raise HTTPException(404,"Operación no encontrada")
+    return dict(row)
+
+@app.post("/api/admin/login")
+def admin_login(p: AdminLogin, request: Request):
+    if not ADMIN_KEY:
+        raise HTTPException(503, "ADMIN_KEY no configurado")
+    ip_key = "ip:" + _client_ip(request)
+    is_owner = bool(p.master_key and hmac.compare_digest(p.master_key, ADMIN_KEY))
+    user_key = ""
+    if is_owner:
+        # A valid master key is never throttled, so the legitimate owner cannot
+        # be locked out by failed attempts from a shared or spoofed address.
+        ADMIN_LOGIN_IP_LIMITER.reset(ip_key)
+        username = "owner"
+        permissions = ["users", "premium", "payments", "stats", "admins", "settings", "audit", "ai_analytics", "dating", "ads"]
+        ttl = OWNER_SESSION_TTL
+    else:
+        username_input = p.username.strip()
+        user_key = "user:" + username_input.lower()[:64]
+        _enforce_rate_limit(ADMIN_LOGIN_IP_LIMITER, ip_key, "Demasiados intentos de acceso. Espera unos minutos.")
+        _enforce_rate_limit(ADMIN_LOGIN_USER_LIMITER, user_key, "Demasiados intentos para este usuario. Espera unos minutos.")
+        c = db()
+        row = c.execute("SELECT * FROM admin_users WHERE username=? AND is_active=1", (username_input,)).fetchone()
+        c.close()
+        if not row:
+            # Equalise timing with a dummy PBKDF2 so usernames cannot be enumerated.
+            hashlib.pbkdf2_hmac("sha256", p.password.encode(), b"\x00" * 16, 180000)
+            raise HTTPException(401, "Credenciales incorrectas")
+        try:
+            salt_hex, stored_hash = row["password_hash"].split(":", 1)
+            salt = bytes.fromhex(salt_hex)
+            if not salt or not stored_hash:
+                raise ValueError("hash incompleto")
+        except (ValueError, TypeError):
+            # A corrupted stored hash must never turn into a 500 or a login.
+            logger.error("Admin login rejected: malformed stored password hash")
+            raise HTTPException(401, "Credenciales incorrectas")
+        calculated = hashlib.pbkdf2_hmac("sha256", p.password.encode(), salt, 180000).hex()
+        if not hmac.compare_digest(stored_hash, calculated):
+            raise HTTPException(401, "Credenciales incorrectas")
+        username = row["username"]
+        permissions = json.loads(row["permissions"])
+        ttl = ADMIN_SESSION_TTL
+        ADMIN_LOGIN_IP_LIMITER.reset(ip_key)
+        ADMIN_LOGIN_USER_LIMITER.reset(user_key)
+    claims = {"username": username, "exp": int(time.time()) + ttl, "jti": uuid.uuid4().hex}
+    if is_owner:
+        claims["role"] = "owner"
+    payload = _b64e(json.dumps(claims, separators=(",", ":")).encode())
+    token = payload + "." + _b64e(hmac.new(ADMIN_KEY.encode(), payload.encode(), hashlib.sha256).digest())
+    session_db = db()
+    try:
+        session_db.execute(
+            "INSERT INTO admin_sessions(session_id, username, expires_at, created_at, revoked_at) VALUES(?,?,?,?,NULL)",
+            (claims["jti"], username, claims["exp"], now()),
+        )
+        session_db.commit()
+    finally:
+        session_db.close()
+    return {"success": True, "token": token, "username": username, "is_owner": is_owner, "permissions": permissions,
+            "expires_at": datetime.fromtimestamp(claims["exp"], timezone.utc).isoformat(),
+            "session_days": 90 if is_owner else 7}
+
+@app.get("/api/admin/me")
+def admin_me(request:Request): return admin_identity(request)
+
+@app.post("/api/admin/logout")
+def admin_logout(request: Request):
+    identity = admin_identity(request)
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    payload = token.rsplit(".", 1)[0]
+    claims = json.loads(_b64d(payload).decode())
+    c = db()
+    try:
+        c.execute("UPDATE admin_sessions SET revoked_at=? WHERE session_id=? AND username=? AND revoked_at IS NULL",
+                  (now(), str(claims.get("jti", "")), identity["username"]))
+        c.commit()
+    finally:
+        c.close()
+    return {"success": True, "logged_out": True}
+
+@app.get("/api/admin/users")
+def admin_users(request:Request, q:str=""):
+    ident=admin(request,"users"); c=db(); term=f"%{q.strip()}%"
+    rows=c.execute("SELECT u.user_id,u.username,u.first_name,u.last_name,u.premium_until,u.payment_phone,u.created_at,b.banned_at FROM users u LEFT JOIN user_bans b ON b.user_id=u.user_id WHERE u.user_id LIKE ? OR u.username LIKE ? OR u.first_name LIKE ? ORDER BY u.created_at DESC LIMIT 200",(term,term,term)).fetchall(); c.close()
+    return {"items":[{**dict(r),"premium":bool(r["premium_until"] and _utc_datetime(r["premium_until"]) > _utc_datetime()),"banned":bool(r["banned_at"])} for r in rows]}
+
+class BanRequest(BaseModel): reason:str=""
+
+def _protected_target(uid:str):
+    if str(uid) in _admin_telegram_ids(): raise HTTPException(400,"No puedes banear ni borrar a un administrador")
+
+@app.post("/api/admin/users/{user_id}/ban")
+def admin_ban_user(user_id:str, p:BanRequest, request:Request):
+    ident=admin(request,"users"); _protected_target(user_id); c=db()
+    try:
+        res=_cleanup.ban_user(c,user_id,ident["username"],p.reason)
+    finally: c.close()
+    audit(ident["username"],"ban_user",user_id,{"reason":p.reason[:300]})
+    reason_text = f"\n\nMotivo: {p.reason}" if p.reason else ""
+    notify_user(user_id, f"🚫 <b>Tu cuenta ha sido suspendida.</b>{reason_text}\n\nTus datos se conservarán 48 horas. Si crees que es un error, contacta a soporte.")
+    return {"success":True,**res}
+
+@app.post("/api/admin/users/{user_id}/unban")
+def admin_unban_user(user_id:str, request:Request):
+    ident=admin(request,"users"); c=db()
+    try:
+        was=_cleanup.unban_user(c,user_id)
+    finally: c.close()
+    if not was: raise HTTPException(404,"El usuario no está baneado")
+    audit(ident["username"],"unban_user",user_id,{})
+    notify_user(user_id, "✅ <b>Tu cuenta ha sido reactivada.</b>\n\nYa puedes usar LiggaCuba con normalidad. ¡Bienvenido de nuevo! 💜")
+    return {"success":True,"user_id":str(user_id)}
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(user_id:str, request:Request):
+    ident=admin(request,"users"); _protected_target(user_id); c=db()
+    try:
+        counts=_cleanup.delete_user_data(c,user_id,_dating_photos_dir())
+    finally: c.close()
+    audit(ident["username"],"delete_user",user_id,counts)
+    return {"success":True,"user_id":str(user_id),"deleted":counts}
+
+@app.post("/api/admin/premium")
+def admin_premium(p:PremiumChange, request:Request):
+    ident=admin(request,"premium"); uid=str(p.user_id); u=user(uid); t=now()
+    if p.action == "revoke":
+        until = None
+    elif p.action in {"grant", "extend"}:
+        # Grants/renewals never discard already-paid time on an active subscription.
+        base = datetime.now(timezone.utc)
+        try:
+            if u.get("premium_until"):
+                base = max(base, _utc_datetime(u["premium_until"]))
+        except (ValueError, TypeError):
+            pass
+        until = (base + timedelta(days=max(1, min(int(p.days), 3650)))).isoformat()
+    else: raise HTTPException(400,"Acción inválida")
+    c=db(); c.execute("UPDATE users SET premium_until=?,updated_at=? WHERE user_id=?",(until,t,uid)); c.commit(); c.close(); audit(ident["username"],"premium_"+p.action,uid,{"days":p.days,"premium_until":until})
+    if p.action == "revoke":
+        notify_user(uid, "⚠️ <b>Tu Premium ha sido desactivado.</b>\n\nSi tienes dudas, contacta a soporte.")
+    elif p.action in {"grant", "extend"}:
+        notify_user(uid, f"🎁 <b>¡Premium activado!</b>\n\nTienes <b>{p.days} días</b> de acceso Premium en LiggaCuba. ¡Disfrútalo! 💜")
+    return {"success":True,"user_id":uid,"premium_until":until,"premium":bool(until and _utc_datetime(until) > _utc_datetime())}
+
+@app.get("/api/admin/admins")
+def admin_list(request:Request):
+    admin(request,"admins"); c=db(); rows=c.execute("SELECT username,permissions,is_active,created_at FROM admin_users ORDER BY created_at DESC").fetchall(); c.close(); return {"items":[{**dict(r),"permissions":json.loads(r["permissions"])} for r in rows]}
+
+@app.post("/api/admin/admins")
+def admin_create(p:AdminCreate, request:Request):
+    ident=admin(request,"admins"); username=re.sub(r"[^a-zA-Z0-9_.-]","",p.username.strip())
+    if len(username)<3 or len(p.password)<10: raise HTTPException(400,"Usuario mínimo 3 caracteres y contraseña mínimo 10")
+    allowed={"users","premium","payments","stats","audit","ai_analytics","dating","ads"}; perms=sorted(set(p.permissions)&allowed)
+    if not perms: raise HTTPException(400,"Selecciona al menos un permiso")
+    salt=os.urandom(16); digest=salt.hex()+":"+hashlib.pbkdf2_hmac("sha256",p.password.encode(),salt,180000).hex(); t=now(); c=db()
+    try: c.execute("INSERT INTO admin_users(username,password_hash,permissions,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?)",(username,digest,json.dumps(perms),1,t,t)); c.commit()
+    except sqlite3.IntegrityError: c.close(); raise HTTPException(409,"Ese administrador ya existe")
+    c.close(); audit(ident["username"],"admin_created",username,{"permissions":perms}); return {"success":True,"username":username,"permissions":perms}
+
+@app.post("/api/admin/admins/status")
+def admin_admin_status(p:AdminStatus, request:Request):
+    ident=admin(request,"admins")
+    if p.username=="owner": raise HTTPException(400,"No se puede desactivar al administrador principal")
+    c=db(); cur=c.execute("UPDATE admin_users SET is_active=?,updated_at=? WHERE username=?",(1 if p.is_active else 0,now(),p.username)); c.commit(); c.close()
+    if not cur.rowcount: raise HTTPException(404,"Administrador no encontrado")
+    audit(ident["username"],"admin_status",p.username,{"active":p.is_active}); return {"success":True}
+
+@app.get("/api/admin/audit")
+def admin_audit(request:Request):
+    admin(request,"audit"); c=db(); rows=c.execute("SELECT actor,action,target,details,created_at FROM admin_audit ORDER BY id DESC LIMIT 200").fetchall(); c.close(); return {"items":[dict(r) for r in rows]}
+
+def _verify_payment_core(operation_id: str, actor: str) -> dict:
+    """Verifica un pago y activa el plan. Única implementación (panel y Telegram)."""
+    c=db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row=c.execute("SELECT * FROM payment_operations WHERE operation_id=?",(operation_id,)).fetchone()
+        if not row:
+            c.rollback()
+            raise HTTPException(404,"Operación no encontrada")
+        if row["status"] not in {"pending","proof_submitted"}:
+            c.rollback()
+            raise HTTPException(409,"Operación no verificable o ya procesada")
+        if row["plan"] not in _payments.VALID_PLANS:
+            c.rollback()
+            raise HTTPException(409,"El plan de esta operación no es válido")
+        # Reserve the operation atomically so a concurrent request cannot grant Premium twice.
+        t=now()
+        cur=c.execute("UPDATE payment_operations SET status='processing',updated_at=? WHERE operation_id=? AND status IN ('pending','proof_submitted')",(t,operation_id))
+        if cur.rowcount != 1:
+            c.rollback()
+            raise HTTPException(409,"La operación ya está siendo procesada")
+        until=_apply_paid_plan(c,row["user_id"],row["plan"],t)
+        done=c.execute("UPDATE payment_operations SET status='verified',verified_at=?,updated_at=? WHERE operation_id=? AND status='processing'",(t,t,operation_id))
+        if done.rowcount != 1:
+            c.rollback()
+            raise HTTPException(409,"La operación ya fue verificada")
+        c.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        c.rollback()
+        raise HTTPException(500,"No se pudo verificar el pago")
+    finally:
+        c.close()
+    is_ad=_payments.is_ad_plan(row["plan"])
+    key="ad_paid_until" if is_ad else "premium_until"
+    audit(actor,"payment_verified",operation_id,{"user_id":row["user_id"],key:until})
+    if is_ad:
+        notify_user(row["user_id"], "✅ <b>¡Tu anuncio fue activado!</b>\nYa puedes editar tu anuncio desde <b>Más → Anunciar mi negocio</b>.")
+    else:
+        days = _payments.plan_days(row["plan"])
+        notify_user(row["user_id"], f"🎉 <b>¡Premium activado!</b>\nTienes <b>{days} días</b> de acceso Premium en LiggaCuba. ¡Disfrútalo!")
+        _reward_referrer(row["user_id"], str(operation_id))
+    return {"success":True,"status":"verified",key:until,"plan":row["plan"]}
+
+
+def _review_photo_core(photo_id, approve: bool, reason: str, actor: str) -> dict:
+    """Aprueba o rechaza una foto de Citas (misma función que el panel)."""
+    c = db()
+    try:
+        result = _dating.admin_review_photo(
+            c, int(photo_id), bool(approve), reason or "", actor, _dating_photos_dir()
+        )
+    finally:
+        c.close()
+    uid = str(result.get("user_id") or "")
+    if uid:
+        if approve:
+            notify_user(uid, "✅ <b>Tu foto de Citas fue aprobada.</b>\nYa pueden verla al descubrir perfiles. 💜")
+        else:
+            motivo = f"\n\nMotivo: {reason}" if reason else ""
+            notify_user(uid, f"❌ <b>Tu foto de Citas no fue aprobada.</b>{motivo}\n\nSube otra que cumpla las reglas de contenido.")
+    audit(actor, "dating_photo_" + ("approved" if approve else "rejected"), str(photo_id), {"user_id": uid})
+    return result
+
+
+def _review_report_core(report_id, action: str, actor: str) -> dict:
+    """Suspende o descarta un reporte de Citas (misma función que el panel)."""
+    c = db()
+    try:
+        result = _dating.admin_resolve_report(c, int(report_id), action, actor)
+    finally:
+        c.close()
+    uid = str(result.get("user_id") or "")
+    if uid and action == "suspend":
+        notify_user(uid, "🚫 <b>Tu perfil de Citas fue suspendido.</b>\n\nUn reporte fue revisado por administración. "
+                         "Si crees que es un error, contacta a soporte por Telegram o WhatsApp.")
+    audit(actor, "dating_report_" + str(action), str(report_id), {"user_id": uid})
+    return result
+
+
+def _review_ad_core(ad_id, action: str, reason: str, actor: str) -> dict:
+    """Aplica una decisión de moderación sobre un anuncio (misma función que el panel).
+
+    Corrección: apply_admin_action mapea "resume" → status "approved" sin
+    devolver was_paused.  Leemos el estado previo ANTES de actuar para
+    distinguir una reactivación de una aprobación inicial.
+    apply_admin_action y _notify_ad_result no se modifican (evita
+    regresiones en el panel y en ads.py).
+    """
+    from . import ads as _ads_mod
+    conn = db()
+    try:
+        prev = conn.execute(
+            "SELECT status FROM ads WHERE id=?", (int(ad_id),)
+        ).fetchone()
+        was_paused = bool(prev and prev["status"] == "paused")
+        result = _ads_mod.apply_admin_action(conn, int(ad_id), action, reason, actor)
+    finally:
+        conn.close()
+    uid = str(result.get("owner_user_id") or "")
+    if uid:
+        status = result.get("status")
+        if status == "approved" and was_paused:
+            notify_user(uid, "✅ <b>Tu anuncio fue reactivado.</b>\n"
+                        "Ya se está mostrando de nuevo.")
+        elif status == "approved":
+            notify_user(uid, "✅ <b>Tu anuncio fue aprobado.</b>\n"
+                        "Ya se está mostrando a quienes usan LiggaCuba sin Premium.")
+        elif status == "rejected":
+            motivo = f"\n\nMotivo: {reason}" if reason else ""
+            notify_user(uid, f"❌ <b>Tu anuncio fue rechazado.</b>{motivo}\n\n"
+                        "Corrígelo y vuelve a enviarlo a revisión.")
+        elif status == "paused":
+            notify_user(uid, "⏸ <b>Tu anuncio fue pausado.</b>\n"
+                        "Puedes corregirlo y volver a enviarlo a revisión.")
+    audit(actor, "ad_" + str(action), str(ad_id), {"reason": reason or ""})
+    return result
+
+
+def _review_referral_core(referral_id, approve: bool, notes: str, actor: str) -> dict:
+    """Resuelve una anomalía de referido y avisa al invitador exactamente una vez.
+
+    resolve_anomaly espera action: str ("approve" | "reject"); se le pasa
+    la cadena correcta.  La notificación al invitador se envía tras cerrar
+    la conexión, usando el row leído antes del finally.
+    """
+    c = db()
+    try:
+        row = c.execute(
+            "SELECT r.referrer_id, r.referred_id FROM referrals r WHERE r.id=?",
+            (int(referral_id),)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Referido no encontrado")
+        # resolve_anomaly recibe cadena, nunca booleano.
+        action = "approve" if approve else "reject"
+        _referrals.resolve_anomaly(c, int(referral_id), actor, action, notes or "")
+    finally:
+        c.close()
+    referrer_id = str(row["referrer_id"] or "")
+    if referrer_id:
+        if approve:
+            notify_user(
+                referrer_id,
+                "🎁 <b>Tu referido fue aprobado.</b>\n"
+                "Administración revisó la invitación y quedó confirmada. "
+                "Recibirás los días de Premium cuando corresponda.",
+            )
+        else:
+            notify_user(
+                referrer_id,
+                "ℹ️ <b>Tu referido no fue aprobado.</b>\n"
+                "Administración revisó la invitación y no cumple las condiciones del programa.",
+            )
+    audit(actor, "referral_anomaly_" + ("approved" if approve else "rejected"),
+          str(referral_id), {"notes": notes or ""})
+    return {"success": True, "referral_id": int(referral_id)}
+
+
+def _handle_review_callback(update: dict) -> dict:
+    """Callback de un botón del grupo de revisión."""
+    data = str(((update.get("callback_query") or {}).get("data")) or "")
+    if not data.startswith(_review.CALLBACK_PREFIX + ":"):
+        return {"handled": False, "action": "unsupported_callback"}
+    return _review.handle_callback(
+        update, connect=db, admins=_admin_telegram_ids(),
+        verify_payment=_verify_payment_core, reject_payment=_reject_payment_core,
+        review_photo=_review_photo_core, resolve_report=_review_report_core,
+        ad_action=_review_ad_core, resolve_referral=_review_referral_core, audit=audit,
+    )
+
+
+def _handle_review_reason_message(update: dict) -> bool:
+    """Si un admin debía escribir el motivo de un rechazo, este mensaje lo completa."""
+    message = update.get("message") or {}
+    sender = (message.get("from") or {}).get("id")
+    admin_id = str(sender) if sender is not None else ""
+    if not admin_id or admin_id not in _admin_telegram_ids():
+        return False
+    chat_id = (message.get("chat") or {}).get("id")
+    text = (message.get("text") or "").strip()
+    if not text or text.startswith("/"):
+        return False
+    pending = _review.pending_action_for(db, admin_id, chat_id, text)
+    if not pending:
+        return False
+    _review.execute_action(
+        connect=db, admin_id=admin_id, chat_id=chat_id, message_id=message.get("message_id"),
+        action=pending["action"], target=pending["target"], reason=pending["reason"],
+        verify_payment=_verify_payment_core, reject_payment=_reject_payment_core,
+        review_photo=_review_photo_core, resolve_report=_review_report_core,
+        ad_action=_review_ad_core, resolve_referral=_review_referral_core, audit=audit,
+    )
+    return True
+
+
+def _review_async(kind: str, payload: dict) -> None:
+    """Aviso al grupo sin bloquear la respuesta (el atajo debe contestar rápido)."""
+    def _run():
+        try:
+            _review.notify(kind, payload, connect=db)
+        except Exception:
+            logger.warning("Review async notice failed kind=%s", kind, exc_info=True)
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _review_hook(kind: str, payload: dict) -> None:
+    """Envía al grupo lo que necesita decisión de administración."""
+    try:
+        if kind == "photo":
+            photo_id = int(payload.get("id") or 0)
+            if not photo_id:
+                return
+            raw = None
+            display_name = ""
+            c = db()
+            try:
+                row = c.execute(
+                    "SELECT ph.filename, p.display_name FROM dating_photos ph "
+                    "LEFT JOIN dating_profiles p ON p.user_id=ph.user_id WHERE ph.id=?",
+                    (photo_id,),
+                ).fetchone()
+            finally:
+                c.close()
+            if not row:
+                return
+            display_name = row["display_name"] or ""
+            raw = _dating.read_photo_bytes(_dating_photos_dir(), row["filename"])
+            _review.notify("photo", {"photo_id": photo_id, "user_id": str(payload.get("user_id") or ""),
+                                     "display_name": display_name, "image": raw}, connect=db)
+            return
+        _review.notify(kind, payload, connect=db)
+    except Exception:
+        logger.warning("Review hook failed kind=%s", kind, exc_info=True)
+
+
+def _referral_review_hook(referral_id: int, reason: str) -> None:
+    """Puente desde referrals.py hacia el grupo de revisión."""
+    try:
+        c = db()
+        try:
+            row = c.execute("SELECT referrer_id, referred_id FROM referrals WHERE id=?", (int(referral_id),)).fetchone()
+        finally:
+            c.close()
+        if not row:
+            return
+        _review.notify("referral", {"referral_id": int(referral_id), "reason": reason,
+                                    "referrer_id": row["referrer_id"], "referred_id": row["referred_id"]}, connect=db)
+    except Exception:
+        logger.warning("Referral review hook failed id=%s", referral_id, exc_info=True)
+
+
+@app.post("/api/admin/payments/verify")
+def verify_payment(p:PaymentId, request:Request):
+    ident=admin(request,"payments")
+    return _verify_payment_core(p.operation_id, ident["username"])
+
+
+def _reject_payment_core(operation_id: str, actor: str, reason: str = "") -> dict:
+    """Rechaza un pago. Única implementación (panel y Telegram)."""
+    c=db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row=c.execute("SELECT * FROM payment_operations WHERE operation_id=?",(operation_id,)).fetchone()
+        if not row:
+            c.rollback()
+            raise HTTPException(404,"Operación no encontrada")
+        if row["status"] not in {"pending","proof_submitted"}:
+            c.rollback()
+            raise HTTPException(409,"Operación ya procesada")
+        t=now()
+        cur=c.execute("UPDATE payment_operations SET status='rejected',updated_at=? WHERE operation_id=? AND status IN ('pending','proof_submitted')",(t,operation_id))
+        if cur.rowcount != 1:
+            c.rollback()
+            raise HTTPException(409,"La operación ya fue procesada")
+        c.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        c.rollback()
+        raise HTTPException(500,"No se pudo rechazar el pago")
+    finally:
+        c.close()
+    audit(actor,"payment_rejected",operation_id,{"reason":reason,"user_id":row["user_id"]})
+    reason_text = f"\n\nMotivo: {reason}" if reason else ""
+    notify_user(row["user_id"], f"❌ <b>Tu pago no pudo ser verificado.</b>{reason_text}\n\nSi crees que es un error, contacta a soporte por Telegram o WhatsApp.")
+    return {"success":True,"status":"rejected"}
+
+
+@app.post("/api/admin/payments/reject")
+def reject_payment(p: PaymentReview, request:Request):
+    ident=admin(request,"payments")
+    return _reject_payment_core(p.operation_id, ident["username"], p.reason or "")
+
+
+@app.get("/api/admin/payments/{operation_id}/proof")
+def admin_payment_proof(operation_id: str, request: Request):
+    admin(request,"payments")
+    c=db()
+    try:
+        row=c.execute("""SELECT operation_id,proof_text,proof_image,archive_status,archive_chat_id,
+                       archive_message_id,archived_at FROM payment_operations WHERE operation_id=?""",
+                      (operation_id,)).fetchone()
+    finally:
+        c.close()
+    if not row:
+        raise HTTPException(404,"Operación no encontrada")
+    if not (row["proof_text"] or row["proof_image"] or row["archive_message_id"]):
+        raise HTTPException(404,"No hay comprobante local; revisa el estado del archivo de Telegram")
+    return dict(row)
+
+
+@app.get("/api/admin/stats")
+def admin_stats(request: Request):
+    admin(request, "stats")
+    c = db()
+    try:
+        # ── Contadores base ──────────────────────────────────────────────────
+        total_users     = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+        premium_users   = c.execute("SELECT COUNT(*) n FROM users WHERE premium_until>?", (now(),)).fetchone()["n"]
+        today_usage     = c.execute("SELECT COUNT(*) n FROM usage_logs WHERE used_at>=?", (cuba_day_start_utc(),)).fetchone()["n"]
+        pending_payments= c.execute("SELECT COUNT(*) n FROM payment_operations WHERE status IN ('pending','proof_submitted')").fetchone()["n"]
+
+        # ── Nuevos usuarios por día (últimos 14 días) ────────────────────────
+        cutoff_14 = cuba_n_days_ago_date(13)
+        _cuba_mod = cuba_sqlite_day_modifier()  # p.ej. '-5 hours' desde ZoneInfo
+        new_by_day_rows = c.execute(
+            f"""SELECT date(created_at, '{_cuba_mod}') day, COUNT(*) n
+               FROM users WHERE date(created_at, '{_cuba_mod}') >= ?
+               GROUP BY date(created_at, '{_cuba_mod}') ORDER BY day""",
+            (cutoff_14,)
+        ).fetchall()
+        new_users_by_day = [{"day": r["day"], "count": r["n"]} for r in new_by_day_rows]
+
+        # ── Conversión free → premium (usuarios que pagaron al menos 1 vez) ──
+        # Base de conversión: usuarios creados hace más de 1 día (tuvieron tiempo de pagar)
+        eligible_users = c.execute(
+            "SELECT COUNT(*) n FROM users WHERE created_at < ?",
+            ((datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),)
+        ).fetchone()["n"]
+        ever_premium = c.execute(
+            "SELECT COUNT(DISTINCT user_id) n FROM payment_operations WHERE status='verified'"
+        ).fetchone()["n"]
+        conversion_rate = round(ever_premium * 100 / eligible_users, 1) if eligible_users > 0 else 0.0
+
+        # Nuevas conversiones últimos 7 días
+        conversions_7d = c.execute(
+            "SELECT COUNT(DISTINCT user_id) n FROM payment_operations WHERE status='verified' AND verified_at>=?",
+            ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(),)
+        ).fetchone()["n"]
+
+        # ── Retención a 7 días ───────────────────────────────────────────────
+        # Usuarios registrados hace 7-14 días que volvieron a usar en los últimos 7 días
+        cohort_start = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+        cohort_end   = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        active_start = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        cohort_size = c.execute(
+            "SELECT COUNT(*) n FROM users WHERE created_at>=? AND created_at<?",
+            (cohort_start, cohort_end)
+        ).fetchone()["n"]
+        retained = c.execute(
+            """SELECT COUNT(DISTINCT u.user_id) n FROM users u
+               JOIN usage_logs ul ON ul.user_id=u.user_id
+               WHERE u.created_at>=? AND u.created_at<? AND ul.used_at>=?""",
+            (cohort_start, cohort_end, active_start)
+        ).fetchone()["n"]
+        retention_7d = round(retained * 100 / cohort_size, 1) if cohort_size > 0 else None
+
+        # ── Uso diario últimos 14 días (para gráfica de actividad) ───────────
+        usage_by_day_rows = c.execute(
+            f"""SELECT date(used_at, '{_cuba_mod}') day, COUNT(*) n
+               FROM usage_logs WHERE date(used_at, '{_cuba_mod}') >= ?
+               GROUP BY date(used_at, '{_cuba_mod}') ORDER BY day""",
+            (cutoff_14,)
+        ).fetchall()
+        usage_by_day = [{"day": r["day"], "count": r["n"]} for r in usage_by_day_rows]
+
+        # ── Resumen de Citas ─────────────────────────────────────────────────
+        try:
+            dating_profiles = c.execute("SELECT COUNT(*) n FROM dating_profiles WHERE status='active'").fetchone()["n"]
+            dating_matches  = c.execute("SELECT COUNT(*) n FROM dating_matches WHERE status='active'").fetchone()["n"]
+            dating_pending_photos = c.execute("SELECT COUNT(*) n FROM dating_photos WHERE status='pending'").fetchone()["n"]
+        except Exception:
+            dating_profiles = dating_matches = dating_pending_photos = None
+
+    finally:
+        c.close()
+
+    out = {
+        # Contadores base (retrocompatibles)
+        "total_users":      total_users,
+        "premium_users":    premium_users,
+        "today_usage":      today_usage,
+        "pending_payments": pending_payments,
+        # Nuevas métricas
+        "new_users_by_day": new_users_by_day,
+        "usage_by_day":     usage_by_day,
+        "conversion": {
+            "ever_premium":    ever_premium,
+            "eligible_users":  eligible_users,
+            "rate_pct":        conversion_rate,
+            "last_7d":         conversions_7d,
+        },
+        "retention_7d": {
+            "cohort_size": cohort_size,
+            "retained":    retained,
+            "rate_pct":    retention_7d,
+            "note":        "Usuarios registrados hace 7-14 días que volvieron a usar en los últimos 7 días",
+        },
+    }
+    if dating_profiles is not None:
+        out["dating"] = {
+            "active_profiles":  dating_profiles,
+            "active_matches":   dating_matches,
+            "pending_photos":   dating_pending_photos,
+        }
+    return out
+
+@app.get("/api/admin/ai-monitor")
+def admin_ai_monitor(request: Request):
+    admin(request, "ai_analytics")
+    c = db()
+    try:
+        today_start = cuba_day_start_utc()
+        totals = c.execute("""
+          SELECT COUNT(*) total,
+                 SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) successes,
+                 SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) failures,
+                 COUNT(DISTINCT user_id) users,
+                 AVG(CASE WHEN status='success' THEN latency_ms END) avg_latency,
+                 AVG(CASE WHEN status='success' THEN quality_score END) avg_quality
+          FROM ai_generation_events WHERE created_at >= ?
+        """, (today_start,)).fetchone()
+        provider_rows = c.execute("""
+          SELECT provider, model, COUNT(*) total,
+                 SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) successes,
+                 SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) failures,
+                 AVG(latency_ms) avg_latency,
+                 AVG(quality_score) avg_quality
+          FROM ai_generation_events GROUP BY provider, model ORDER BY total DESC LIMIT 30
+        """).fetchall()
+        user_rows = c.execute("""
+          SELECT u.user_id, COALESCE(NULLIF(u.username,''), NULLIF(TRIM(COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'')),''), 'Usuario') display_name,
+                 u.usage_today, u.premium_until,
+                 COUNT(e.id) total_attempts,
+                 (SELECT COUNT(*) FROM analysis_attempts aa WHERE aa.user_id=u.user_id) total_analyses,
+                 SUM(CASE WHEN e.status='success' THEN 1 ELSE 0 END) successes,
+                 SUM(CASE WHEN e.status='error' THEN 1 ELSE 0 END) failures,
+                 AVG(e.quality_score) avg_quality,
+                 (SELECT e2.model FROM ai_generation_events e2 WHERE e2.user_id=u.user_id ORDER BY e2.id DESC LIMIT 1) last_model,
+                 (SELECT e3.provider FROM ai_generation_events e3 WHERE e3.user_id=u.user_id ORDER BY e3.id DESC LIMIT 1) last_provider
+          FROM users u LEFT JOIN ai_generation_events e ON e.user_id=u.user_id
+          GROUP BY u.user_id ORDER BY total_attempts DESC, u.created_at DESC LIMIT 200
+        """).fetchall()
+        event_rows = c.execute("""
+          SELECT e.created_at, COALESCE(NULLIF(u.username,''), NULLIF(TRIM(COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'')),''), 'Usuario') display_name,
+                 e.provider, e.model, e.status, e.error_code, e.latency_ms, e.quality_score, e.retry_number, e.module, e.mode
+          FROM ai_generation_events e LEFT JOIN users u ON u.user_id=e.user_id
+          ORDER BY e.id DESC LIMIT 100
+        """).fetchall()
+        _cuba_mod = cuba_sqlite_day_modifier()
+        days = c.execute(f"""
+          SELECT date(created_at, '{_cuba_mod}') day,
+                 SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) successes,
+                 SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) failures
+          FROM ai_generation_events WHERE date(created_at, '{_cuba_mod}') >= ? GROUP BY date(created_at, '{_cuba_mod}') ORDER BY day
+        """, (cuba_n_days_ago_date(6),)).fetchall()
+        total=int(totals["total"] or 0); successes=int(totals["successes"] or 0); failures=int(totals["failures"] or 0)
+        return {
+          "summary":{"today_events":total,"successes":successes,"failures":failures,
+                     "success_rate":round(successes*100/total,1) if total else 0,
+                     "unique_users":int(totals["users"] or 0),
+                     "avg_latency_ms":round(totals["avg_latency"] or 0),
+                     "avg_quality":round(totals["avg_quality"] or 0,1)},
+          "providers":[{**dict(r),"total":int(r["total"] or 0),"successes":int(r["successes"] or 0),
+                        "failures":int(r["failures"] or 0),"avg_latency":round(r["avg_latency"] or 0),
+                        "avg_quality":round(r["avg_quality"] or 0,1)} for r in provider_rows],
+          "users":[{**dict(r),"remaining_attempts":max(0, FREE_DAILY_LIMIT-int(r["usage_today"] or 0)),
+                    "successes":int(r["successes"] or 0),"failures":int(r["failures"] or 0),
+                    "total_attempts":int(r["total_attempts"] or 0),
+                    "total_analyses":int(r["total_analyses"] or 0),
+                    "success_rate":round(int(r["successes"] or 0)*100/max(1,int(r["total_attempts"] or 0)),1),
+                    "avg_quality":round(r["avg_quality"] or 0,1),
+                    "premium":bool(r["premium_until"] and _utc_datetime(r["premium_until"]) > _utc_datetime())} for r in user_rows],
+          "events":[dict(r) for r in event_rows],
+          "days":[dict(r) for r in days],
+          "provider_health": get_provider_health(),
+          "provider_configuration": validate_provider_configuration(),
+          "quality_note":"Puntuación heurística estimada (1–100), no evaluación semántica objetiva. La salud en memoria es local al proceso y no sustituye métricas persistentes. No se guardan imágenes, textos de conversación, respuestas ni claves API."
+        }
+    finally:
+        c.close()
+
+
+@app.get("/api/admin/payments")
+def admin_payments(request:Request):
+    admin(request,"payments"); c=db()
+    rows=c.execute("""SELECT operation_id,user_id,plan,language,status,amount,proof_text,CASE WHEN proof_image IS NOT NULL AND proof_image!='' THEN 1 ELSE 0 END AS has_proof_image,payment_method,payer_phone,destination_account,transaction_id,transfer_date,archive_chat_id,archive_message_id,archive_status,archive_attempts,archive_next_attempt_at,archive_last_error,archived_at,created_at,updated_at,verified_at,cancelled_at
+                      FROM payment_operations ORDER BY created_at DESC LIMIT 100""").fetchall()
+    c.close()
+    return {"items":[dict(r) for r in rows]}
+
+@app.post("/api/atajo-diagnostico")
+async def atajo_diagnostico(request: Request):
+    # This diagnostic endpoint must not be an unauthenticated public reflector.
+    key = request.headers.get("x-atajo-key", "")
+    if not ATAJO_KEY or not hmac.compare_digest(key, ATAJO_KEY):
+        raise HTTPException(401, "Atajo no autorizado")
+    body = await request.body()
+    if len(body) > 16 * 1024:
+        raise HTTPException(413, "Solicitud demasiado grande")
+    return {
+        "success": True,
+        "mensaje": "Atajos se comunica con el servidor",
+        "bytes_recibidos": len(body),
+    }
+
+
+@app.get("/api/admin/ai-providers")
+def admin_ai_providers(request: Request):
+    admin(request, "settings")
+    c = db()
+    try:
+        rows = c.execute("SELECT provider_id,name,base_url,model,supports_text,supports_image,enabled,priority,last_test_status,last_test_at,last_error_category,created_at,updated_at,api_key_encrypted FROM custom_ai_providers ORDER BY priority,name").fetchall()
+        return {"encryption_configured": len((os.getenv("AI_PROVIDER_ENCRYPTION_KEY") or "").strip()) >= 32,
+                "items": [{k: row[k] for k in row.keys() if k != "api_key_encrypted"} | {"has_api_key": bool(row["api_key_encrypted"])} for row in rows],
+                "built_in": validate_provider_configuration()}
+    finally:
+        c.close()
+
+
+@app.post("/api/admin/ai-providers")
+def admin_ai_provider_upsert(p: AIProviderUpsert, request: Request):
+    ident = admin(request, "settings")
+    provider_id = re.sub(r"[^a-z0-9_-]", "", p.provider_id.strip().lower())
+    name = p.name.strip()[:80]
+    model = p.model.strip()[:200]
+    if not provider_id or len(provider_id) > 48 or not name or not model:
+        raise HTTPException(400, "Identificador, nombre y modelo son obligatorios; el ID debe usar letras, números, guion o guion bajo.")
+    if provider_id in {"gemini", "groq", "openrouter", "cohere"}:
+        raise HTTPException(409, "Ese ID está reservado para un proveedor integrado.")
+    try:
+        endpoint = normalize_compatible_endpoint(p.base_url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    if not (1 <= int(p.priority) <= 1000):
+        raise HTTPException(400, "La prioridad debe estar entre 1 y 1000; el número menor se intenta primero.")
+    if not p.supports_text and not p.supports_image:
+        raise HTTPException(400, "Selecciona al menos una capacidad: texto o imagen.")
+    c = db()
+    try:
+        existing = c.execute("SELECT api_key_encrypted FROM custom_ai_providers WHERE provider_id=?", (provider_id,)).fetchone()
+        if not existing and not p.api_key.strip():
+            raise HTTPException(400, "Introduce la clave API para registrar el proveedor.")
+        if p.api_key.strip():
+            try:
+                encrypted = encrypt_provider_key(p.api_key.strip())
+            except ProviderError as exc:
+                raise HTTPException(503, "Configura AI_PROVIDER_ENCRYPTION_KEY en Railway antes de guardar claves.") from None
+        else:
+            encrypted = existing["api_key_encrypted"]
+        timestamp = now()
+        c.execute("""INSERT INTO custom_ai_providers(provider_id,name,base_url,model,api_key_encrypted,supports_text,supports_image,enabled,priority,created_at,updated_at)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(provider_id) DO UPDATE SET name=excluded.name,base_url=excluded.base_url,model=excluded.model,
+                     api_key_encrypted=excluded.api_key_encrypted,supports_text=excluded.supports_text,supports_image=excluded.supports_image,
+                     enabled=excluded.enabled,priority=excluded.priority,updated_at=excluded.updated_at,last_test_status=NULL,last_error_category=NULL""",
+                  (provider_id,name,endpoint,model,encrypted,int(p.supports_text),int(p.supports_image),int(p.enabled),int(p.priority),timestamp,timestamp))
+        c.commit()
+    finally:
+        c.close()
+    audit(ident["username"], "ai_provider_upsert", provider_id, {"name": name, "model": model, "enabled": p.enabled, "priority": p.priority, "supports_text": p.supports_text, "supports_image": p.supports_image})
+    return {"success": True, "provider_id": provider_id, "api_key_saved": True, "api_key_returned": False}
+
+
+@app.post("/api/admin/ai-providers/{provider_id}/test")
+def admin_ai_provider_test(provider_id: str, request: Request):
+    ident = admin(request, "settings")
+    c = db()
+    try:
+        row = c.execute("SELECT * FROM custom_ai_providers WHERE provider_id=?", (provider_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Proveedor no encontrado")
+        try:
+            config = dict(row)
+            config["api_key"] = decrypt_provider_key(row["api_key_encrypted"])
+            result = test_custom_provider(config)
+            status, category = "success", None
+        except Exception as exc:
+            result = {"ok": False, "latency_ms": None, "error_category": getattr(exc, "category", "connection_error")}
+            status, category = "error", result["error_category"]
+        c.execute("UPDATE custom_ai_providers SET last_test_status=?,last_test_at=?,last_error_category=?,updated_at=? WHERE provider_id=?", (status, now(), category, now(), provider_id))
+        c.commit()
+    finally:
+        c.close()
+    audit(ident["username"], "ai_provider_test", provider_id, {"status": status, "error_category": category, "latency_ms": result.get("latency_ms")})
+    return result
+
+
+@app.delete("/api/admin/ai-providers/{provider_id}")
+def admin_ai_provider_delete(provider_id: str, request: Request):
+    ident = admin(request, "settings")
+    c = db()
+    try:
+        cur = c.execute("DELETE FROM custom_ai_providers WHERE provider_id=?", (provider_id,))
+        c.commit()
+    finally:
+        c.close()
+    if not cur.rowcount:
+        raise HTTPException(404, "Proveedor no encontrado")
+    audit(ident["username"], "ai_provider_deleted", provider_id, {})
+    return {"success": True, "provider_id": provider_id}
+
+
+# ---------------------------------------------------------------------------
+# Admin – Referidos
+# ---------------------------------------------------------------------------
+
+@app.get("/api/admin/referrals/stats")
+def admin_referral_stats(request: Request):
+    """Estadísticas globales del sistema de referidos."""
+    admin(request)
+    c = db()
+    try:
+        stats = _referrals.get_admin_stats(c)
+    finally:
+        c.close()
+    return stats
+
+
+class AdminReferralListQuery(BaseModel):
+    status: Optional[str] = None
+    search: Optional[str] = None
+    limit: int = 50
+    offset: int = 0
+
+
+@app.post("/api/admin/referrals/list")
+def admin_referral_list(p: AdminReferralListQuery, request: Request):
+    """Lista paginada de referidos con filtros."""
+    admin(request)
+    c = db()
+    try:
+        result = _referrals.get_admin_referral_list(
+            c, status=p.status, search=p.search, limit=p.limit, offset=p.offset
+        )
+    finally:
+        c.close()
+    return result
+
+
+class AdminAnomalyResolve(BaseModel):
+    referral_id: int
+    action: str  # "approve" | "reject"
+    notes: str = ""
+
+
+@app.post("/api/admin/referrals/anomaly/resolve")
+def admin_resolve_anomaly(p: AdminAnomalyResolve, request: Request):
+    """Resuelve una anomalía detectada en un referido."""
+    ident = admin(request)
+    if p.action not in ("approve", "reject"):
+        raise HTTPException(400, "action debe ser 'approve' o 'reject'")
+    c = db()
+    try:
+        _referrals.resolve_anomaly(c, p.referral_id, ident["username"], p.action, p.notes)
+    finally:
+        c.close()
+    return {"success": True}
+
+
+class AdminRewardAdjust(BaseModel):
+    referral_id: int
+    grant: bool
+    notes: str = ""
+
+
+@app.post("/api/admin/referrals/reward/adjust")
+def admin_adjust_reward(p: AdminRewardAdjust, request: Request):
+    """Ajuste manual de recompensa. Deja registro de auditoría."""
+    ident = admin(request)
+    c = db()
+    try:
+        result = _referrals.admin_adjust_reward(c, p.referral_id, ident["username"], p.grant, p.notes)
+    finally:
+        c.close()
+    if not result.get("success"):
+        raise HTTPException(400, result.get("error", "No se pudo ajustar"))
+    if p.grant and result.get("action") == "admin_grant_reward":
+        _notify_referral_reward(str(result.get("referrer_id") or ""), str(result.get("referred_id") or ""))
+    return result
+
+
+@app.get("/api/admin/referrals/reconcile")
+def admin_reconcile(request: Request):
+    """Detecta recompensas pendientes de acreditar para revisión."""
+    admin(request)
+    c = db()
+    try:
+        pending = _referrals.reconcile_pending_rewards(c)
+    finally:
+        c.close()
+    return {"pending_rewards": pending, "count": len(pending)}
+
+
+@app.post("/api/admin/referrals/flag")
+def admin_flag_anomaly(request: Request, referral_id: int, reason: str = "manual_flag"):
+    """Marca manualmente un referido como anomalía."""
+    ident = admin(request)
+    c = db()
+    try:
+        _referrals.flag_anomaly(c, referral_id, f"admin:{ident['username']} – {reason}")
+        _referral_review_hook(int(referral_id), f"admin:{ident['username']} – {reason}")
+    finally:
+        c.close()
+    return {"success": True}
+
+
+@app.get("/api/admin/referrals/audit")
+def admin_referral_audit(request: Request, limit: int = 50, offset: int = 0):
+    """Log de auditoría de acciones administrativas sobre referidos."""
+    admin(request)
+    c = db()
+    try:
+        rows = c.execute(
+            "SELECT * FROM referral_audit_log ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        total = c.execute("SELECT COUNT(*) n FROM referral_audit_log").fetchone()["n"]
+    finally:
+        c.close()
+    return {"total": total, "items": [dict(r) for r in rows]}
+
+
+# ---------------------------------------------------------------------------
+# Referrals – Enlace personal de invitación
+# ---------------------------------------------------------------------------
+
+@app.get("/api/referral/my-link")
+def get_referral_link(request: Request):
+    """
+    Devuelve el código de referido del usuario y el enlace startapp completo.
+    Requiere que TELEGRAM_BOT_USERNAME esté configurado en el entorno.
+    """
+    uid = current_user(request)
+    bot_username = BOT_USERNAME.lstrip("@")
+    c = db()
+    try:
+        code = _ensure_refer_code(uid)
+    finally:
+        c.close()
+
+    if not bot_username:
+        return {
+            "refer_code": code,
+            "invite_link": None,
+            "bot_username": None,
+            "warning": "TELEGRAM_BOT_USERNAME no configurado",
+        }
+
+    invite_link = f"https://t.me/{bot_username}?startapp=ref_{code}"
+    return {
+        "refer_code": code,
+        "invite_link": invite_link,
+        "bot_username": bot_username,
+    }
+
+
+# ---------------------------------------------------------------------------
+# LiggaCuba Citas (sin chat interno: los matches se contactan por Telegram/WhatsApp)
+# ---------------------------------------------------------------------------
+def _dating_photos_dir() -> str:
+    configured = (os.getenv("DATING_PHOTOS_DIR") or "").strip()
+    if configured:
+        return configured
+    if _db.is_file_database(DB_PATH):
+        return os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "dating_photos")
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), "liggacuba_dating_photos")
+
+
+def _dating_secret() -> str:
+    if not SESSION_SECRET or len(SESSION_SECRET) < 32:
+        raise HTTPException(503, "SESSION_SECRET debe configurarse con al menos 32 caracteres")
+    return SESSION_SECRET
+
+
+def _dating_notify(user_id: str, text: str) -> None:
+    try:
+        # El aviso de match (y el resto de avisos de Citas) abre la Mini App.
+        send_message(user_id, text, _review.app_keyboard())
+    except Exception as exc:  # el aviso es opcional: nunca debe romper el match
+        logger.warning("Dating notification not delivered: error_type=%s", type(exc).__name__)
+
+
+def _direct_bot_reply(match_id: int, body: str, actor: str) -> None:
+    """Lógica de /api/admin/dating/bots/reply sin HTTP (evita deadlock en 1 worker).
+
+    Se inyecta en TelegramBot para que los replies del grupo de control no
+    hagan urllib a 127.0.0.1 del mismo proceso uvicorn.
+    """
+    admin_bot_reply = _dating.admin_bot_reply
+    is_chat_open = _dating.is_chat_open
+    c = db()
+    try:
+        result = admin_bot_reply(c, match_id, body, actor)
+    finally:
+        c.close()
+
+    # Notificar al usuario y al grupo de control (mismo comportamiento que el endpoint)
+    def _notify_user_and_group(res=result, actor=actor):
+        try:
+            c2 = db()
+            try:
+                real_id = res["real_id"]
+                bot_name = res["bot_name"]
+                mid = res["match_id"]
+                if not is_chat_open(c2, real_id, mid, window_seconds=30):
+                    _dating_notify(
+                        real_id,
+                        f"💬 <b>{bot_name} te envió un mensaje en LiggaCuba Citas.</b>\n"
+                        f"Abre la Mini App para leer y responder (startapp=chat_{mid}).",
+                    )
+                _dating_bot.send_bot_control_event("bot_admin_reply", {
+                    "match_id": mid,
+                    "bot_id": res["sender_id"],
+                    "bot_name": bot_name,
+                    "real_id": real_id,
+                    "body": res["body"],
+                    "actor": actor,
+                })
+            finally:
+                c2.close()
+        except Exception as exc:
+            logger.debug("_direct_bot_reply notify error: %s", exc)
+
+    import threading
+    threading.Thread(target=_notify_user_and_group, daemon=True).start()
+
+
+# Evita el deadlock: replies del grupo de control llaman la lógica de negocio
+# directamente en lugar de HTTP al mismo proceso (uvicorn sin --workers).
+_dating_bot.set_direct_reply_handler(_direct_bot_reply)
+
+app.include_router(_dating.build_router(
+    current_user=current_user, connect=db, is_premium=lambda uid: premium(uid), admin=admin, audit=audit,
+    notify=_dating_notify, secret=_dating_secret, photos_dir=_dating_photos_dir,
+    free_daily_likes=_env_int("DATING_FREE_DAILY_LIKES", 20), review=_review_hook,
+    bot_control=_dating_bot.send_bot_control_event,
+))
+
+app.include_router(_ads.build_router(
+    current_user=current_user, connect=db, is_premium=lambda uid: premium(uid), admin=admin, audit=audit,
+    payments=_payments, notify=_dating_notify, review=_review_hook,
+))
+
+try:
+    _referrals.set_review_hook(_referral_review_hook)
+except Exception:
+    logger.warning("Could not register the referral review hook", exc_info=True)
