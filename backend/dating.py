@@ -407,6 +407,48 @@ def get_profile(c: sqlite3.Connection, uid: str) -> Optional[sqlite3.Row]:
     return c.execute("SELECT * FROM dating_profiles WHERE user_id=?", (str(uid),)).fetchone()
 
 
+def get_match_profile_view(c: sqlite3.Connection, viewer_uid: str, target_public_id: str, secret: str) -> Dict[str, Any]:
+    """Vista de solo lectura de un perfil con el que el viewer tiene match activo."""
+    viewer_uid = str(viewer_uid)
+    target = c.execute(
+        "SELECT * FROM dating_profiles WHERE public_id=? AND status='active'",
+        (str(target_public_id),)
+    ).fetchone()
+    if not target:
+        raise DatingError("Perfil no encontrado.", 404, "not_found")
+    tid = target["user_id"]
+    # Debe existir un match activo entre ambos
+    match = c.execute(
+        "SELECT id FROM dating_matches WHERE status='active' AND "
+        "((user_a=? AND user_b=?) OR (user_a=? AND user_b=?))",
+        (viewer_uid, tid, tid, viewer_uid)
+    ).fetchone()
+    if not match:
+        raise DatingError("Solo puedes ver el perfil de tus matches.", 403, "not_match")
+    age = age_from(target["birth_date"]) if target["birth_date"] else None
+    photos = _approved_photo_urls(c, tid, secret)
+    interests = []
+    try:
+        raw = target["interests"] or ""
+        interests = [x.strip() for x in str(raw).split(",") if x.strip()][:8]
+    except Exception:
+        pass
+    return {
+        "profile": {
+            "public_id": target["public_id"],
+            "display_name": target["display_name"],
+            "age": age,
+            "province": target["province"],
+            "municipality": target["municipality"],
+            "bio": target["bio"],
+            "gender": target["gender"],
+            "interests": interests,
+        },
+        "photos": photos,
+        "match_id": match["id"],
+    }
+
+
 def upsert_profile(c: sqlite3.Connection, uid: str, cleaned: Dict[str, Any], now: Optional[str] = None) -> sqlite3.Row:
     now = now or _now()
     uid = str(uid)
@@ -1451,7 +1493,13 @@ def get_messages(
         for r in rows
     ]
     last_id = messages[-1]["id"] if messages else int(after_id)
-    return {"messages": messages, "last_id": last_id}
+    sent = count_sent_messages(c, match_id, uid)
+    return {
+        "messages": messages,
+        "last_id": last_id,
+        "free_msg_limit": FREE_MSG_LIMIT,
+        "messages_sent": sent,
+    }
 
 
 def post_message(
@@ -1489,11 +1537,24 @@ def post_message(
                 403, "msg_limit"
             )
 
+    # Obtener el otro usuario del match (para notificar si no tiene el chat abierto)
+    match_row = c.execute(
+        "SELECT user_a, user_b FROM dating_matches WHERE id=?", (int(match_id),)
+    ).fetchone()
+    other_id = None
+    if match_row:
+        other_id = match_row["user_b"] if str(match_row["user_a"]) == uid else match_row["user_a"]
+
     cur = c.execute(
         "INSERT INTO dating_messages(match_id, sender_id, body, created_at, is_system) VALUES(?,?,?,?,0)",
         (int(match_id), uid, body, now)
     )
     c.commit()
+
+    # Indicar si el receptor tiene el chat abierto (para que el router decida notificar)
+    recipient_online = False
+    if other_id:
+        recipient_online = is_chat_open(c, other_id, match_id, window_seconds=20)
 
     return {
         "id":         cur.lastrowid,
@@ -1502,6 +1563,9 @@ def post_message(
         "created_at": now,
         "read_at":    None,
         "is_system":  False,
+        "other_id":   other_id,
+        "recipient_online": recipient_online,
+        "match_id":   int(match_id),
     }
 
 
@@ -2166,7 +2230,19 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
         premium = is_premium(uid)
         return run(lambda c: likes_received(c, uid, secret(), premium))
 
-    @router.post("/api/dating/matches")
+    
+    @router.post("/api/dating/profile-view")
+    def dating_profile_view(p: dict, request: Request):
+        """Vista de solo lectura del perfil de un match (para el botón Ver perfil del chat)."""
+        uid = current_user(request)
+        public_id = str((p or {}).get("public_id") or "").strip()
+        if not public_id:
+            raise DatingError("public_id requerido.")
+        def work(c):
+            return get_match_profile_view(c, uid, public_id, secret())
+        return with_db(connect, work)
+
+@router.post("/api/dating/matches")
     def dating_matches(request: Request):
         uid = current_user(request)
 

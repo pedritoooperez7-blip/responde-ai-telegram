@@ -13,8 +13,11 @@
   'use strict';
 
   // ── constantes ────────────────────────────────────────────────────────────
-  const POLL_MS          = 4500;   // polling mientras el chat está abierto
-  const MSG_LIMIT_FREE   = 8;      // mensajes gratuitos por match
+  const POLL_MS_ACTIVE   = 3000;   // polling rápido tras actividad
+  const POLL_MS_IDLE     = 8000;   // polling lento si no hay mensajes nuevos
+  let   POLL_MS          = POLL_MS_ACTIVE;
+  // Límite free viene del backend. Fallback 8 por compatibilidad.
+  let FREE_MSG_LIMIT = 8;
   const LOAD_LIMIT       = 40;     // mensajes por carga
 
   // ── textos ────────────────────────────────────────────────────────────────
@@ -222,6 +225,20 @@
     try {
       const d = await fetchMatchList();
       S.listCache = d.matches || [];
+      // Actualizar badge total de no leídos en la tab Matches
+      const totalUnread = (S.listCache || []).reduce((s, m) => s + (m.unread_count || 0), 0);
+      const badge = document.getElementById('matches-unread-badge');
+      if (badge) {
+        if (totalUnread > 0) {
+          badge.textContent = totalUnread > 99 ? '99+' : String(totalUnread);
+          badge.hidden = false;
+          badge.style.display = '';
+        } else {
+          badge.hidden = true;
+          badge.style.display = 'none';
+        }
+      }
+
       S.listStamp = Date.now();
       _paintList(container, S.listCache);
     } catch (e) {
@@ -294,6 +311,20 @@
       if (!S.matchInfo) {
         const d = await fetchMatchList();
         S.listCache = d.matches || [];
+      // Actualizar badge total de no leídos en la tab Matches
+      const totalUnread = (S.listCache || []).reduce((s, m) => s + (m.unread_count || 0), 0);
+      const badge = document.getElementById('matches-unread-badge');
+      if (badge) {
+        if (totalUnread > 0) {
+          badge.textContent = totalUnread > 99 ? '99+' : String(totalUnread);
+          badge.hidden = false;
+          badge.style.display = '';
+        } else {
+          badge.hidden = true;
+          badge.style.display = 'none';
+        }
+      }
+
         S.matchInfo = S.listCache.find(m => m.match_id === matchId) || null;
       }
       if (!S.matchInfo) {
@@ -303,6 +334,8 @@
       const data = await fetchMessages(matchId, 0);
       S.messages  = data.messages || [];
       S.lastId    = data.last_id  || 0;
+      if (data.free_msg_limit != null) FREE_MSG_LIMIT = data.free_msg_limit;
+      if (data.messages_sent != null) S.mySentCount = data.messages_sent;
       // La carga inicial pinta el campo disabled. Hay que reconstruir el chat
       // con el input habilitado; si no, el teclado no abre en ningún móvil.
       _paintFullChat();
@@ -420,7 +453,7 @@
 
     // banner de límite free
     const myCount = S.messages.filter(m => !m.is_system && m.sender_id === _myId()).length;
-    if (!isPremium() && myCount >= MSG_LIMIT_FREE - 2 && myCount < MSG_LIMIT_FREE) {
+    if (!isPremium() && myCount >= FREE_MSG_LIMIT - 2 && myCount < FREE_MSG_LIMIT) {
       nodes.push(_limitBanner(myCount));
     }
 
@@ -447,7 +480,7 @@
     s.replaceChildren(
       _buildHeader(S.matchInfo),
       msgsWrap,
-      (!isPremium() && myCount >= MSG_LIMIT_FREE) ? _limitWall() : _buildInput(false));
+      (!isPremium() && myCount >= FREE_MSG_LIMIT) ? _limitWall() : _buildInput(false));
 
     _paintMessages({ force: true });
   }
@@ -477,7 +510,7 @@
 
   function _limitBanner(count) {
     return el('div', { class: 'ch-limit-banner' },
-      el('span', { text: C('msg_limit_banner', { n: count, max: MSG_LIMIT_FREE }) }));
+      el('span', { text: C('msg_limit_banner', { n: count, max: FREE_MSG_LIMIT }) }));
   }
 
   function _limitWall() {
@@ -485,7 +518,7 @@
       el('div', { class: 'ch-limit-inner' },
         el('i', { class: 'fa-solid fa-lock ch-limit-icon' }),
         el('strong', { text: C('limit_title') }),
-        el('p', { text: C('limit_text', { n: MSG_LIMIT_FREE }) }),
+        el('p', { text: C('limit_text', { n: FREE_MSG_LIMIT }) }),
         el('button', { class: 'primary', type: 'button', text: C('go_premium'),
           onclick: () => { _stopPolling(); window.showPremium?.('limit'); } })));
   }
@@ -525,7 +558,7 @@
     // comprobar límite free
     if (!isPremium()) {
       const myCount = S.messages.filter(m => !m.is_system && m.sender_id === _myId()).length;
-      if (myCount >= MSG_LIMIT_FREE) {
+      if (myCount >= FREE_MSG_LIMIT) {
         _showLimitModal(); return;
       }
     }
@@ -585,7 +618,7 @@
       el('div', { class: 'ch-limit-modal' },
         el('i', { class: 'fa-solid fa-lock ch-limit-icon' }),
         el('strong', { text: C('limit_title') }),
-        el('p', { text: C('limit_text', { n: MSG_LIMIT_FREE }) })),
+        el('p', { text: C('limit_text', { n: FREE_MSG_LIMIT }) })),
       el('button', { class: 'primary', type: 'button', text: C('go_premium'),
         onclick: () => { m.close(); _stopPolling(); window.showPremium?.('limit'); } }),
       el('button', { class: 'secondary', type: 'button', text: C('cancel'),
@@ -607,14 +640,31 @@
     try {
       const data = await fetchMessages(S.matchId, S.lastId);
       const newMsgs = data.messages || [];
-      if (!newMsgs.length) return;
+      if (data.free_msg_limit != null) FREE_MSG_LIMIT = data.free_msg_limit;
+      if (!newMsgs.length) {
+        // Sin mensajes nuevos → ralentizar el polling
+        if (POLL_MS !== POLL_MS_IDLE) {
+          POLL_MS = POLL_MS_IDLE;
+          _restartPoll();
+        }
+        return;
+      }
+      // Hay mensajes nuevos → acelerar
+      if (POLL_MS !== POLL_MS_ACTIVE) {
+        POLL_MS = POLL_MS_ACTIVE;
+        _restartPoll();
+      }
       S.messages.push(...newMsgs);
       S.lastId = data.last_id || S.lastId;
       _paintMessages();
       markRead(S.matchId);
-      // actualizar lista en segundo plano (badge de no leídos)
       _refreshListBadge();
     } catch (_) { /* red inestable: se ignora */ }
+  }
+
+  function _restartPoll() {
+    if (S.pollTimer) { clearInterval(S.pollTimer); S.pollTimer = null; }
+    if (S.matchId) S.pollTimer = setInterval(_poll, POLL_MS);
   }
 
   function _scrollToBottom(force = false) {
@@ -657,9 +707,40 @@
   }
 
   function _openProfile(publicId) {
-    // La función de ver perfil de otra persona no existe aún en dating.js,
-    // pero la dejamos preparada para cuando se añada.
-    // Por ahora simplemente va de vuelta.
+    // Abre una vista de solo lectura del perfil del match.
+    // Intenta usar la función global si existe; si no, muestra un sheet básico.
+    if (typeof window.openDatingProfile === 'function') {
+      window.openDatingProfile(publicId);
+      return;
+    }
+    // Fallback: pedir datos al backend y mostrar un sheet simple
+    (async () => {
+      try {
+        const d = await jpost('/api/dating/profile-view', { public_id: publicId });
+        const prof = d.profile || {};
+        const photos = d.photos || [];
+        const age = prof.age != null ? `, ${prof.age}` : '';
+        const loc = [prof.province, prof.municipality].filter(Boolean).join(' · ');
+        const body = [
+          el('h3', { text: (prof.display_name || 'Perfil') + age }),
+          loc ? el('p', { class: 'd-muted', text: loc }) : null,
+          prof.bio ? el('p', { text: prof.bio }) : null,
+        ].filter(Boolean);
+        if (photos.length) {
+          const img = el('img', { style: 'width:100%;border-radius:12px;margin:8px 0;max-height:280px;object-fit:cover' });
+          img.src = photos[0];
+          body.splice(1, 0, img);
+        }
+        if (prof.interests && prof.interests.length) {
+          body.push(el('div', { class: 'chips' },
+            ...prof.interests.slice(0, 8).map(i => el('span', { class: 'chip', text: i }))
+          ));
+        }
+        const m = sheet(...body, el('button', { class: 'secondary', type: 'button', text: C('back'), onclick: () => m.close() }));
+      } catch (e) {
+        toast(e?.message || C('error'));
+      }
+    })();
   }
 
   function _reportSheet(publicId) {
@@ -687,6 +768,20 @@
     try {
       const d = await fetchMatchList();
       S.listCache = d.matches || [];
+      // Actualizar badge total de no leídos en la tab Matches
+      const totalUnread = (S.listCache || []).reduce((s, m) => s + (m.unread_count || 0), 0);
+      const badge = document.getElementById('matches-unread-badge');
+      if (badge) {
+        if (totalUnread > 0) {
+          badge.textContent = totalUnread > 99 ? '99+' : String(totalUnread);
+          badge.hidden = false;
+          badge.style.display = '';
+        } else {
+          badge.hidden = true;
+          badge.style.display = 'none';
+        }
+      }
+
       S.listStamp = Date.now();
     } catch (_) {}
   }
@@ -1101,6 +1196,22 @@
   font-style: italic;
   color: #9b8fc0;
 }
+
+.ch-tab-badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  margin-left: 6px;
+  border-radius: 9px;
+  background: var(--purple, #4d35ff);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  vertical-align: middle;
+}
+
 .ch-unread {
   flex-shrink: 0;
   min-width: 20px;

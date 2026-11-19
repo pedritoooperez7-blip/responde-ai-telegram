@@ -1,7 +1,10 @@
 /* LiggaCuba Citas — interfaz de la Mini App.
  *
- * No hay chat dentro de la app: al hacer match se muestran los botones para
- * hablar por Telegram o WhatsApp (los canales que cada persona decidió compartir).
+ * Incluye:
+ *  - Descubrir perfiles, likes y matches
+ *  - Chat interno ligero (texto) entre matches (ver chat.js)
+ *  - Contactos externos (Telegram / WhatsApp) que cada persona decide compartir
+ *
  * Reutiliza de app.js: state, $, $$, toast, tg, showPremium, home().
  * Todo el contenido de otros usuarios se inserta con textContent (nunca innerHTML).
  */
@@ -24,8 +27,11 @@
       sec_basic: 'Lo básico', sec_identity: 'Identidad y preferencias', sec_location: 'Dónde vives', sec_about: 'Sobre ti', sec_age: 'Edad de las personas que buscas', sec_contact: 'Contacto', sec_legal: 'Confirmaciones',
       chars_left: '{n} caracteres restantes', interests_ph: 'música, viajes, cine…', bio_ph: 'Cuenta algo sobre ti…', name_ph: 'Tu nombre', municipality_ph: 'Ej. Plaza de la Revolución', age_to: 'a', age_summary: 'De {a} a {b} años',
       title: 'Citas', tab_discover: 'Descubrir', tab_matches: 'Matches', tab_mine: 'Mi perfil',
-      intro_title: 'Conoce gente nueva', intro_text: 'Dale like a quien te guste. Si hay match, hablan por Telegram o WhatsApp: en LiggaCuba no hay chat interno.',
-      intro_1: 'Solo mayores de 18 años', intro_2: 'Tu contacto lo ven únicamente tus matches', intro_3: 'Todas las fotos se revisan antes de publicarse',
+      intro_title: 'Conoce gente nueva',
+      intro_text: 'Dale like a quien te guste. Si hay match, pueden chatear aquí dentro o por Telegram/WhatsApp (los canales que cada uno quiera compartir).',
+      intro_1: 'Solo mayores de 18 años',
+      intro_2: 'Chat interno + contactos solo visibles para tus matches',
+      intro_3: 'Todas las fotos se revisan antes de publicarse',
       create_profile: 'Crear mi perfil', edit_profile: 'Editar perfil', save: 'Guardar', saving: 'Guardando…', cancel: 'Cancelar', back: 'Atrás',
       name: 'Nombre', birth: 'Fecha de nacimiento', gender: 'Soy', looking: 'Quiero conocer', province: 'Provincia', province_ph: 'Selecciona tu provincia', municipality: 'Municipio (opcional)',
       bio: 'Sobre mí', bio_help: 'Sin enlaces ni usuarios. Máximo 300 caracteres.', interests: 'Intereses (separados por comas)', age_range: 'Rango de edad que buscas',
@@ -55,8 +61,11 @@
       sec_basic: 'The basics', sec_identity: 'Identity and preferences', sec_location: 'Where you live', sec_about: 'About you', sec_age: 'Age of the people you look for', sec_contact: 'Contact', sec_legal: 'Confirmations',
       chars_left: '{n} characters left', interests_ph: 'music, travel, movies…', bio_ph: 'Tell something about yourself…', name_ph: 'Your name', municipality_ph: 'e.g. Downtown', age_to: 'to', age_summary: 'From {a} to {b} years old',
       title: 'Dating', tab_discover: 'Discover', tab_matches: 'Matches', tab_mine: 'My profile',
-      intro_title: 'Meet new people', intro_text: 'Like the people you want to meet. On a match you talk on Telegram or WhatsApp: LiggaCuba has no in-app chat.',
-      intro_1: 'Adults 18+ only', intro_2: 'Only your matches can see your contact', intro_3: 'Every photo is reviewed before it goes live',
+      intro_title: 'Meet new people',
+      intro_text: 'Like the people you want to meet. When you match you can chat here or on Telegram/WhatsApp (whichever channels each person shares).',
+      intro_1: 'Adults 18+ only',
+      intro_2: 'In-app chat + contacts visible only to your matches',
+      intro_3: 'Every photo is reviewed before it goes live',
       create_profile: 'Create my profile', edit_profile: 'Edit profile', save: 'Save', saving: 'Saving…', cancel: 'Cancel', back: 'Back',
       name: 'Name', birth: 'Date of birth', gender: 'I am', looking: 'I want to meet', province: 'Province', province_ph: 'Select your province', municipality: 'Municipality (optional)',
       bio: 'About me', bio_help: 'No links or usernames. 300 characters max.', interests: 'Interests (comma separated)', age_range: 'Age range you are looking for',
@@ -200,8 +209,26 @@
     const head = $('#datingTabs');
     const hasProfile = !!D.me?.profile;
     head.classList.toggle('hidden', !hasProfile);
-    head.replaceChildren(...['discover', 'matches', 'mine'].map(t =>
-      el('button', { class: 'segment' + (D.tab === t ? ' active' : ''), type: 'button', text: T('tab_' + t), onclick: () => { D.tab = t; render(); } })));
+    const prevBadge = document.getElementById('matches-unread-badge');
+    const prevUnread = prevBadge && !prevBadge.hidden ? prevBadge.textContent : '';
+    head.replaceChildren(...['discover', 'matches', 'mine'].map(t => {
+      const btn = el('button', {
+        class: 'segment' + (D.tab === t ? ' active' : ''),
+        type: 'button',
+        onclick: () => { D.tab = t; render(); },
+      }, T('tab_' + t));
+      if (t === 'matches') {
+        const badge = el('span', {
+          id: 'matches-unread-badge',
+          class: 'ch-tab-badge',
+          hidden: !prevUnread,
+          text: prevUnread || '0',
+        });
+        if (!prevUnread) badge.style.display = 'none';
+        btn.append(badge);
+      }
+      return btn;
+    }));
     if (!hasProfile && D.tab !== 'form') return renderIntro();
     if (D.tab === 'form') return renderForm();
     const status = D.me.profile.status;
