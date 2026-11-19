@@ -150,6 +150,19 @@ CREATE TABLE IF NOT EXISTS dating_chat_presence (
   seen_at    TEXT NOT NULL,
   PRIMARY KEY (user_id, match_id)
 );
+CREATE TABLE IF NOT EXISTS dating_mutes (
+  user_id    TEXT NOT NULL,
+  match_id   INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, match_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dating_mutes_user ON dating_mutes(user_id);
+CREATE TABLE IF NOT EXISTS dating_typing (
+  user_id    TEXT NOT NULL,
+  match_id   INTEGER NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, match_id)
+);
 """
 
 
@@ -1019,6 +1032,10 @@ def delete_dating_data(c: sqlite3.Connection, uid: str, photos_dir: str) -> None
         marks = ",".join("?" * len(match_ids))
         c.execute(f"DELETE FROM dating_messages WHERE match_id IN ({marks})", match_ids)
         c.execute(f"DELETE FROM dating_chat_presence WHERE match_id IN ({marks})", match_ids)
+        c.execute(f"DELETE FROM dating_mutes WHERE match_id IN ({marks})", match_ids)
+        c.execute(f"DELETE FROM dating_typing WHERE match_id IN ({marks})", match_ids)
+    c.execute("DELETE FROM dating_mutes WHERE user_id=?", (uid,))
+    c.execute("DELETE FROM dating_typing WHERE user_id=?", (uid,))
     c.execute("DELETE FROM dating_swipes WHERE user_id=? OR target_id=?", (uid, uid))
     c.execute("DELETE FROM dating_matches WHERE user_a=? OR user_b=?", (uid, uid))
     c.execute("DELETE FROM dating_blocks WHERE blocker_id=? OR blocked_id=?", (uid, uid))
@@ -1304,6 +1321,8 @@ def admin_delete_bot(c: sqlite3.Connection, user_id: str, photos_dir: Optional[s
                 f"DELETE FROM dating_messages WHERE match_id IN ({marks})", match_ids
             ).rowcount
             c.execute(f"DELETE FROM dating_chat_presence WHERE match_id IN ({marks})", match_ids)
+            c.execute(f"DELETE FROM dating_mutes WHERE match_id IN ({marks})", match_ids)
+            c.execute(f"DELETE FROM dating_typing WHERE match_id IN ({marks})", match_ids)
         else:
             msgs_deleted = 0
 
@@ -1500,6 +1519,8 @@ def get_messages(
         "last_id": last_id,
         "free_msg_limit": FREE_MSG_LIMIT,
         "messages_sent": sent,
+        "muted": is_muted(c, uid, match_id),
+        "other_typing": is_other_typing(c, uid, match_id),
     }
 
 
@@ -1612,13 +1633,77 @@ def is_chat_open(c: sqlite3.Connection, uid: str, match_id: int, window_seconds:
         return False
 
 
+def is_muted(c: sqlite3.Connection, uid: str, match_id: int) -> bool:
+    """True si el usuario silenció este match."""
+    row = c.execute(
+        "SELECT 1 FROM dating_mutes WHERE user_id=? AND match_id=?",
+        (str(uid), int(match_id))
+    ).fetchone()
+    return bool(row)
+
+
+def set_mute(c: sqlite3.Connection, uid: str, match_id: int, muted: bool, now: Optional[str] = None) -> Dict[str, Any]:
+    """Silencia o desilencia un match. Solo el propio usuario."""
+    _require_active_match(c, uid, match_id)
+    now = now or _now()
+    if muted:
+        c.execute(
+            "INSERT OR IGNORE INTO dating_mutes(user_id, match_id, created_at) VALUES(?,?,?)",
+            (str(uid), int(match_id), now)
+        )
+    else:
+        c.execute(
+            "DELETE FROM dating_mutes WHERE user_id=? AND match_id=?",
+            (str(uid), int(match_id))
+        )
+    c.commit()
+    return {"match_id": int(match_id), "muted": muted}
+
+
+def touch_typing(c: sqlite3.Connection, uid: str, match_id: int, now: Optional[str] = None) -> None:
+    """Registra que el usuario está escribiendo en este match."""
+    _require_active_match(c, uid, match_id)
+    now = now or _now()
+    c.execute(
+        "INSERT INTO dating_typing(user_id, match_id, updated_at) VALUES(?,?,?) "
+        "ON CONFLICT(user_id, match_id) DO UPDATE SET updated_at=excluded.updated_at",
+        (str(uid), int(match_id), now)
+    )
+    c.commit()
+
+
+def is_other_typing(c: sqlite3.Connection, uid: str, match_id: int, window_seconds: int = 6) -> bool:
+    """True si el otro usuario del match escribió (typing) en los últimos window_seconds."""
+    row = c.execute(
+        "SELECT user_a, user_b FROM dating_matches WHERE id=? AND status='active'",
+        (int(match_id),)
+    ).fetchone()
+    if not row:
+        return False
+    other = row["user_b"] if str(row["user_a"]) == str(uid) else row["user_a"]
+    trow = c.execute(
+        "SELECT updated_at FROM dating_typing WHERE user_id=? AND match_id=?",
+        (str(other), int(match_id))
+    ).fetchone()
+    if not trow or not trow["updated_at"]:
+        return False
+    try:
+        updated = datetime.fromisoformat(trow["updated_at"])
+        if updated.tzinfo is not None:
+            updated = updated.replace(tzinfo=None)
+        return (_utcnow() - updated).total_seconds() <= window_seconds
+    except Exception:
+        return False
+
+
 def _enrich_matches_with_chat(c: sqlite3.Connection, uid: str, matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Añade last_message y unread_count a cada match de la lista."""
+    """Añade last_message, unread_count y muted a cada match de la lista."""
     for m in matches:
         mid = m.get("match_id")
         if mid is None:
             m["last_message"] = None
             m["unread_count"] = 0
+            m["muted"] = False
             continue
         last = c.execute(
             "SELECT * FROM dating_messages WHERE match_id=? ORDER BY id DESC LIMIT 1",
@@ -1634,10 +1719,16 @@ def _enrich_matches_with_chat(c: sqlite3.Connection, uid: str, matches: List[Dic
             }
         else:
             m["last_message"] = None
-        m["unread_count"] = c.execute(
-            "SELECT COUNT(*) FROM dating_messages WHERE match_id=? AND sender_id!=? AND read_at IS NULL AND is_system=0",
-            (mid, str(uid))
-        ).fetchone()[0]
+        muted = is_muted(c, uid, mid)
+        m["muted"] = muted
+        # Si está silenciado, no contar unread para el badge total
+        if muted:
+            m["unread_count"] = 0
+        else:
+            m["unread_count"] = c.execute(
+                "SELECT COUNT(*) FROM dating_messages WHERE match_id=? AND sender_id!=? AND read_at IS NULL AND is_system=0",
+                (mid, str(uid))
+            ).fetchone()[0]
     return matches
 
 
@@ -2424,6 +2515,9 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
     class MessageIn(BaseModel):
         body: str = ""
 
+    class MuteIn(BaseModel):
+        muted: bool = True
+
     @router.get("/api/dating/matches/{match_id}/messages")
     def dating_messages_get(match_id: int, request: Request, after_id: int = 0, limit: int = 40):
         uid = current_user(request)
@@ -2445,9 +2539,9 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
 
             other_id = match_row["user_b"] if match_row["user_a"] == uid else match_row["user_a"]
 
-            # Notificar al usuario real (si no tiene el chat abierto)
+            # Notificar al usuario real (si no tiene el chat abierto y no silenció este match)
             if not str(other_id).startswith("bot_"):
-                if not is_chat_open(c, other_id, match_id, window_seconds=15):
+                if not is_muted(c, other_id, match_id) and not is_chat_open(c, other_id, match_id, window_seconds=15):
                     sender_row = c.execute(
                         "SELECT display_name FROM dating_profiles WHERE user_id=?", (uid,)
                     ).fetchone()
@@ -2480,6 +2574,22 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
 
             return {"message": msg}
 
+        return run(work)
+
+    
+    @router.post("/api/dating/matches/{match_id}/mute")
+    def dating_mute(match_id: int, p: MuteIn, request: Request):
+        """Silenciar o desilenciar un match. Body: { muted: true|false }"""
+        uid = current_user(request)
+        return run(lambda c: set_mute(c, uid, match_id, p.muted))
+
+    @router.post("/api/dating/matches/{match_id}/typing")
+    def dating_typing(match_id: int, request: Request):
+        """Registra que el usuario está escribiendo (llamado mientras teclea)."""
+        uid = current_user(request)
+        def work(c):
+            touch_typing(c, uid, match_id)
+            return {"ok": True}
         return run(work)
 
     @router.post("/api/dating/matches/{match_id}/read")

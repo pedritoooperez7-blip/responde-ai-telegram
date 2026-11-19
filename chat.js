@@ -31,7 +31,7 @@
       limit_text: 'Con el plan gratuito puedes enviar {n} mensajes por match. Mejora a Premium para escribir sin límite.',
       go_premium: 'Ver Premium', cancel: 'Cancelar',
       view_profile: 'Ver perfil', open_tg: 'Telegram', open_wa: 'WhatsApp',
-      mute: 'Silenciar', report: 'Reportar', block: 'Bloquear', unmatch: 'Deshacer match',
+      mute: 'Silenciar', unmute: 'Activar notificaciones', muted_label: 'Silenciado', report: 'Reportar', block: 'Bloquear', unmatch: 'Deshacer match', typing: 'escribiendo…',
       unmatch_confirm: '¿Deshacer este match? Dejarás de chatear con esta persona.',
       block_confirm: '¿Bloquear a esta persona? No volverán a verse.',
       unmatched: 'Match eliminado', blocked: 'Usuario bloqueado',
@@ -51,7 +51,7 @@
       limit_text: 'Free users can send {n} messages per match. Upgrade to Premium for unlimited messaging.',
       go_premium: 'See Premium', cancel: 'Cancel',
       view_profile: 'View profile', open_tg: 'Telegram', open_wa: 'WhatsApp',
-      mute: 'Mute', report: 'Report', block: 'Block', unmatch: 'Remove match',
+      mute: 'Mute', unmute: 'Unmute', muted_label: 'Muted', report: 'Report', block: 'Block', unmatch: 'Remove match', typing: 'typing…',
       unmatch_confirm: 'Remove this match? You will stop chatting with this person.',
       block_confirm: 'Block this person? You will not see each other again.',
       unmatched: 'Match removed', blocked: 'User blocked',
@@ -75,6 +75,9 @@
     matchId:    null,   // match abierto
     messages:   [],     // array de mensajes cargados
     lastId:     0,      // id del último mensaje recibido (para polling incremental)
+    muted:      false,  // este match está silenciado por mí
+    otherTyping: false, // el otro está escribiendo
+    typingTimer: null,  // debounce para enviar typing
     pollTimer:  null,
     sending:    false,
     atBottom:   true,   // si el scroll está abajo → auto-scroll
@@ -266,12 +269,14 @@
     const photo = safePhoto((m.photos || [])[0]);
     const lm = m.last_message;
     const unread = m.unread_count || 0;
-    const preview = lm
-      ? (lm.is_system ? C('match_event') : _truncate(lm.body, 36))
-      : C('match_event');
+    const preview = m.muted
+      ? ('🔇 ' + C('muted_label'))
+      : (lm
+        ? (lm.is_system ? C('match_event') : _truncate(lm.body, 36))
+        : C('match_event'));
     const time = lm ? relTime(lm.created_at) : relTime(m.matched_at);
 
-    const row = el('div', { class: 'ch-row', onclick: () => open(m.match_id) },
+    const row = el('div', { class: 'ch-row' + (m.muted ? ' muted-row' : ''), onclick: () => open(m.match_id) },
       el('div', { class: 'ch-avatar' + (photo ? '' : ' ch-avatar-empty') },
         photo ? el('img', { src: photo, alt: '' }) : el('span', { text: (m.display_name || '?')[0].toUpperCase() })),
       el('div', { class: 'ch-row-body' },
@@ -336,6 +341,8 @@
       S.lastId    = data.last_id  || 0;
       if (data.free_msg_limit != null) FREE_MSG_LIMIT = data.free_msg_limit;
       if (data.messages_sent != null) S.mySentCount = data.messages_sent;
+      if (data.muted != null) S.muted = !!data.muted;
+      if (data.other_typing != null) S.otherTyping = !!data.other_typing;
       // La carga inicial pinta el campo disabled. Hay que reconstruir el chat
       // con el input habilitado; si no, el teclado no abre en ningún móvil.
       _paintFullChat();
@@ -418,7 +425,9 @@
       avatar,
       el('div', { class: 'ch-hdr-info' },
         el('strong', { text: name }),
-        el('span', { class: 'ch-hdr-sub', text: 'Citas' })),
+        el('span', { id: 'ch-typing-indicator', class: 'ch-hdr-sub ch-typing',
+          text: C('typing'), hidden: !S.otherTyping,
+          style: S.otherTyping ? '' : 'display:none' })),
       menuBtn);
   }
 
@@ -533,10 +542,11 @@
       autocorrect: 'on', autocapitalize: 'sentences',
     });
 
-    // auto-resize
+    // auto-resize + typing indicator
     textarea.oninput = () => {
       textarea.style.height = 'auto';
       textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
+      if (textarea.value.trim()) _onTypingInput();
     };
 
     textarea.onkeydown = (e) => {
@@ -641,6 +651,10 @@
       const data = await fetchMessages(S.matchId, S.lastId);
       const newMsgs = data.messages || [];
       if (data.free_msg_limit != null) FREE_MSG_LIMIT = data.free_msg_limit;
+      if (data.muted != null) S.muted = !!data.muted;
+      const wasTyping = S.otherTyping;
+      if (data.other_typing != null) S.otherTyping = !!data.other_typing;
+      if (S.otherTyping !== wasTyping) _updateTypingUI();
       if (!newMsgs.length) {
         // Sin mensajes nuevos → ralentizar el polling
         if (POLL_MS !== POLL_MS_IDLE) {
@@ -679,11 +693,14 @@
     const m = sheet(
       el('h3', { text: info.display_name }),
       el('button', { class: 'secondary', type: 'button', text: C('view_profile'),
-        onclick: () => { m.close(); toast('Perfil disponible desde Matches'); } }),
+        onclick: () => { m.close(); _openProfile(info.public_id); } }),
       ...contacts.map(c =>
         el('button', { class: 'secondary contact-btn ' + (c.type === 'whatsapp' ? 'wa' : 'tg'), type: 'button',
           text: C(c.type === 'whatsapp' ? 'open_wa' : 'open_tg'),
           onclick: () => { m.close(); openExternal(c.url); } })),
+      el('button', { class: 'secondary', type: 'button', 'data-action': 'mute',
+        text: S.muted ? C('unmute') : C('mute'),
+        onclick: async () => { m.close(); await _toggleMute(); } }),
       el('button', { class: 'secondary', type: 'button', text: C('report'),
         onclick: () => { m.close(); _reportSheet(info.public_id); } }),
       el('button', { class: 'secondary', type: 'button', text: C('unmatch'),
@@ -704,6 +721,39 @@
         } }),
       el('button', { class: 'cancel-btn', type: 'button', text: C('cancel'),
         onclick: () => m.close() }));
+  }
+
+
+  async function _toggleMute() {
+    if (!S.matchId) return;
+    const next = !S.muted;
+    try {
+      await jpost(`/api/dating/matches/${S.matchId}/mute`, { muted: next });
+      S.muted = next;
+      toast(next ? C('muted_label') : C('unmute'));
+      _refreshListBadge();
+      // Update menu label if open
+      const btn = document.querySelector('[data-action="mute"]');
+      if (btn) btn.textContent = next ? C('unmute') : C('mute');
+    } catch (e) {
+      toast(e?.message || C('error'));
+    }
+  }
+
+  let _typingLastSent = 0;
+  function _onTypingInput() {
+    if (!S.matchId) return;
+    const now = Date.now();
+    if (now - _typingLastSent < 2500) return; // debounce 2.5s
+    _typingLastSent = now;
+    jpost(`/api/dating/matches/${S.matchId}/typing`, {}).catch(() => {});
+  }
+
+  function _updateTypingUI() {
+    const elTyping = document.getElementById('ch-typing-indicator');
+    if (!elTyping) return;
+    elTyping.hidden = !S.otherTyping;
+    elTyping.style.display = S.otherTyping ? '' : 'none';
   }
 
   function _openProfile(publicId) {
@@ -1195,6 +1245,16 @@
 .ch-preview-system {
   font-style: italic;
   color: #9b8fc0;
+}
+
+
+.ch-typing {
+  color: var(--purple, #4d35ff) !important;
+  font-style: italic;
+  font-size: 11px;
+}
+.ch-row.muted-row .ch-preview {
+  opacity: 0.55;
 }
 
 .ch-tab-badge {
