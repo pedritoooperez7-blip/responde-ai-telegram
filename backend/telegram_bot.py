@@ -488,6 +488,9 @@ class TelegramBot:
         self.internal_base_url = configured_base.rstrip("/")
         self.control_admin_ids: Set[str] = _parse_admin_ids(os.getenv("BOTS_CONTROL_ADMIN_IDS", ""))
         self.admin_api_header = os.getenv("ADMIN_API_HEADER", "X-Admin-Key")
+        # Handler directo (inyectado desde main.py) para evitar auto-llamada HTTP
+        # en un proceso de un solo worker (deadlock → reintentos infinitos de Telegram).
+        self._direct_reply_handler = None  # type: ignore[var-annotated]
         if not self.token:
             logger.warning("TelegramBot (bots): no hay TELEGRAM_BOT_TOKEN/BOT_TOKEN — eventos de bots silenciados.")
 
@@ -609,8 +612,30 @@ class TelegramBot:
         actor_name = str(actor_name).replace("\r", " ").replace("\n", " ").strip()[:64]
         return self._post_bot_reply(match_id, reply_text_body, actor=f"tg:{actor_name}")
 
+    def set_direct_reply_handler(self, handler) -> None:
+        """Inyecta el handler de negocio para evitar HTTP al mismo proceso (deadlock)."""
+        self._direct_reply_handler = handler
+
     def _post_bot_reply(self, match_id: int, body: str, actor: str = "telegram_admin") -> bool:
-        """POST interno a /api/admin/dating/bots/reply."""
+        """Entrega la respuesta del admin como mensaje del bot.
+
+        Preferimos el handler directo (inyectado desde main.py) para no hacer
+        una petición HTTP al mismo proceso uvicorn de un solo worker, que produce
+        deadlock, timeout, liberación del claim y reintentos masivos de Telegram.
+        Si no hay handler, se mantiene el fallback HTTP (útil en tests).
+        """
+        if self._direct_reply_handler is not None:
+            try:
+                self._direct_reply_handler(match_id, body, actor)
+                logger.info("_post_bot_reply (direct) OK: match_id=%d actor=%s", match_id, actor)
+                return True
+            except Exception as exc:
+                logger.error(
+                    "_post_bot_reply (direct) error: match_id=%d %s", match_id, exc, exc_info=True
+                )
+                return False
+
+        # Fallback HTTP (solo si no se inyectó handler; no usar en producción con 1 worker)
         url = f"{self.internal_base_url}/api/admin/dating/bots/reply"
         payload = json.dumps(
             {"match_id": match_id, "body": body, "actor": actor},

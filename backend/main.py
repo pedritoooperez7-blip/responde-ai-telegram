@@ -3630,6 +3630,55 @@ def _dating_notify(user_id: str, text: str) -> None:
         logger.warning("Dating notification not delivered: error_type=%s", type(exc).__name__)
 
 
+def _direct_bot_reply(match_id: int, body: str, actor: str) -> None:
+    """Lógica de /api/admin/dating/bots/reply sin HTTP (evita deadlock en 1 worker).
+
+    Se inyecta en TelegramBot para que los replies del grupo de control no
+    hagan urllib a 127.0.0.1 del mismo proceso uvicorn.
+    """
+    admin_bot_reply = _dating.admin_bot_reply
+    is_chat_open = _dating.is_chat_open
+    c = db()
+    try:
+        result = admin_bot_reply(c, match_id, body, actor)
+    finally:
+        c.close()
+
+    # Notificar al usuario y al grupo de control (mismo comportamiento que el endpoint)
+    def _notify_user_and_group(res=result, actor=actor):
+        try:
+            c2 = db()
+            try:
+                real_id = res["real_id"]
+                bot_name = res["bot_name"]
+                mid = res["match_id"]
+                if not is_chat_open(c2, real_id, mid, window_seconds=30):
+                    _dating_notify(
+                        real_id,
+                        f"💬 <b>{bot_name} te envió un mensaje en LiggaCuba Citas.</b>\n"
+                        f"Abre la Mini App para leer y responder (startapp=chat_{mid}).",
+                    )
+                _dating_bot.send_bot_control_event("bot_admin_reply", {
+                    "match_id": mid,
+                    "bot_id": res["sender_id"],
+                    "bot_name": bot_name,
+                    "real_id": real_id,
+                    "body": res["body"],
+                    "actor": actor,
+                })
+            finally:
+                c2.close()
+        except Exception as exc:
+            logger.debug("_direct_bot_reply notify error: %s", exc)
+
+    import threading
+    threading.Thread(target=_notify_user_and_group, daemon=True).start()
+
+
+# Evita el deadlock: replies del grupo de control llaman la lógica de negocio
+# directamente en lugar de HTTP al mismo proceso (uvicorn sin --workers).
+_dating_bot.set_direct_reply_handler(_direct_bot_reply)
+
 app.include_router(_dating.build_router(
     current_user=current_user, connect=db, is_premium=lambda uid: premium(uid), admin=admin, audit=audit,
     notify=_dating_notify, secret=_dating_secret, photos_dir=_dating_photos_dir,
