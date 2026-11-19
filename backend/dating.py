@@ -429,8 +429,9 @@ def get_match_profile_view(c: sqlite3.Connection, viewer_uid: str, target_public
     photos = _approved_photo_urls(c, tid, secret)
     interests = []
     try:
-        raw = target["interests"] or ""
-        interests = [x.strip() for x in str(raw).split(",") if x.strip()][:8]
+        parsed = json.loads(target["interests"] or "[]")
+        if isinstance(parsed, list):
+            interests = [str(x).strip() for x in parsed if str(x).strip()][:8]
     except Exception:
         pass
     return {
@@ -1934,6 +1935,9 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
     class MatchIn(BaseModel):
         match_id: int
 
+    class ProfileViewIn(BaseModel):
+        public_id: str
+
     class VisibleIn(BaseModel):
         visible: bool
 
@@ -2232,17 +2236,15 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
 
     
     @router.post("/api/dating/profile-view")
-    def dating_profile_view(p: dict, request: Request):
+    def dating_profile_view(p: ProfileViewIn, request: Request):
         """Vista de solo lectura del perfil de un match (para el botón Ver perfil del chat)."""
         uid = current_user(request)
-        public_id = str((p or {}).get("public_id") or "").strip()
+        public_id = str(p.public_id or "").strip()
         if not public_id:
-            raise DatingError("public_id requerido.")
-        def work(c):
-            return get_match_profile_view(c, uid, public_id, secret())
-        return with_db(connect, work)
+            raise HTTPException(400, "public_id requerido.")
+        return run(lambda c: get_match_profile_view(c, uid, public_id, secret()))
 
-@router.post("/api/dating/matches")
+    @router.post("/api/dating/matches")
     def dating_matches(request: Request):
         uid = current_user(request)
 
