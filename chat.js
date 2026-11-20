@@ -80,8 +80,8 @@
     firstId:    0,
     loadingOlder: false,
     typingTimer: null,  // debounce para enviar typing
-    pollTimer:  null,   // legacy name; ahora guarda el EventSource o el timeout de reconexión
-    es:         null,   // EventSource activo del long-poll/SSE
+    pollTimer:  null,   // timeout de reconexión del stream
+    es:         null,   // AbortController del fetch SSE activo
     streamMatchId: null, // match_id para el que se abrió el stream (evitar race al cambiar de chat)
     sending:    false,
     atBottom:   true,   // si el scroll está abajo → auto-scroll
@@ -690,7 +690,16 @@
 
   // ── long-poll / SSE (Feature #10) ─────────────────────────────────────────
   // Backend: GET /api/dating/matches/{id}/stream  (espera hasta 25s, pings cada ~2.5s)
-  // Compatible con Railway sin sticky sessions. Reconectamos al recibir "done" o error.
+  // fetch (no EventSource): el parche de app.js solo añade Authorization a fetch.
+  // Reconectamos al recibir "done", mensajes o un error de red.
+
+  function _closeStream() {
+    const es = S.es;
+    S.es = null;
+    if (!es) return;
+    try { if (typeof es.abort === 'function') es.abort(); } catch (_) {}
+    try { if (typeof es.close === 'function') es.close(); } catch (_) {}
+  }
 
   function _startPolling() {
     _stopPolling();
@@ -701,67 +710,64 @@
 
   function _stopPolling() {
     S.streamMatchId = null;
-    if (S.es) {
-      try { S.es.close(); } catch (_) {}
-      S.es = null;
-    }
+    _closeStream();
     if (S.pollTimer) {
       clearTimeout(S.pollTimer);
       S.pollTimer = null;
     }
   }
 
-  function _connectStream() {
+  function _dispatchSse(raw, matchId) {
+    if (S.streamMatchId !== matchId) return;
+    let event = 'message';
+    const dataLines = [];
+    for (const line of String(raw || '').split('\n')) {
+      if (!line || line.startsWith(':')) continue;
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+    }
+    const data = dataLines.join('\n');
+    if (event === 'messages') {
+      try { _applyStreamData(JSON.parse(data || '{}')); } catch (_) {}
+      _scheduleReconnect();
+    } else if (event === 'done' || event === 'error') {
+      _scheduleReconnect();
+    }
+  }
+
+  async function _connectStream() {
     if (!S.matchId || S.streamMatchId !== S.matchId) return;
-    if (S.es) {
-      try { S.es.close(); } catch (_) {}
-      S.es = null;
-    }
-    const url = `/api/dating/matches/${S.matchId}/stream?after_id=${S.lastId || 0}`;
-    let es;
+    _closeStream();
+    const matchId = S.matchId;
+    const url = `/api/dating/matches/${matchId}/stream?after_id=${S.lastId || 0}`;
+    const ctrl = new AbortController();
+    S.es = ctrl;
     try {
-      es = new EventSource(url);
-    } catch (_) {
-      // EventSource no disponible o URL inválida → reintento corto
-      S.pollTimer = setTimeout(_connectStream, SSE_RECONNECT_MS);
-      return;
+      const r = await fetch(url, { signal: ctrl.signal, headers: { Accept: 'text/event-stream' } });
+      if (S.streamMatchId !== matchId) return;
+      if (!r.ok || !r.body) throw new Error('stream');
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (S.streamMatchId === matchId) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          _dispatchSse(block, matchId);
+        }
+      }
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;
     }
-    S.es = es;
-
-    es.addEventListener('messages', (ev) => {
-      if (S.streamMatchId !== S.matchId) return;
-      try {
-        const data = JSON.parse(ev.data || '{}');
-        _applyStreamData(data);
-      } catch (_) { /* payload inválido */ }
-      // El backend cierra el stream tras entregar mensajes; reconectar
-      _scheduleReconnect();
-    });
-
-    es.addEventListener('ping', () => {
-      // keep-alive; no-op
-    });
-
-    es.addEventListener('done', () => {
-      _scheduleReconnect();
-    });
-
-    es.addEventListener('error', (ev) => {
-      // error de red o el servidor cerró (tras done). Reconectar si seguimos en el chat.
-      if (S.streamMatchId === S.matchId) _scheduleReconnect();
-    });
-
-    // Algunos navegadores también disparan onerror al cerrar
-    es.onerror = () => {
-      if (S.streamMatchId === S.matchId) _scheduleReconnect();
-    };
+    if (S.streamMatchId === matchId) _scheduleReconnect();
   }
 
   function _scheduleReconnect() {
-    if (S.es) {
-      try { S.es.close(); } catch (_) {}
-      S.es = null;
-    }
+    _closeStream();
     if (S.pollTimer) {
       clearTimeout(S.pollTimer);
       S.pollTimer = null;

@@ -2301,14 +2301,14 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
         return out
 
     
+    class ReorderIn(BaseModel):
+        photo_ids: List[int] = []
+
     @router.post("/api/dating/photos/reorder")
-    def dating_photos_reorder(p: dict, request: Request):
+    def dating_photos_reorder(p: ReorderIn, request: Request):
         """Reordena fotos. Body: { photo_ids: [id1, id2, ...] }"""
         uid = current_user(request)
-        ids = (p or {}).get("photo_ids") or []
-        def work(c):
-            return reorder_photos(c, uid, ids)
-        return with_db(connect, work)
+        return run(lambda c: reorder_photos(c, uid, list(p.photo_ids)))
 
     @router.delete("/api/dating/photos/{photo_id}")
     def dating_delete_photo(photo_id: int, request: Request):
@@ -2676,7 +2676,7 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
                 def work(c):
                     return get_messages(c, uid, match_id, after_id=last, limit=30)
                 try:
-                    data = with_db(connect, work)
+                    data = run(work)
                 except Exception as exc:
                     yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
                     break

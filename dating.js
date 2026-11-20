@@ -681,6 +681,24 @@
     renderWizard();
   }
 
+  async function _reorderPhoto(index, delta) {
+    const photos = D.me?.photos || [];
+    const next = index + delta;
+    if (next < 0 || next >= photos.length || D.busy) return;
+    const order = photos.slice();
+    const [moved] = order.splice(index, 1);
+    order.splice(next, 0, moved);
+    // El backend exige exactamente las fotos no rechazadas, en el orden nuevo.
+    const photo_ids = order.filter(ph => ph.status !== 'rejected').map(ph => Number(ph.id));
+    D.busy = true;
+    try {
+      await jpost('/api/dating/photos/reorder', { photo_ids });
+      D.me = await jpost('/api/dating/me');
+      renderMine();
+    } catch (e) { fail(e); }
+    finally { D.busy = false; }
+  }
+
   // ---- mi perfil y fotos -----------------------------------------------
   function renderMine() {
     const p = D.me.profile;
