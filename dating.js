@@ -46,6 +46,7 @@
       under_review: 'Tu perfil está en revisión y no aparece para otras personas por ahora.', suspended: 'Tu perfil de Citas está suspendido. Contacta a soporte.',
       pass: 'Pasar', like: 'Me gusta', superlike: 'Super Like', undo: 'Deshacer', likes_left: 'Te quedan {n} likes hoy', likes_unlimited: 'Premium · likes ilimitados',
       share_earn_cta: '🎁 Comparte en tu estado de WhatsApp y gana +10 likes gratis hoy', share_earn_btn: 'Compartir y ganar +10 likes', share_earn_done: '✅ ¡Ganaste +10 likes extra hoy!', share_earn_confirm: 'Confirmando…',
+      share_earn_shared: 'Ya lo compartí', share_earn_share_hint: 'Comparte el enlace y luego confirma para recibir tus +10 likes.', share_earn_copy: 'Copiar enlace',
       empty_title: 'No hay más perfiles por ahora', empty_text: 'Vuelve más tarde, amplía tu rango de edad o invita a amigos a LiggaCuba.', empty_cta_invite: 'Invitar amigos', empty_cta_profile: 'Completar mi perfil', refresh: 'Actualizar',
       same_province: 'Tu provincia', report: 'Reportar', block: 'Bloquear', unmatch: 'Deshacer match', matches_empty: 'Aún no tienes matches. ¡Sigue descubriendo!',
       match_title: '¡Es un match!', match_text: 'Ahora puedes escribirle a {n} por:', keep: 'Seguir viendo', write_to: 'Escribir por',
@@ -80,6 +81,7 @@
       under_review: 'Your profile is under review and hidden for now.', suspended: 'Your Dating profile is suspended. Contact support.',
       pass: 'Pass', like: 'Like', superlike: 'Super Like', undo: 'Undo', likes_left: '{n} likes left today', likes_unlimited: 'Premium · unlimited likes',
       share_earn_cta: '🎁 Share to your WhatsApp status and get +10 free likes today', share_earn_btn: 'Share & get +10 likes', share_earn_done: '✅ You earned +10 extra likes today!', share_earn_confirm: 'Confirming…',
+      share_earn_shared: 'I already shared it', share_earn_share_hint: 'Share the link and then confirm to get your +10 likes.', share_earn_copy: 'Copy link',
       empty_title: 'No more profiles for now', empty_text: 'Come back later, widen your age range, or invite friends to LiggaCuba.', empty_cta_invite: 'Invite friends', empty_cta_profile: 'Complete my profile', refresh: 'Refresh',
       same_province: 'Your province', report: 'Report', block: 'Block', unmatch: 'Remove match', matches_empty: 'No matches yet. Keep discovering!',
       match_title: "It's a match!", match_text: 'You can now message {n} on:', keep: 'Keep browsing', write_to: 'Message on',
@@ -789,6 +791,73 @@
     D.feed = d.profiles || []; D.photoIdx = 0; D.premium = !!d.premium; D.likesLeft = d.likes_left;
     D.likesInfo = bundle.likes; D.shareEarn = d.share_earn || null;
   }
+  function _shareEarnLink() {
+    // Enlace de la Mini App / bot para compartir
+    const botUser = (typeof window.__LIGGA_BOT_USERNAME === 'string' && window.__LIGGA_BOT_USERNAME)
+      || 'LiggaCubaBot';
+    return `https://t.me/${botUser.replace(/^@/, '')}?startapp=dating`;
+  }
+
+  function _openShareEarnFlow() {
+    const shareUrl = _shareEarnLink();
+    const shareText = 'Conoce gente en LiggaCuba 💜 ' + shareUrl;
+    // 1) Intentar share nativo de Telegram WebApp
+    try {
+      if (window.Telegram?.WebApp?.openTelegramLink) {
+        const tgShare = `https://t.me/share/url?url=${encodeURIComponent(shareUrl)}&text=${encodeURIComponent('Conoce gente en LiggaCuba 💜')}`;
+        window.Telegram.WebApp.openTelegramLink(tgShare);
+      } else if (navigator.share) {
+        navigator.share({ title: 'LiggaCuba', text: shareText, url: shareUrl }).catch(() => {});
+      } else {
+        // Fallback WhatsApp
+        window.open(`https://wa.me/?text=${encodeURIComponent(shareText)}`, '_blank');
+      }
+    } catch (_) {
+      try { window.open(`https://wa.me/?text=${encodeURIComponent(shareText)}`, '_blank'); } catch (__) {}
+    }
+    // 2) Modal de confirmación: solo entonces se llama al endpoint
+    const close = () => m.remove();
+    const m = el('div', { class: 'modal dating-modal' },
+      el('div', { class: 'crop-backdrop', onclick: close }),
+      el('div', { class: 'result-sheet' },
+        el('h3', { text: T('share_earn_btn') }),
+        el('p', { class: 'd-muted', text: T('share_earn_share_hint') }),
+        el('button', { class: 'secondary', type: 'button', text: T('share_earn_copy'),
+          onclick: async () => {
+            try {
+              await navigator.clipboard.writeText(shareUrl);
+              toast(T('share_earn_copy'));
+            } catch (_) {
+              try {
+                const ta = document.createElement('textarea');
+                ta.value = shareUrl; document.body.appendChild(ta);
+                ta.select(); document.execCommand('copy'); ta.remove();
+                toast(T('share_earn_copy'));
+              } catch (__) {}
+            }
+          } }),
+        el('button', { class: 'primary', type: 'button', text: T('share_earn_shared'),
+          onclick: async (ev) => {
+            const btn = ev.currentTarget;
+            btn.disabled = true; btn.textContent = T('share_earn_confirm');
+            try {
+              const r = await jpost('/api/dating/share-earn', {});
+              if (r.granted || r.already_granted) {
+                D.shareEarn = { already_earned: true, bonus_today: r.bonus };
+                D.likesLeft = r.likes_left;
+                close();
+                renderDiscover();
+              } else {
+                btn.disabled = false; btn.textContent = T('share_earn_shared');
+              }
+            } catch (_) {
+              btn.disabled = false; btn.textContent = T('share_earn_shared');
+            }
+          } }),
+        el('button', { class: 'cancel-btn', type: 'button', text: X('cancel'), onclick: close })));
+    document.getElementById('datingScreen')?.append(m);
+  }
+
   async function renderDiscover() {
     if (!D.feed.length) {
       setBody(el('p', { class: 'd-muted', text: T('loading') }));
@@ -827,18 +896,7 @@
       ? el('div', { class: 'd-share-earn-banner' },
           el('span', { text: T('share_earn_cta') }),
           el('button', { class: 'd-share-earn-btn', type: 'button', text: T('share_earn_btn'),
-            onclick: async (ev) => {
-              const btn = ev.currentTarget;
-              btn.disabled = true; btn.textContent = T('share_earn_confirm');
-              try {
-                const r = await jpost('/api/dating/share-earn', {});
-                if (r.granted || r.already_granted) {
-                  D.shareEarn = { already_earned: true, bonus_today: r.bonus };
-                  D.likesLeft = r.likes_left;
-                  renderDiscover();
-                }
-              } catch (_) { btn.disabled = false; btn.textContent = T('share_earn_btn'); }
-            }
+            onclick: () => _openShareEarnFlow()
           }))
       : ((!D.premium && D.shareEarn && D.shareEarn.already_earned)
           ? el('div', { class: 'd-share-earn-banner done' }, el('span', { text: T('share_earn_done') }))

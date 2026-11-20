@@ -417,6 +417,12 @@
     document.querySelector('.bottom-nav')?.classList.remove('hidden');
     _stopPolling();
     S.matchId = null;
+    // Refrescar lista de matches para preview y badges de no leídos
+    S.listCache = null;
+    const listContainer = document.querySelector('.d-matches-container');
+    if (listContainer && typeof renderList === 'function') {
+      try { renderList(listContainer); } catch (_) {}
+    }
   }
 
   function _ensureChatScreen() {
@@ -601,6 +607,11 @@
       textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
       if (textarea.value.trim()) _onTypingInput();
     };
+
+    // Al abrir el teclado, reajustar scroll al fondo tras el reflow del viewport
+    textarea.addEventListener('focus', () => {
+      setTimeout(() => _scrollToBottom(true), 200);
+    });
 
     textarea.onkeydown = (e) => {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); _doSend(textarea, sendBtn); }
@@ -827,37 +838,44 @@
   // ── menú del chat ─────────────────────────────────────────────────────────
   function _menuSheet(info) {
     const contacts = (info.contacts || []).filter(c => safeContact(c.url));
-    const m = sheet(
-      el('h3', { text: info.display_name }),
-      el('button', { class: 'secondary', type: 'button', text: C('view_profile'),
-        onclick: () => { m.close(); _openProfile(info.public_id); } }),
-      ...contacts.map(c =>
-        el('button', { class: 'secondary contact-btn ' + (c.type === 'whatsapp' ? 'wa' : 'tg'), type: 'button',
-          text: C(c.type === 'whatsapp' ? 'open_wa' : 'open_tg'),
-          onclick: () => { m.close(); openExternal(c.url); } })),
-      el('button', { class: 'secondary', type: 'button', 'data-action': 'mute',
-        text: S.muted ? C('unmute') : C('mute'),
-        onclick: async () => { m.close(); await _toggleMute(); } }),
-      el('button', { class: 'secondary', type: 'button', text: C('report'),
-        onclick: () => { m.close(); _reportSheet(info.public_id); } }),
-      el('button', { class: 'secondary', type: 'button', text: C('unmatch'),
-        onclick: async () => {
-          if (!await datingConfirm(C('unmatch_confirm'))) return;
-          try {
-            await jpost('/api/dating/unmatch', { match_id: info.match_id });
-            toast(C('unmatched')); m.close(); _hideChatScreen();
-          } catch (e) { toast(e?.message || C('error')); }
-        } }),
-      el('button', { class: 'secondary danger-btn', type: 'button', text: C('block'),
-        onclick: async () => {
-          if (!await datingConfirm(C('block_confirm'))) return;
-          try {
-            await jpost('/api/dating/block', { target: info.public_id });
-            toast(C('blocked')); m.close(); _hideChatScreen();
-          } catch (e) { toast(e?.message || C('error')); }
-        } }),
-      el('button', { class: 'cancel-btn', type: 'button', text: C('cancel'),
-        onclick: () => m.close() }));
+    const close = () => m.remove();
+    const m = el('div', { class: 'modal dating-modal ch-menu-modal' },
+      el('div', { class: 'crop-backdrop', onclick: close }),
+      el('div', { class: 'result-sheet ch-menu-sheet' },
+        el('h3', { text: info.display_name }),
+        el('button', { class: 'secondary', type: 'button', text: C('view_profile'),
+          onclick: () => { close(); _openProfile(info.public_id); } }),
+        ...contacts.map(c =>
+          el('button', { class: 'secondary contact-btn ' + (c.type === 'whatsapp' ? 'wa' : 'tg'), type: 'button',
+            text: C(c.type === 'whatsapp' ? 'open_wa' : 'open_tg'),
+            onclick: () => { close(); openExternal(c.url); } })),
+        el('button', { class: 'secondary', type: 'button', 'data-action': 'mute',
+          text: S.muted ? C('unmute') : C('mute'),
+          onclick: async () => { close(); await _toggleMute(); } }),
+        el('button', { class: 'secondary', type: 'button', text: C('report'),
+          onclick: () => { close(); _reportSheet(info.public_id); } }),
+        el('button', { class: 'secondary', type: 'button', text: C('unmatch'),
+          onclick: async () => {
+            if (!await datingConfirm(C('unmatch_confirm'))) return;
+            try {
+              await jpost('/api/dating/unmatch', { match_id: info.match_id });
+              toast(C('unmatched')); close(); _hideChatScreen();
+            } catch (e) { toast(e?.message || C('error')); }
+          } }),
+        el('button', { class: 'secondary danger-btn', type: 'button', text: C('block'),
+          onclick: async () => {
+            if (!await datingConfirm(C('block_confirm'))) return;
+            try {
+              await jpost('/api/dating/block', { target: info.public_id });
+              toast(C('blocked')); close(); _hideChatScreen();
+            } catch (e) { toast(e?.message || C('error')); }
+          } }),
+        el('button', { class: 'cancel-btn', type: 'button', text: C('cancel'),
+          onclick: () => close() })));
+    m.close = close;
+    // Preferir el chat screen para z-index; fallback a datingScreen
+    (_screen() || document.getElementById('datingScreen'))?.append(m);
+    return m;
   }
 
 
@@ -1057,6 +1075,24 @@
   overflow: hidden;
   max-width: 520px;
   margin: 0 auto;
+}
+
+/* Menú de 3 puntos: bottom-sheet anclado abajo, no centrado */
+.ch-menu-modal {
+  z-index: 60;
+}
+.ch-menu-sheet {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: auto;
+  bottom: 0;
+  transform: none;
+  max-height: min(80dvh, 560px);
+  overflow-y: auto;
+  border-radius: 20px 20px 0 0;
+  padding: 16px 16px calc(16px + max(env(safe-area-inset-bottom, 0px), var(--tg-safe-area-inset-bottom, 0px), var(--tg-safe-bottom, 0px)));
+  box-shadow: 0 -8px 40px rgba(0,0,0,.18);
 }
 
 /* header */

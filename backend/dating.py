@@ -1268,6 +1268,92 @@ def _validate_bot_data(data: Dict[str, Any]) -> None:
         raise DatingError("La edad mínima no puede ser mayor que la máxima.", 400)
 
 
+def _build_bot_portrait_prompt(data: Dict[str, Any]) -> str:
+    """Construye un prompt de retrato fotorealista coherente con el perfil del bot."""
+    display_name = str(data.get("display_name") or "").strip()
+    birth_date = str(data.get("birth_date") or "").strip()
+    gender = str(data.get("gender") or "").strip().lower()
+    province = str(data.get("province") or "").strip()
+    municipality = str(data.get("municipality") or "").strip()
+    bio = str(data.get("bio") or "").strip()[:200]
+    raw_interests = data.get("interests") or []
+    interests = [str(i) for i in (raw_interests if isinstance(raw_interests, list) else []) if str(i).strip()][:6]
+    try:
+        age = age_from(birth_date) if birth_date else 25
+    except Exception:
+        age = 25
+    sex = "woman" if gender == "mujer" else ("man" if gender == "hombre" else "person")
+    loc = ", ".join(x for x in [municipality, province, "Cuba"] if x)
+    interests_txt = ", ".join(interests) if interests else "everyday life"
+    return (
+        f"Photorealistic natural profile portrait photo of a Cuban {sex}, about {age} years old, "
+        f"from {loc}. Soft neutral background, natural daylight, candid smartphone selfie style, "
+        f"friendly expression, realistic skin texture, no text, no watermark, no logo. "
+        f"Interests: {interests_txt}. "
+        + (f"Personality vibe from bio: {bio}. " if bio else "")
+        + f"Name context only (do not render text): {display_name}."
+    )
+
+
+def generate_bot_portrait(prompt: str) -> Optional[bytes]:
+    """Genera un retrato con el proveedor de imágenes disponible. Devuelve JPEG bytes o None.
+
+    Usa Gemini Imagen si hay GEMINI_API_KEY. Falla de forma controlada sin lanzar
+    excepciones al llamador (devuelve None).
+    """
+    import urllib.error
+    import urllib.request
+
+    key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if not key:
+        return None
+    model = (os.getenv("GEMINI_IMAGE_MODEL") or "imagen-3.0-generate-002").strip()
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:predict"
+        f"?key={key}"
+    )
+    payload = {
+        "instances": [{"prompt": prompt}],
+        "parameters": {
+            "sampleCount": 1,
+            "aspectRatio": "1:1",
+            "personGeneration": "allow_adult",
+        },
+    }
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        preds = data.get("predictions") or []
+        if not preds:
+            return None
+        b64 = preds[0].get("bytesBase64Encoded") or preds[0].get("image", {}).get("bytesBase64Encoded")
+        if not b64:
+            return None
+        raw = base64.b64decode(b64)
+        # Normalizar a JPEG vía Pillow si está disponible
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(raw))
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            img.thumbnail((PHOTO_MAX_SIDE, PHOTO_MAX_SIDE))
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=88)
+            return out.getvalue()
+        except Exception:
+            return raw if raw[:3] == b"\xff\xd8\xff" else None
+    except Exception as exc:
+        logger.warning("generate_bot_portrait failed: %s", exc)
+        return None
+
+
 def admin_create_bot(c: sqlite3.Connection, data: Dict[str, Any], now: Optional[str] = None) -> Dict[str, Any]:
     """Crea un perfil de bot de citas. No requiere cuenta de Telegram real.
 
@@ -2584,10 +2670,24 @@ def build_router(*, current_user: Callable, connect: Callable, is_premium: Calla
 
     @router.post("/api/admin/dating/bots")
     def admin_bots_create(p: BotCreateIn, request: Request):
-        """Crea un nuevo perfil de bot de citas."""
+        """Crea un nuevo perfil de bot de citas.
+        Tras crear, intenta generar un retrato IA y asociarlo como foto approved.
+        Si la IA falla, el bot queda con el fallback de bot_portraits.
+        """
         ident = admin(request, "dating")
         data = _model_dump(p)
         result = run(lambda c: admin_create_bot(c, data))
+        # Foto IA solo al crear (no en edición). Fallo controlado → fallback actual.
+        try:
+            prompt = _build_bot_portrait_prompt(data)
+            jpeg = generate_bot_portrait(prompt)
+            if jpeg:
+                def _attach(c):
+                    return admin_add_bot_photo(c, result["user_id"], photos_dir(), jpeg)
+                photo = run(_attach)
+                result["ai_photo_id"] = photo.get("id")
+        except Exception as exc:
+            logger.warning("AI portrait skipped for bot %s: %s", result.get("user_id"), exc)
         audit(ident["username"], "dating_bot_created", result["user_id"], {"display_name": result["display_name"]})
         return result
 
